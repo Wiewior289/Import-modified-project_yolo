@@ -340,7 +340,7 @@ export default function App() {
     } else {
       if (cmd === 'SET_PARAMS') {
         if (extra.conf !== undefined) setConfThreshold(extra.conf);
-        addLog(`[SYMULACJA UI] Zmieniono próg na ${extra.conf}`);
+        addLog(`[LOKALNIE] Próg ustawiony na ${extra.conf}; brak aktywnego WebSocket, więc telefon nie otrzymał zmiany.`);
       }
     }
   };
