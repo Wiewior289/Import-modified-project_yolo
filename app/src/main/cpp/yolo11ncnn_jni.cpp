@@ -145,8 +145,8 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
             "Czy GPU ma dostep bezposredni?: %s",                               
             desc.format, desc.width, desc.height, desc.layers, desc.stride,     
             (unsigned long long)desc.usage,                                                 
-            (desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) ? "TAK (CPU COPY DETECTED)" : "NIE (CZYSTY SPRZET)",                               
-            (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) ? "TAK (IDEALNIE)" : "NIE"                                                             
+            (desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) ? "CPU_READ usage enabled" : "CPU_READ usage absent",
+            (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) ? "GPU_SAMPLED_IMAGE enabled" : "GPU_SAMPLED_IMAGE absent"                                                             
         );                                                                      
     }                                                                           
                                                                                 
