@@ -35,12 +35,7 @@ class TelemetryServer(
 
     override fun onMessage(conn: WebSocket, message: String) {
         try {
-            val cmd = when {
-                message.contains("EMERGENCY_STOP") -> "EMERGENCY_STOP"
-                message.contains("RESET_ESTOP") -> "RESET_ESTOP"
-                message.contains("SET_PARAMS") -> "SET_PARAMS"
-                else -> "UNKNOWN"
-            }
+            val cmd = if (message.contains("SET_PARAMS")) "SET_PARAMS" else "UNKNOWN"
             onCommandReceived?.invoke(cmd, message)
         } catch (e: Exception) {
             Log.e("TelemetryServer", "Błąd parsowania", e)
