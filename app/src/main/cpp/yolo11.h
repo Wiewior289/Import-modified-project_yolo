@@ -30,9 +30,9 @@
 // Zone 1: MID  (0.35 <= bottom_y <= 0.70)
 // Zone 2: FAR  (bottom_y < 0.35)
 enum ObstacleZone {
-    ZONE_CRITICAL = 0,
-    ZONE_REACTION = 1,
-    ZONE_HORIZON  = 2
+    ZONE_NEAR = 0,
+    ZONE_MID  = 1,
+    ZONE_FAR  = 2
 };
 
 struct Object {
@@ -62,21 +62,13 @@ public:
      */
     int load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu = true);
 
-    /**                                                                         
-     * High-speed Zero-Copy inference directly from Android Camera2             
-	AHardwareBuffer.                                                                
-     * Hardware YCbCr -> RGB conversion, rotation and scaling performed in GPU  
-	Vulkan shader.                                                                  
-     * True Zero-Copy: [0..255] -> [0..1] normalization and elempack conversion 
-	executed on GPU.                                                                
-     * @param rotate_type EXIF orientation (1: 0 deg, 6: 90 deg CW, 3: 180 deg, 
-	8: 270 deg)                                                                     
-     * @param fence_fd Synchronization fence file descriptor from Camera2 HAL   
-	(-1 if none)                                                                    
-     */                                                                         
-    int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,   
-                   std::vector<Object>& objects, int rotate_type = 1, int       
-	fence_fd = -1);
+    /**
+     * Imports a Camera2 AHardwareBuffer into Vulkan and runs YOLO on its VkMat.
+     * The caller keeps the originating Image alive for this call. Cache entries
+     * retain their own AHardwareBuffer reference beyond the call.
+     */
+    int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                   std::vector<Object>& objects, int rotate_type = 1);
 
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
