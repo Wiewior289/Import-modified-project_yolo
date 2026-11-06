@@ -105,7 +105,7 @@ const PROJECT_TREE: ProjectNode = {
                       name: 'yolo11.cpp',
                       type: 'file',
                       status: 'fixed',
-                      description: 'Zero-Copy AHardwareBuffer na Mali-G72, raportowanie najlepszego kandydata'
+                      description: 'Import AHardwareBuffer do Vulkan na Mali-G72, dekodowanie wyników na CPU'
                     },
                     {
                       name: 'yolo11ncnn_jni.cpp',
@@ -389,7 +389,7 @@ export default function App() {
                 Galaxy S9+ Mali-G72 MP18
               </span>
             </div>
-            <p className="text-xs text-slate-400">Zero-Copy AHardwareBuffer &bull; Serwer Telemetrii WebSocket &bull; STM32F405</p>
+            <p className="text-xs text-slate-400">Camera2 AHB → Vulkan • YOLO11 NCNN • Telemetria WebSocket</p>
           </div>
         </div>
 
