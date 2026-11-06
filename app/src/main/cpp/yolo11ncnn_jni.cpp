@@ -95,13 +95,13 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
     jint rotate_type)
 {
     if (!hardware_buffer_obj || !out_buffer_obj) {
-        return 0;
+        return -1;
     }
 
     std::lock_guard<std::mutex> lock(g_lock);
 
     if (!g_yolo || !g_yolo->is_ready()) {
-        return 0;
+        return -2;
     }
 
     AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);                                                           
@@ -133,11 +133,13 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
     AHardwareBuffer_acquire(ahb);                                               
                                                                                 
     g_objects_scratchpad.clear();                                               
-    int ret = g_yolo->detect_ahb(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type, -1);                                         
+    int ret = g_yolo->detect_ahb(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type);                                         
     AHardwareBuffer_release(ahb);                                               
                                                                                 
-    if (ret != 0) {                                                             
-        return 0;                                                               
+    if (ret != 0) {
+        LOGE("detect_ahb failed with code %d", ret);
+        g_flat_buffer[0] = 0.0f;
+        return ret;
     }
 
     int count = g_yolo->pack_detections_flat(g_objects_scratchpad, g_flat_buffer, MAX_DETECTION_FLOATS);
@@ -162,32 +164,6 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopClass(JNIEnv* env, jobject thiz)
     std::lock_guard<std::mutex> lock(g_lock);
     if (!g_yolo) return -1;
     return g_yolo->get_top_candidate_class();
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_tencent_yolo11ncnn_Yolo11Ncnn_IsEmergencyStop(JNIEnv* env, jobject thiz)
-{
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (!g_yolo) return JNI_FALSE;
-    return g_yolo->is_emergency_stop_active() ? JNI_TRUE : JNI_FALSE;
-}
-
-JNIEXPORT void JNICALL
-Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ResetEmergencyStop(JNIEnv* env, jobject thiz)
-{
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_yolo) {
-        g_yolo->reset_emergency_stop();
-    }
-}
-
-JNIEXPORT void JNICALL
-Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ClearCache(JNIEnv* env, jobject thiz)
-{
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_yolo) {
-        g_yolo->clear_ahb_cache();
-    }
 }
 
 JNIEXPORT void JNICALL
