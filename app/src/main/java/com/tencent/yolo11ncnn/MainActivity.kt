@@ -2,11 +2,9 @@ package com.tencent.yolo11ncnn
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
-import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import android.content.Context
 import android.graphics.ImageFormat
@@ -15,6 +13,7 @@ import android.hardware.camera2.*
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ExecutorService
@@ -53,14 +52,14 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var confThreshold: Float = 0.25f
     @Volatile private var nmsThreshold: Float = 0.45f
-    @Volatile private var manualEStop: Boolean = false
 
     private val isYoloReady = AtomicBoolean(false)
     private val isCameraRunning = AtomicBoolean(false)
     private val isProcessingFrame = AtomicBoolean(false)
 
-    private var frameCount: Int = 0
-    private var lastFpsCalcTimeMs: Long = 0
+    private var frameSequence: Long = 0L
+    private var fpsWindowStartMs: Long = 0L
+    private var fpsWindowFrames: Int = 0
     private var currentFps: Float = 0f
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -161,30 +160,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleRemoteCommand(cmd: String, payload: String) {
-        val q = '"'
-        when (cmd) {
-            "EMERGENCY_STOP" -> {
-                manualEStop = true
-                telemetryServer.broadcastStatus("ESTOP_MANUAL", "Twardy E-STOP z dashboardu!")
-            }
-            "RESET_ESTOP" -> {
-                manualEStop = false
-                yoloEngine.ResetEmergencyStop()
-                telemetryServer.broadcastStatus("ESTOP_RESET", "Zresetowano E-STOP")
-            }
-            "SET_PARAMS" -> {
-                try {
-                    val confKey = "" + q + "conf" + q
-                    val nmsKey = "" + q + "nms" + q
-                    val conf = payload.substringAfter(confKey, "").substringAfter(":", "").substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
-                    val nms = payload.substringAfter(nmsKey, "").substringAfter(":", "").substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
-                    if (conf != null) confThreshold = conf
-                    if (nms != null) nmsThreshold = nms
-                    telemetryServer.broadcastStatus("PARAMS_UPDATED", "conf=" + confThreshold + ", nms=" + nmsThreshold)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Błąd parsowania SET_PARAMS", e)
-                }
-            }
+        if (cmd != "SET_PARAMS") return
+        try {
+            val q = '"'
+            val confKey = "" + q + "conf" + q
+            val nmsKey = "" + q + "nms" + q
+            val conf = payload.substringAfter(confKey, "").substringAfter(":", "")
+                .substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
+            val nms = payload.substringAfter(nmsKey, "").substringAfter(":", "")
+                .substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
+            if (conf != null) confThreshold = conf.coerceIn(0.01f, 0.99f)
+            if (nms != null) nmsThreshold = nms.coerceIn(0.01f, 0.99f)
+            telemetryServer.broadcastStatus("PARAMS_UPDATED", "conf=" + confThreshold + ", nms=" + nmsThreshold)
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd parsowania SET_PARAMS", e)
         }
     }
 
@@ -213,93 +202,77 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // Flag USAGE_GPU_SAMPLED_IMAGE (0x100) jest kluczowy dla Vulkan zero-copy!
-            val usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
-            imageReader = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ImageReader.newInstance(320, 320, ImageFormat.YUV_420_888, 3, usage)
-            } else {
-                ImageReader.newInstance(320, 320, ImageFormat.YUV_420_888, 3)
-            }
+            // Android 10+ ImageReader overload propagates GPU_SAMPLED_IMAGE to HAL buffers.
+            imageReader = ImageReader.newInstance(
+                320, 320, ImageFormat.YUV_420_888, 3,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+            )
 
             imageReader?.setOnImageAvailableListener({ reader ->
-    // 1. Jeśli system nie jest gotowy lub GPU przetwarza poprzednią klatkę - zrzucamy bufor NATYCHMIAST
-    if (!isYoloReady.get() || isProcessingFrame.get()) {
-        val badImage = reader.acquireLatestImage()
-        badImage?.close()
-        return@setOnImageAvailableListener
-    }
-
-    // 2. Pobieramy klatkę do inferencji
-    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-    
-    // Blokujemy potok przed nadejściem kolejnej klatki
-    isProcessingFrame.set(true)
-
-    // Tworzymy wątek roboczy, aby NIE blokować wątku kamery, ale trzymać obiekt Image otwarty!
-    backgroundInitExecutor.execute {
-        try {
-            calculateFps()
-
-            val rotateType = when (sensorOrientation) {
-                90 -> 6
-                180 -> 3
-                270 -> 8
-                else -> 1
-            }
-
-            val hwBuffer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                image.hardwareBuffer
-            } else null
-
-            var count = 0
-            if (hwBuffer != null) {
-                try {
-                    // Ta linia blokuje ten wątek aż GPU Mali skończy obliczenia
-                    count = yoloEngine.DetectAHBDirect(
-                        hwBuffer,
-                        detectionBuffer,
-                        confThreshold,
-                        nmsThreshold,
-                        rotateType
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Błąd DetectAHBDirect", e)
-                } finally {
-                    hwBuffer.close() // Bezpieczne zamknięcie buforu sprzętowego
+                if (!isYoloReady.get() || isProcessingFrame.get()) {
+                    reader.acquireLatestImage()?.close()
+                    return@setOnImageAvailableListener
                 }
-            }
 
-            val topScore = yoloEngine.GetTopScore()
-            val topClass = yoloEngine.GetTopClass()
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                isProcessingFrame.set(true)
+                val frameId = ++frameSequence
+                val imageTimestampNs = image.timestamp
 
-            if (frameCount == 1) {
-                Log.i(TAG, "Inference: FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
-                        " | Objects=" + count +
-                        " | TopCandidate=" + String.format(java.util.Locale.US, "%.3f", topScore) +
-                        " (class=" + topClass + ")")
-            }
+                backgroundInitExecutor.execute {
+                    try {
+                        val rotateType = when (sensorOrientation) {
+                            90 -> 6
+                            180 -> 3
+                            270 -> 8
+                            else -> 1
+                        }
 
-            val isHardwareEStop = yoloEngine.IsEmergencyStop()
-            val finalEStop = manualEStop || isHardwareEStop
+                        detectionBuffer.fill(0f)
+                        var rawCount = -1
+                        val hwBuffer = image.hardwareBuffer
+                        try {
+                            rawCount = yoloEngine.DetectAHBDirect(
+                                hwBuffer, detectionBuffer, confThreshold, nmsThreshold, rotateType
+                            )
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Błąd DetectAHBDirect frame=$frameId", e)
+                        } finally {
+                            hwBuffer.close()
+                        }
 
-            // Budujemy i wysyłamy telemetrię – asynchronicznie, wewnątrz tego samego bezpiecznego wątku tła
-            val jsonPayload = buildJson(count, detectionBuffer, finalEStop, currentFps, topScore, topClass)
-            try {
-                telemetryServer.sendDetections(jsonPayload)
-            } catch (e: Exception) {
-                Log.e(TAG, "Błąd wysyłania telemetrii", e)
-            }
+                        updateProcessingFps()
+                        val count = rawCount.coerceAtLeast(0)
+                        if (rawCount < 0) Log.e(TAG, "Detekcja nie powiodła się: code=$rawCount frame=$frameId")
 
-            sendToSTM32(count, detectionBuffer, finalEStop)
+                        val topScore = yoloEngine.GetTopScore()
+                        val topClass = yoloEngine.GetTopClass()
 
-        } finally {
-            // KLUCZOWE: Zamykamy klatkę DOPIERO gdy wątek tła ukończył całkowicie inferencję i sieć!
-            image.close()
-            isProcessingFrame.set(false)
-        }
-    }
-}, cameraHandler)
+                        if (frameId % 30L == 0L) {
+                            Log.i(TAG, "Frame=$frameId imageTs=$imageTimestampNs FPS=" +
+                                String.format(java.util.Locale.US, "%.1f", currentFps) +
+                                " objects=$count top=" +
+                                String.format(java.util.Locale.US, "%.3f", topScore) +
+                                " class=$topClass")
+                        }
 
+                        val jsonPayload = buildJson(
+                            count, detectionBuffer, currentFps, topScore, topClass, frameId, imageTimestampNs
+                        )
+                        try {
+                            telemetryServer.sendDetections(jsonPayload)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Błąd wysyłania telemetrii", e)
+                        }
+
+                        // Vision test only: no actuator command is issued.
+                        sendToSTM32(count, detectionBuffer, false)
+                    } finally {
+                        image.close()
+                        isProcessingFrame.set(false)
+                    }
+                }
+            }, cameraHandler)
 
 
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -387,26 +360,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun calculateFps() {
-        val now = System.currentTimeMillis()
-        frameCount++
-        if (now - lastFpsCalcTimeMs >= 1000) {
-            currentFps = (frameCount * 1000f) / (now - lastFpsCalcTimeMs)
-            frameCount = 0
-            lastFpsCalcTimeMs = now
+    private fun updateProcessingFps() {
+        val now = SystemClock.elapsedRealtime()
+        if (fpsWindowStartMs == 0L) {
+            fpsWindowStartMs = now
+            fpsWindowFrames = 1
+            return
+        }
+        fpsWindowFrames++
+        val elapsedMs = now - fpsWindowStartMs
+        if (elapsedMs >= 1000L) {
+            currentFps = fpsWindowFrames * 1000f / elapsedMs
+            fpsWindowFrames = 0
+            fpsWindowStartMs = now
         }
     }
 
-    private fun buildJson(count: Int, data: FloatArray, eStop: Boolean, fpsVal: Float, topScore: Float, topClass: Int): String {
+    private fun buildJson(
+        count: Int, data: FloatArray, fpsVal: Float, topScore: Float, topClass: Int,
+        frameId: Long, imageTimestampNs: Long
+    ): String {
         val q = '"'
-        val sb = StringBuilder(512)
+        val sb = StringBuilder(640)
         sb.append("{")
             .append(q).append("type").append(q).append(":").append(q).append("telemetry").append(q).append(",")
+            .append(q).append("frameId").append(q).append(":").append(frameId).append(",")
+            .append(q).append("imageTimestampNs").append(q).append(":").append(imageTimestampNs).append(",")
             .append(q).append("fps").append(q).append(":").append(String.format(java.util.Locale.US, "%.1f", fpsVal)).append(",")
             .append(q).append("topScore").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", topScore)).append(",")
             .append(q).append("topClass").append(q).append(":").append(topClass).append(",")
-            .append(q).append("conf").append(q).append(":").append(confThreshold).append(",")
-            .append(q).append("eStop").append(q).append(":").append(eStop).append(",")
+            .append(q).append("conf").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", confThreshold)).append(",")
             .append(q).append("count").append(q).append(":").append(count).append(",")
             .append(q).append("objects").append(q).append(":[")
 
@@ -416,10 +399,10 @@ class MainActivity : AppCompatActivity() {
                 .append(q).append("zone").append(q).append(":").append(data[base].toInt()).append(",")
                 .append(q).append("class").append(q).append(":").append(data[base + 1].toInt()).append(",")
                 .append(q).append("score").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 2])).append(",")
-                .append(q).append("x").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 3])).append(",")
-                .append(q).append("y").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 4])).append(",")
-                .append(q).append("w").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 5])).append(",")
-                .append(q).append("h").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 6]))
+                .append(q).append("x").append(q).append(":").append(String.format(java.util.Locale.US, "%.5f", data[base + 3])).append(",")
+                .append(q).append("y").append(q).append(":").append(String.format(java.util.Locale.US, "%.5f", data[base + 4])).append(",")
+                .append(q).append("w").append(q).append(":").append(String.format(java.util.Locale.US, "%.5f", data[base + 5])).append(",")
+                .append(q).append("h").append(q).append(":").append(String.format(java.util.Locale.US, "%.5f", data[base + 6]))
             sb.append("}")
             if (i < count - 1) sb.append(",")
         }
