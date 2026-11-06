@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * YOLO11 NCNN Zero-Copy AHardwareBuffer Engine for Autonomous Robotic Mower
+ * YOLO11 NCNN AHardwareBuffer Vulkan Import Engine for Autonomous Robotic Mower
  * Platform: Samsung Galaxy S9+ (Samsung Exynos 9810 + Mali-G72 MP18 Bifrost GPU)
  * Actuator MCU: STM32F405 (UART/CAN control interface)
  * Framework: Tencent ncnn (Vulkan GPU Acceleration & AHardwareBuffer Zero-Copy)
@@ -16,7 +16,7 @@
 #include <cmath>
 #include <cstring>
 
-#define TAG "Yolo11_ZeroCopy_MaliG72"
+#define TAG "Yolo11_AHB_MaliG72"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
