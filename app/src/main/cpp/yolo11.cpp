@@ -414,17 +414,28 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
         return -11;
     }
 
+    const auto post_start = std::chrono::steady_clock::now();
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
     objects.clear();
     nms_sorted_bboxes(nms_thresh, objects);
+    const double postprocess_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_start).count();
 
     static int s_frame_log = 0;
     if (++s_frame_log % 30 == 0) {
-        LOGI("Pipeline: preprocess=%.2fms cache_create=%.2fms infer+readback=%.2fms | out(dims=%d w=%d h=%d c=%d) proposals=%zu detections=%zu top=%.3f cls=%d",
-             preprocess_ms, cache_create_ms, infer_readback_ms,
+        LOGI("Pipeline: preprocess=%.2fms cache_create=%.2fms infer+readback=%.2fms post=%.2fms | out(dims=%d w=%d h=%d c=%d) proposals=%zu detections=%zu top=%.3f cls=%d",
+             preprocess_ms, cache_create_ms, infer_readback_ms, postprocess_ms,
              out.dims, out.w, out.h, out.c, proposal_scratchpad.size(),
              objects.size(), last_top_score, last_top_class);
+        const size_t detail_count = std::min<size_t>(objects.size(), 8);
+        for (size_t i = 0; i < detail_count; i++) {
+            const Object& obj = objects[i];
+            LOGD("det[%zu] cls=%d score=%.3f xywh=(%.4f,%.4f,%.4f,%.4f) zone=%d",
+                 i, obj.label, obj.prob,
+                 obj.x / target_w, obj.y / target_h, obj.w / target_w, obj.h / target_h,
+                 obj.zone_id);
+        }
     }
     return 0;
 }
