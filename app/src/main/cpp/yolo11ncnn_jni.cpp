@@ -105,9 +105,9 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
     }
 
     AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);                                                           
-    if (!ahb) {                                                                 
-        LOGE("Failed to get AHardwareBuffer from Java object");                 
-        return 0;                                                               
+    if (!ahb) {
+        LOGE("Failed to get AHardwareBuffer from Java object");
+        return -3;
     }                                                                           
                                                                                 
     // Pierwszy Log Diagnostyczny
