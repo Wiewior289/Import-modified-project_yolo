@@ -22,14 +22,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * ============================================================================
- * MainActivity - Autonomous Robotic Mower Vision Processor
+ * MainActivity - Camera2 / AHardwareBuffer YOLO test harness
  * Platform: Samsung Galaxy S9+ (Mali-G72 MP18 + Exynos 9810)
  *
- * TRUE ZERO-COPY CAMERA2 PIPELINE:
- * 1. Start TelemetryServer (Port 8080) w onCreate() - natychmiastowa gotowość WWW.
- * 2. Inicjalizacja YOLO11 Vulkan w tle (Background Executor) - brak zamrażania UI/ANR!
- * 3. Start Camera2 z ImageReader skonfigurowanym z flagą USAGE_GPU_SAMPLED_IMAGE
- *    (Zero CPU copy, brak CameraX - strumień prosto do Vulkan AHardwareBuffer).
+ * Camera2 -> ImageReader AHardwareBuffer -> Vulkan import -> NCNN.
+ * The input buffer is imported without an application-side YUV-to-RGB CPU copy.
+ * Model output is read back to CPU for DFL decode, NMS and dashboard telemetry.
  * ============================================================================
  */
 class MainActivity : AppCompatActivity() {
@@ -174,11 +172,13 @@ class MainActivity : AppCompatActivity() {
         val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
             var selectedCameraId: String? = null
+            var selectedCharacteristics: CameraCharacteristics? = null
             for (id in cameraManager.cameraIdList) {
                 val characteristics = cameraManager.getCameraCharacteristics(id)
                 val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
                 if (facing == CameraCharacteristics.LENS_FACING_BACK) {
                     selectedCameraId = id
+                    selectedCharacteristics = characteristics
                     sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
                     break
                 }
@@ -186,17 +186,47 @@ class MainActivity : AppCompatActivity() {
 
             if (selectedCameraId == null && cameraManager.cameraIdList.isNotEmpty()) {
                 selectedCameraId = cameraManager.cameraIdList[0]
+                selectedCharacteristics = cameraManager.getCameraCharacteristics(selectedCameraId!!)
+                sensorOrientation = selectedCharacteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
             }
 
-            if (selectedCameraId == null) {
+            if (selectedCameraId == null || selectedCharacteristics == null) {
                 Log.e(TAG, "Brak dostępnej kamery w urządzeniu!")
                 telemetryServer.broadcastStatus("ERROR_CAMERA", "Brak dostępnej kamery!")
                 return
             }
 
-            // Android 10+ ImageReader overload propagates GPU_SAMPLED_IMAGE to HAL buffers.
+            val streamMap = selectedCharacteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val yuvSizes = streamMap?.getOutputSizes(ImageFormat.YUV_420_888)?.toList().orEmpty()
+            if (yuvSizes.isEmpty()) {
+                Log.e(TAG, "Wybrana kamera nie udostępnia strumienia YUV_420_888")
+                telemetryServer.broadcastStatus("ERROR_CAMERA_SIZE", "Brak wspieranego wyjścia YUV_420_888")
+                return
+            }
+
+            // Prefer a square stream; otherwise choose the closest aspect ratio and
+            // report the mismatch instead of assuming 320x320 is supported by the HAL.
+            val inputSize = yuvSizes.minByOrNull { size ->
+                val aspectPenalty = kotlin.math.abs(size.width.toDouble() / size.height.toDouble() - 1.0) * 10000.0
+                val areaPenalty = kotlin.math.abs(size.width * size.height - 320 * 320).toDouble() / 1000.0
+                aspectPenalty + areaPenalty
+            } ?: run {
+                telemetryServer.broadcastStatus("ERROR_CAMERA_SIZE", "Nie udało się wybrać rozmiaru YUV")
+                return
+            }
+
+            val inputAspect = inputSize.width.toDouble() / inputSize.height.toDouble()
+            Log.i(TAG, "Camera2 YUV input=" + inputSize.width + "x" + inputSize.height + ", aspect=" + inputAspect)
+            if (kotlin.math.abs(inputAspect - 1.0) > 0.02) {
+                telemetryServer.broadcastStatus(
+                    "WARN_CAMERA_ASPECT",
+                    "Strumień kamery nie jest kwadratowy (" + inputSize.width + "x" + inputSize.height + "); preprocess do 320x320 może zmieniać proporcje."
+                )
+            }
+
+            // Android 10+ ImageReader overload requests GPU sampling and CPU read access.
             imageReader = ImageReader.newInstance(
-                320, 320, ImageFormat.YUV_420_888, 3,
+                inputSize.width, inputSize.height, ImageFormat.YUV_420_888, 3,
                 HardwareBuffer.USAGE_CPU_READ_OFTEN or HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
             )
 
