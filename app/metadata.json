@@ -1,0 +1,6 @@
+{
+  "name": "YOLO11 Mower Vision - Zero-Copy AHB NCNN",
+  "description": "Real-time Zero-Copy AHardwareBuffer YOLO11 vision system for autonomous robotic lawn mower on Samsung Galaxy S9+ (Mali-G72 MP18) and STM32F405.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

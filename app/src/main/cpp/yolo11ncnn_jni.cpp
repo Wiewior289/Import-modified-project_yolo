@@ -1,0 +1,204 @@
+/**
+ * ============================================================================
+ * JNI Interface for YOLO11 Zero-Copy AHardwareBuffer Mower Vision System
+ * Target: Samsung Galaxy S9+ (Mali-G72 MP18)
+ * ============================================================================
+ */
+
+#include <jni.h>
+#include <android/asset_manager_jni.h>
+#include <android/hardware_buffer.h>
+#include <android/hardware_buffer_jni.h>
+#include <android/log.h>
+#include <mutex>
+#include <atomic>
+#include "yolo11.h"
+
+#define TAG "Yolo11Ncnn_JNI"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+static Yolo11* g_yolo = nullptr;
+static std::mutex g_lock;
+
+static const int MAX_DETECTION_FLOATS = 1 + 64 * 7;
+static float g_flat_buffer[MAX_DETECTION_FLOATS];
+static std::vector<Object> g_objects_scratchpad;
+static std::atomic<bool> g_first_ahb_logged(false);
+
+extern "C" {
+
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
+{
+    LOGI("JNI_OnLoad called for YOLO11 Zero-Copy Mali-G72 Native Module");
+    return JNI_VERSION_1_6;
+}
+
+JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_yolo) {
+        delete g_yolo;
+        g_yolo = nullptr;
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
+    JNIEnv* env,
+    jobject thiz,
+    jobject asset_manager,
+    jint model_type_index,
+    jint target_size,
+    jboolean use_gpu)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+
+    if (g_yolo) {
+        delete g_yolo;
+        g_yolo = nullptr;
+    }
+
+    g_yolo = new Yolo11();
+    AAssetManager* mgr = AAssetManager_fromJava(env, asset_manager);
+
+    const char* modeltype = "n";
+    if (model_type_index == 1) {
+        modeltype = "s";
+    } else if (model_type_index == 2) {
+        modeltype = "m";
+    }
+
+    int ret = g_yolo->load(mgr, modeltype, target_size, use_gpu == JNI_TRUE);
+    if (ret != 0) {
+        LOGE("YOLO11 init failed with error code: %d", ret);
+        delete g_yolo;
+        g_yolo = nullptr;
+        return JNI_FALSE;
+    }
+
+    g_objects_scratchpad.reserve(64);
+    LOGI("YOLO11 initialized successfully (Model: yolo11%s, Size: %d, GPU: %d)",
+         modeltype, target_size, use_gpu ? 1 : 0);
+    return JNI_TRUE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
+    JNIEnv* env,
+    jobject thiz,
+    jobject hardware_buffer_obj,
+    jfloatArray out_buffer_obj,
+    jfloat conf_thresh,
+    jfloat nms_thresh,
+    jint rotate_type)
+{
+    if (!hardware_buffer_obj || !out_buffer_obj) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(g_lock);
+
+    if (!g_yolo || !g_yolo->is_ready()) {
+        return 0;
+    }
+
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);                                                           
+    if (!ahb) {                                                                 
+        LOGE("Failed to get AHardwareBuffer from Java object");                 
+        return 0;                                                               
+    }                                                                           
+                                                                                
+    // Pierwszy Log Diagnostyczny
+    if (!g_first_ahb_logged.exchange(true)) {                                   
+        AHardwareBuffer_Desc desc;                                              
+        AHardwareBuffer_describe(ahb, &desc);                                   
+                                                                                
+        __android_log_print(ANDROID_LOG_INFO, "NCNN_BARE_METAL",                
+            "=== ANALIZA PIERWSZEGO AHB COUPLING ===\n"                         
+            "Format sprzetowy (HEX): 0x%X\n"                                    
+            "Wymiary krzemu: %ux%u | Warstwy: %u\n"                             
+            "Stride (Wyrownanie pamieci w bajtach): %u\n"                       
+            "Usage Flags: 0x%llX\n"                                             
+            "Czy CPU ma dostep do odczytu?: %s\n"                               
+            "Czy GPU ma dostep bezposredni?: %s",                               
+            desc.format, desc.width, desc.height, desc.layers, desc.stride,     
+            (unsigned long long)desc.usage,                                                 
+            (desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) ? "TAK (CPU COPY DETECTED)" : "NIE (CZYSTY SPRZET)",                               
+            (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) ? "TAK (IDEALNIE)" : "NIE"                                                             
+        );                                                                      
+    }                                                                           
+                                                                                
+    AHardwareBuffer_acquire(ahb);                                               
+                                                                                
+    g_objects_scratchpad.clear();                                               
+    int ret = g_yolo->detect_ahb(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type, -1);                                         
+    AHardwareBuffer_release(ahb);                                               
+                                                                                
+    if (ret != 0) {                                                             
+        return 0;                                                               
+    }
+
+    int count = g_yolo->pack_detections_flat(g_objects_scratchpad, g_flat_buffer, MAX_DETECTION_FLOATS);
+
+    const int floats_to_copy = 1 + count * 7;
+    env->SetFloatArrayRegion(out_buffer_obj, 0, floats_to_copy, g_flat_buffer);
+
+    return count;
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopScore(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_yolo) return 0.0f;
+    return g_yolo->get_top_candidate_score();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopClass(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_yolo) return -1;
+    return g_yolo->get_top_candidate_class();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_IsEmergencyStop(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (!g_yolo) return JNI_FALSE;
+    return g_yolo->is_emergency_stop_active() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ResetEmergencyStop(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_yolo) {
+        g_yolo->reset_emergency_stop();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ClearCache(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_yolo) {
+        g_yolo->clear_ahb_cache();
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Destroy(JNIEnv* env, jobject thiz)
+{
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (g_yolo) {
+        delete g_yolo;
+        g_yolo = nullptr;
+    }
+    LOGI("YOLO11 native instance destroyed");
+}
+
+} // extern "C"

@@ -1,0 +1,154 @@
+#ifndef YOLO11_H
+#define YOLO11_H
+
+/**
+ * ============================================================================
+ * YOLO11 NCNN Zero-Copy AHardwareBuffer Engine for Autonomous Robotic Mower
+ * Platform: Samsung Galaxy S9+ (Samsung Exynos 9810 + Mali-G72 MP18 Bifrost GPU)
+ * Actuator MCU: STM32F405 (UART/CAN control interface)
+ * Framework: Tencent ncnn (Vulkan GPU Acceleration & AHardwareBuffer Zero-Copy)
+ * ============================================================================
+ */
+
+#include <android/hardware_buffer.h>
+#include <android/asset_manager.h>
+#include <vector>
+#include <string>
+#include <cstdint>
+
+// NCNN includes
+#include "net.h"
+#include "gpu.h"
+#include "command.h"
+#include "pipeline.h"
+#include "layer.h"
+#include "layer_type.h"
+
+// Horizontal Zone IDs based on robot safety distance:
+// Zone 0: CRITICAL (Immediate Danger / Cutter Blade Zone: bottom_y > 0.70) -> Emergency Stop
+// Zone 1: REACTION (Path Planning / Obstacle Avoidance Zone: 0.35 <= bottom_y <= 0.70)
+// Zone 2: HORIZON  (Far Field / Visual Odometry & Landmarks: bottom_y < 0.35)
+enum ObstacleZone {
+    ZONE_CRITICAL = 0,
+    ZONE_REACTION = 1,
+    ZONE_HORIZON  = 2
+};
+
+struct Object {
+    int zone_id;       // 0: Critical, 1: Reaction, 2: Horizon
+    int label;         // Class index (COCO or custom mower obstacle class)
+    float prob;        // Detection confidence [0.0, 1.0]
+    float x;           // Bounding box left (pixel coordinate)
+    float y;           // Bounding box top (pixel coordinate)
+    float w;           // Bounding box width (pixel)
+    float h;           // Bounding box height (pixel)
+};
+
+struct GridAndStride {
+    int grid0;
+    int grid1;
+    int stride;
+};
+
+class Yolo11 {
+public:
+    Yolo11();
+    ~Yolo11();
+
+    /**
+     * Initializes NCNN, Vulkan compute engine, Mali-G72 shader optimizations,
+     * and loads model weights from Android assets.
+     */
+    int load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu = true);
+
+    /**                                                                         
+     * High-speed Zero-Copy inference directly from Android Camera2             
+	AHardwareBuffer.                                                                
+     * Hardware YCbCr -> RGB conversion, rotation and scaling performed in GPU  
+	Vulkan shader.                                                                  
+     * True Zero-Copy: [0..255] -> [0..1] normalization and elempack conversion 
+	executed on GPU.                                                                
+     * @param rotate_type EXIF orientation (1: 0 deg, 6: 90 deg CW, 3: 180 deg, 
+	8: 270 deg)                                                                     
+     * @param fence_fd Synchronization fence file descriptor from Camera2 HAL   
+	(-1 if none)                                                                    
+     */                                                                         
+    int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,   
+                   std::vector<Object>& objects, int rotate_type = 1, int       
+	fence_fd = -1);
+
+    /**
+     * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
+     * Layout: [count, zone_id0, class0, score0, norm_x0, norm_y0, norm_w0, norm_h0, zone_id1, ...]
+     */
+    int pack_detections_flat(const std::vector<Object>& objects, float* out_buffer, int max_capacity);
+
+    /**
+     * Returns true if any detected obstacle is inside Zone 0 (Critical Zone: bottom_y > 0.70).
+     */
+    bool is_emergency_stop_active() const { return emergency_stop_triggered; }
+
+    /**
+     * Resets the Emergency Stop flag.
+     */
+    void reset_emergency_stop() { emergency_stop_triggered = false; }
+
+    /**
+     * Diagnostics: Returns highest raw score and class seen in last frame (before conf_thresh filtering)
+     */
+    float get_top_candidate_score() const { return last_top_score; }
+    int get_top_candidate_class() const { return last_top_class; }
+
+    /**
+     * Clears all cached Vulkan pipelines and GPU resources.
+     */
+    void clear_ahb_cache();
+
+    /**
+     * Returns configured model target resolution.
+     */
+    int get_target_width() const { return target_w; }
+    int get_target_height() const { return target_h; }
+    bool is_ready() const { return model_loaded; }
+
+private:
+    void generate_grids_and_stride(int target_w, int target_h);
+    void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
+    void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);
+
+    // NCNN network & Vulkan device
+    ncnn::Net net;
+    ncnn::VulkanDevice* vkdev;
+    ncnn::Layer* scale_layer;
+
+    // Cached Vulkan Import Pipeline for AHardwareBuffer (eliminates 24ms shader compile overhead)
+    ncnn::ImportAndroidHardwareBufferPipeline* cached_ahb_pipeline;
+    int cached_ahb_format;
+    int cached_ahb_width;
+    int cached_ahb_height;
+    int cached_ahb_rotate;
+
+    // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
+    std::vector<GridAndStride> grid_strides;
+    std::vector<Object> proposal_scratchpad;
+    std::vector<Object> candidates_scratchpad;
+    std::vector<int> nms_indices_scratchpad;
+
+    // Model configurations
+    int target_w;
+    int target_h;
+    int num_classes;
+    bool model_loaded;
+    bool use_vulkan_compute;
+    bool emergency_stop_triggered;
+
+    // Live diagnostics for raw score inspection
+    float last_top_score;
+    int last_top_class;
+
+    // Statically allocated softmax distribution lookup / scratchpad for DFL
+    static const int REG_MAX = 16;
+    float dfl_distribution_scratchpad[REG_MAX];
+};
+
+#endif // YOLO11_H

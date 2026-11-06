@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kosiarka YOLO11 - Samodzielny Pulpit Telemetrii</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #020617;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 20px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-b: 1px solid #1e293b;
+      padding-bottom: 15px;
+      margin-bottom: 20px;
+    }
+    .title-box h1 { font-size: 1.25rem; font-weight: bold; color: #fff; }
+    .title-box p { font-size: 0.75rem; color: #94a3b8; }
+    .badge {
+      font-size: 0.75rem;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-family: monospace;
+    }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 16px;
+    }
+    .conn-bar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 15px;
+      align-items: center;
+    }
+    .conn-bar input {
+      flex: 1;
+      background: #020617;
+      border: 1px solid #334155;
+      color: #38bdf8;
+      font-family: monospace;
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+    }
+    .btn {
+      background: #059669;
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 0.85rem;
+    }
+    .btn:hover { background: #10b981; }
+    .btn-red { background: #dc2626; }
+    .btn-red:hover { background: #ef4444; }
+    .btn-slate { background: #334155; color: #cbd5e1; }
+    .btn-slate:hover { background: #475569; }
+    .video-viewport {
+      position: relative;
+      aspect-ratio: 4 / 3;
+      background: #020617;
+      border: 2px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+      margin-bottom: 15px;
+    }
+    .line-horizon {
+      position: absolute;
+      top: 35%;
+      left: 0; right: 0;
+      border-bottom: 2px dashed rgba(16, 185, 129, 0.6);
+      color: #34d399;
+      font-size: 10px;
+      font-family: monospace;
+      padding: 2px 8px;
+      background: rgba(6, 78, 59, 0.3);
+      display: flex;
+      justify-content: space-between;
+    }
+    .line-critical {
+      position: absolute;
+      top: 70%;
+      left: 0; right: 0;
+      border-bottom: 2px dashed rgba(239, 68, 68, 0.8);
+      color: #f87171;
+      font-size: 10px;
+      font-family: monospace;
+      padding: 2px 8px;
+      background: rgba(127, 29, 29, 0.4);
+      display: flex;
+      justify-content: space-between;
+    }
+    .obstacle {
+      position: absolute;
+      border-radius: 6px;
+      border: 2px solid;
+      padding: 2px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: all 0.08s linear;
+    }
+    .obstacle.crit { border-color: #ef4444; background: rgba(239, 68, 68, 0.35); }
+    .obstacle.react { border-color: #f59e0b; background: rgba(245, 158, 11, 0.2); }
+    .obstacle.horiz { border-color: #10b981; background: rgba(16, 185, 129, 0.2); }
+    .obstacle-tag {
+      background: rgba(2, 6, 23, 0.85);
+      color: #fff;
+      font-size: 9px;
+      font-family: monospace;
+      padding: 1px 4px;
+      border-radius: 4px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+    .metric-box {
+      background: #020617;
+      border: 1px solid #1e293b;
+      padding: 12px;
+      border-radius: 10px;
+    }
+    .metric-box span { font-size: 10px; color: #64748b; font-family: monospace; display: block; }
+    .metric-box strong { font-size: 1.25rem; font-family: monospace; color: #38bdf8; }
+    .log-box {
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 10px;
+      padding: 10px;
+      height: 180px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.4;
+    }
+    .status-pill {
+      font-size: 11px;
+      font-weight: bold;
+      padding: 4px 8px;
+      border-radius: 6px;
+      display: inline-block;
+      font-family: monospace;
+    }
+    .status-ok { background: rgba(16, 185, 129, 0.2); color: #34d399; }
+    .status-alarm { background: #dc2626; color: #fff; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title-box">
+      <h1>Kosiarka YOLO11 Vision Dashboard (Lokalny Klient)</h1>
+      <p>Direct WebSocket: ADB USB (localhost:8080) lub Wi-Fi (192.168.223.127:8080)</p>
+    </div>
+    <div class="badge" id="estopBadge">STAN BEZPIECZNY</div>
+  </div>
+
+  <div class="conn-bar card">
+    <input type="text" id="wsInput" value="ws://localhost:8080">
+    <button class="btn-slate" onclick="setTarget('ws://localhost:8080')">USB (localhost)</button>
+    <button class="btn-slate" onclick="setTarget('ws://192.168.223.127:8080')">Wi-Fi (S9+)</button>
+    <button class="btn" id="btnConnect" onclick="toggleConnect()">Połącz</button>
+  </div>
+
+  <!-- Próg pewności -->
+  <div class="card" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; gap: 20px;">
+    <div style="flex: 1;">
+      <div style="display: flex; justify-content: space-between; font-size: 12px; font-family: monospace; margin-bottom: 6px;">
+        <span>Próg Pewności (Confidence Threshold):</span>
+        <strong id="confLabel" style="color: #34d399;">25% (0.25)</strong>
+      </div>
+      <input type="range" id="confSlider" min="0.02" max="0.75" step="0.01" value="0.25" style="width: 100%; cursor: pointer;" oninput="onConfChange(this.value)">
+    </div>
+    <div>
+      <button class="btn-slate" onclick="setConf(0.05)">5% (Czuły)</button>
+      <button class="btn-slate" onclick="setConf(0.15)">15% (Średni)</button>
+      <button class="btn-slate" onclick="setConf(0.25)">25% (Standard)</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="video-viewport" id="viewport">
+        <!-- Granice stref -->
+        <div class="line-horizon">
+          <span>HORYZONT (y = 0.35) &bull; ODOMETRIA</span>
+          <span>STREFA 2 &uarr; | STREFA 1 &darr;</span>
+        </div>
+        <div class="line-critical">
+          <span>STREFA KRYTYCZNA (y = 0.70) &bull; TWARDY E-STOP</span>
+          <span>STREFA 1 &uarr; | STREFA 0 &darr;</span>
+        </div>
+        <div id="obstacleContainer"></div>
+      </div>
+
+      <div style="display: flex; gap: 10px;">
+        <button class="btn btn-red" style="flex: 1; padding: 12px;" onclick="sendCmd('EMERGENCY_STOP')">
+          🛑 WYMUŚ TWARDY E-STOP (ZATRZYMAJ NÓŻ)
+        </button>
+        <button class="btn-slate" style="padding: 12px 20px;" onclick="sendCmd('RESET_ESTOP')">
+          🔄 Zresetuj E-STOP
+        </button>
+      </div>
+    </div>
+
+    <div>
+      <div class="card" style="margin-bottom: 20px;">
+        <div class="metrics">
+          <div class="metric-box">
+            <span>FPS KAMERY:</span>
+            <strong id="fpsVal">0.0</strong>
+          </div>
+          <div class="metric-box">
+            <span>OBIEKTY:</span>
+            <strong id="countVal" style="color: #34d399;">0</strong>
+          </div>
+          <div class="metric-box">
+            <span>TOP KANDYDAT:</span>
+            <strong id="topScoreVal" style="color: #fbbf24;">0.0%</strong>
+          </div>
+          <div class="metric-box">
+            <span>KLASA TOP:</span>
+            <strong id="topClassVal">-</strong>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="font-size: 12px; font-family: monospace; color: #94a3b8; margin-bottom: 10px;">LOGI TELEMETRII:</h3>
+        <div class="log-box" id="logBox"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const COCO = ['person','bicycle','car','motorcycle','airplane','bus','train','truck','boat','traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack','umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball','kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket','bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple','sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair','couch','potted plant','bed','dining table','toilet','tv','laptop','mouse','remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator','book','clock','vase','scissors','teddy bear','hair drier','toothbrush'];
+
+    let ws = null;
+    let confThresh = 0.25;
+
+    function addLog(msg) {
+      const b = document.getElementById('logBox');
+      const time = new Date().toLocaleTimeString();
+      b.innerHTML = `<div>[${time}] ${msg}</div>` + b.innerHTML;
+    }
+
+    function setTarget(url) {
+      document.getElementById('wsInput').value = url;
+      if (ws) toggleConnect();
+      toggleConnect();
+    }
+
+    function toggleConnect() {
+      if (ws) {
+        ws.close();
+        ws = null;
+        document.getElementById('btnConnect').innerText = 'Połącz';
+        document.getElementById('btnConnect').className = 'btn';
+        addLog('Rozłączono.');
+        return;
+      }
+
+      const url = document.getElementById('wsInput').value.trim();
+      addLog('Łączenie z ' + url + '...');
+
+      try {
+        ws = new WebSocket(url);
+        ws.onopen = () => {
+          document.getElementById('btnConnect').innerText = 'Rozłącz';
+          document.getElementById('btnConnect').className = 'btn btn-red';
+          addLog('POŁĄCZONO z ' + url);
+        };
+        ws.onmessage = (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            if (d.type === 'telemetry') {
+              handleTelemetry(d);
+            } else if (d.type === 'status') {
+              addLog(`STATUS: [${d.status}] ${d.detail || ''}`);
+            }
+          } catch(err) {}
+        };
+        ws.onerror = (err) => {
+          addLog('Błąd połączenia. Upewnij się, że wykonałeś: adb forward tcp:8080 tcp:8080');
+        };
+        ws.onclose = () => {
+          document.getElementById('btnConnect').innerText = 'Połącz';
+          document.getElementById('btnConnect').className = 'btn';
+          ws = null;
+        };
+      } catch(e) {
+        addLog('Wyjątek: ' + e.message);
+      }
+    }
+
+    function handleTelemetry(d) {
+      if (d.fps !== undefined) document.getElementById('fpsVal').innerText = d.fps;
+      if (d.count !== undefined) document.getElementById('countVal').innerText = d.count;
+      if (d.topScore !== undefined) {
+        document.getElementById('topScoreVal').innerText = (parseFloat(d.topScore) * 100).toFixed(1) + '%';
+      }
+      if (d.topClass !== undefined) {
+        const clsId = parseInt(d.topClass);
+        document.getElementById('topClassVal').innerText = (clsId >= 0 && clsId < COCO.length) ? COCO[clsId] : clsId;
+      }
+
+      const estop = Boolean(d.eStop);
+      const b = document.getElementById('estopBadge');
+      if (estop) {
+        b.innerText = 'ALARM: E-STOP (ZATRZYMANO NÓŻ)';
+        b.className = 'status-pill status-alarm';
+      } else {
+        b.innerText = 'STAN BEZPIECZNY';
+        b.className = 'status-pill status-ok';
+      }
+
+      renderObstacles(d.objects || []);
+    }
+
+    function renderObstacles(objs) {
+      const c = document.getElementById('obstacleContainer');
+      c.innerHTML = '';
+      objs.forEach(o => {
+        const div = document.createElement('div');
+        const isCrit = o.zone === 0;
+        const isReact = o.zone === 1;
+        div.className = 'obstacle ' + (isCrit ? 'crit' : isReact ? 'react' : 'horiz');
+        div.style.left = (Math.max(2, Math.min(85, o.x * 100))) + '%';
+        div.style.top = (Math.max(5, Math.min(85, o.y * 100))) + '%';
+        div.style.width = (Math.max(10, o.w * 100)) + '%';
+        div.style.height = (Math.max(8, o.h * 100)) + '%';
+
+        const name = (o.class >= 0 && o.class < COCO.length) ? COCO[o.class] : 'cls_' + o.class;
+        div.innerHTML = `
+          <div class="obstacle-tag">
+            <span>${name}</span>
+            <span>${(o.score * 100).toFixed(0)}%</span>
+          </div>
+        `;
+        c.appendChild(div);
+      });
+    }
+
+    function sendCmd(cmd) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ cmd: cmd }));
+        addLog('Wysłano komendę: ' + cmd);
+      } else {
+        addLog('Brak aktywnego połączenia WebSocket!');
+      }
+    }
+
+    function onConfChange(val) {
+      confThresh = parseFloat(val);
+      document.getElementById('confLabel').innerText = (confThresh * 100).toFixed(0) + '% (' + confThresh.toFixed(2) + ')';
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ cmd: 'SET_PARAMS', conf: confThresh, nms: 0.45 }));
+      }
+    }
+
+    function setConf(val) {
+      document.getElementById('confSlider').value = val;
+      onConfChange(val);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,499 @@
+package com.tencent.yolo11ncnn
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import android.util.Size
+import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AppCompatActivity
+import android.content.Context
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
+import android.hardware.camera2.*
+import android.media.ImageReader
+import android.os.Handler
+import android.os.HandlerThread
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * ============================================================================
+ * MainActivity - Autonomous Robotic Mower Vision Processor
+ * Platform: Samsung Galaxy S9+ (Mali-G72 MP18 + Exynos 9810)
+ *
+ * TRUE ZERO-COPY CAMERA2 PIPELINE:
+ * 1. Start TelemetryServer (Port 8080) w onCreate() - natychmiastowa gotowość WWW.
+ * 2. Inicjalizacja YOLO11 Vulkan w tle (Background Executor) - brak zamrażania UI/ANR!
+ * 3. Start Camera2 z ImageReader skonfigurowanym z flagą USAGE_GPU_SAMPLED_IMAGE
+ *    (Zero CPU copy, brak CameraX - strumień prosto do Vulkan AHardwareBuffer).
+ * ============================================================================
+ */
+class MainActivity : AppCompatActivity() {
+
+    private val yoloEngine = Yolo11Ncnn()
+    private lateinit var telemetryServer: TelemetryServer
+    private lateinit var backgroundInitExecutor: ExecutorService
+
+    // Camera2 background thread & components
+    private var cameraThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var imageReader: ImageReader? = null
+    private var sensorOrientation: Int = 90
+
+    // Pre-allocated flat buffer: 1 count float + 64 detections * 7 floats (449 floats)
+    // ZERO HEAP ALLOCATIONS ON THE FRAME LOOP!
+    private val detectionBuffer = FloatArray(1 + 64 * 7)
+
+    @Volatile private var confThreshold: Float = 0.25f
+    @Volatile private var nmsThreshold: Float = 0.45f
+    @Volatile private var manualEStop: Boolean = false
+
+    private val isYoloReady = AtomicBoolean(false)
+    private val isCameraRunning = AtomicBoolean(false)
+    private val isProcessingFrame = AtomicBoolean(false)
+
+    private var frameCount: Int = 0
+    private var lastFpsCalcTimeMs: Long = 0
+    private var currentFps: Float = 0f
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(android.R.layout.list_content)
+
+        backgroundInitExecutor = Executors.newSingleThreadExecutor()
+
+        // KROK 1: Start serwera WebSocket natychmiast
+        startTelemetryServer()
+
+        // KROK 2 & 3: Weryfikacja uprawnień i asynchroniczny start potoku
+        if (allPermissionsGranted()) {
+            launchAsyncPipeline()
+        } else {
+            telemetryServer.broadcastStatus("AWAITING_PERMISSIONS", "Oczekiwanie na akceptację uprawnień...")
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_CODE_PERMISSIONS) {
+            if (allPermissionsGranted()) {
+                Log.i(TAG, "Uprawnienia przyznane, uruchamianie potoku")
+                launchAsyncPipeline()
+            } else {
+                Log.e(TAG, "Brak uprawnień kamery!")
+                telemetryServer.broadcastStatus("ERROR_PERMISSIONS", "Brak uprawnień do kamery!")
+            }
+        }
+    }
+
+    private fun startTelemetryServer() {
+        try {
+            telemetryServer = TelemetryServer(
+                port = 8080,
+                onCommandReceived = { cmd, payload ->
+                    handleRemoteCommand(cmd, payload)
+                }
+            )
+            telemetryServer.start()
+            Log.i(TAG, "TelemetryServer wystartował na porcie 8080")
+            telemetryServer.broadcastStatus("SERVER_ONLINE", "Serwer WebSocket nasłuchuje na porcie 8080")
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd startu TelemetryServer", e)
+        }
+    }
+
+    private fun launchAsyncPipeline() {
+        backgroundInitExecutor.execute {
+            Log.i(TAG, "KROK 2: Ładowanie YOLO11 Vulkan w tle...")
+            telemetryServer.broadcastStatus("INIT_YOLO", "Inicjalizacja GPU Mali-G72 i ładowanie wag YOLO11...")
+
+            val startTime = System.currentTimeMillis()
+            var initSuccess = false
+
+            try {
+                initSuccess = yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, true)
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd podczas init YOLO Vulkan", e)
+            }
+
+            val loadDuration = System.currentTimeMillis() - startTime
+
+            if (initSuccess) {
+                Log.i(TAG, "YOLO11 Vulkan Init sukces w " + loadDuration + "ms")
+                isYoloReady.set(true)
+                telemetryServer.broadcastStatus("YOLO_READY", "YOLO11 gotowe na Mali-G72 (" + loadDuration + "ms)")
+
+                // KROK 3: Start natywnej kamery Camera2 DOPIERO po gotowości YOLO
+                runOnUiThread {
+                    Log.i(TAG, "KROK 3: Uruchamianie Camera2 Direct AHB...")
+                    telemetryServer.broadcastStatus("STARTING_CAMERA", "Uruchamianie Camera2 HardwareBuffer stream...")
+                    startCamera2()
+                }
+            } else {
+                Log.w(TAG, "Vulkan Init nie powiódł się, fallback na CPU...")
+                telemetryServer.broadcastStatus("WARN_VULKAN", "Vulkan niedostępny, fallback CPU...")
+
+                val cpuSuccess = yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, false)
+                if (cpuSuccess) {
+                    isYoloReady.set(true)
+                    telemetryServer.broadcastStatus("YOLO_READY", "YOLO11 gotowe w trybie CPU")
+                    runOnUiThread {
+                        startCamera2()
+                    }
+                } else {
+                    Log.e(TAG, "Niepowodzenie ładowania wag z assets!")
+                    telemetryServer.broadcastStatus("ERROR_YOLO", "Błąd ładowania parametrów modelu!")
+                }
+            }
+        }
+    }
+
+    private fun handleRemoteCommand(cmd: String, payload: String) {
+        val q = '"'
+        when (cmd) {
+            "EMERGENCY_STOP" -> {
+                manualEStop = true
+                telemetryServer.broadcastStatus("ESTOP_MANUAL", "Twardy E-STOP z dashboardu!")
+            }
+            "RESET_ESTOP" -> {
+                manualEStop = false
+                yoloEngine.ResetEmergencyStop()
+                telemetryServer.broadcastStatus("ESTOP_RESET", "Zresetowano E-STOP")
+            }
+            "SET_PARAMS" -> {
+                try {
+                    val confKey = "" + q + "conf" + q
+                    val nmsKey = "" + q + "nms" + q
+                    val conf = payload.substringAfter(confKey, "").substringAfter(":", "").substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
+                    val nms = payload.substringAfter(nmsKey, "").substringAfter(":", "").substringBefore(",").substringBefore("}").replace("\"", "").trim().toFloatOrNull()
+                    if (conf != null) confThreshold = conf
+                    if (nms != null) nmsThreshold = nms
+                    telemetryServer.broadcastStatus("PARAMS_UPDATED", "conf=" + confThreshold + ", nms=" + nmsThreshold)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd parsowania SET_PARAMS", e)
+                }
+            }
+        }
+    }
+
+    private fun startCamera2() {
+        startCameraThread()
+        val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            var selectedCameraId: String? = null
+            for (id in cameraManager.cameraIdList) {
+                val characteristics = cameraManager.getCameraCharacteristics(id)
+                val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    selectedCameraId = id
+                    sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                    break
+                }
+            }
+
+            if (selectedCameraId == null && cameraManager.cameraIdList.isNotEmpty()) {
+                selectedCameraId = cameraManager.cameraIdList[0]
+            }
+
+            if (selectedCameraId == null) {
+                Log.e(TAG, "Brak dostępnej kamery w urządzeniu!")
+                telemetryServer.broadcastStatus("ERROR_CAMERA", "Brak dostępnej kamery!")
+                return
+            }
+
+            // Flag USAGE_GPU_SAMPLED_IMAGE (0x100) jest kluczowy dla Vulkan zero-copy!
+            val usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+            imageReader = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ImageReader.newInstance(320, 320, ImageFormat.YUV_420_888, 3, usage)
+            } else {
+                ImageReader.newInstance(320, 320, ImageFormat.YUV_420_888, 3)
+            }
+
+            imageReader?.setOnImageAvailableListener({ reader ->
+    // 1. Jeśli system nie jest gotowy lub GPU przetwarza poprzednią klatkę - zrzucamy bufor NATYCHMIAST
+    if (!isYoloReady.get() || isProcessingFrame.get()) {
+        val badImage = reader.acquireLatestImage()
+        badImage?.close()
+        return@setOnImageAvailableListener
+    }
+
+    // 2. Pobieramy klatkę do inferencji
+    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+    
+    // Blokujemy potok przed nadejściem kolejnej klatki
+    isProcessingFrame.set(true)
+
+    // Tworzymy wątek roboczy, aby NIE blokować wątku kamery, ale trzymać obiekt Image otwarty!
+    backgroundInitExecutor.execute {
+        try {
+            calculateFps()
+
+            val rotateType = when (sensorOrientation) {
+                90 -> 6
+                180 -> 3
+                270 -> 8
+                else -> 1
+            }
+
+            val hwBuffer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                image.hardwareBuffer
+            } else null
+
+            var count = 0
+            if (hwBuffer != null) {
+                try {
+                    // Ta linia blokuje ten wątek aż GPU Mali skończy obliczenia
+                    count = yoloEngine.DetectAHBDirect(
+                        hwBuffer,
+                        detectionBuffer,
+                        confThreshold,
+                        nmsThreshold,
+                        rotateType
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd DetectAHBDirect", e)
+                } finally {
+                    hwBuffer.close() // Bezpieczne zamknięcie buforu sprzętowego
+                }
+            }
+
+            val topScore = yoloEngine.GetTopScore()
+            val topClass = yoloEngine.GetTopClass()
+
+            if (frameCount == 1) {
+                Log.i(TAG, "Inference: FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
+                        " | Objects=" + count +
+                        " | TopCandidate=" + String.format(java.util.Locale.US, "%.3f", topScore) +
+                        " (class=" + topClass + ")")
+            }
+
+            val isHardwareEStop = yoloEngine.IsEmergencyStop()
+            val finalEStop = manualEStop || isHardwareEStop
+
+            // Budujemy i wysyłamy telemetrię – asynchronicznie, wewnątrz tego samego bezpiecznego wątku tła
+            val jsonPayload = buildJson(count, detectionBuffer, finalEStop, currentFps, topScore, topClass)
+            try {
+                telemetryServer.sendDetections(jsonPayload)
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd wysyłania telemetrii", e)
+            }
+
+            sendToSTM32(count, detectionBuffer, finalEStop)
+
+        } finally {
+            // KLUCZOWE: Zamykamy klatkę DOPIERO gdy wątek tła ukończył całkowicie inferencję i sieć!
+            image.close()
+            isProcessingFrame.set(false)
+        }
+    }
+}, cameraHandler)
+
+
+
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                return
+            }
+
+            cameraManager.openCamera(selectedCameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    createCameraCaptureSession()
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                    cameraDevice = null
+                    isCameraRunning.set(false)
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    cameraDevice = null
+                    isCameraRunning.set(false)
+                    Log.e(TAG, "CameraDevice error code: $error")
+                    telemetryServer.broadcastStatus("ERROR_CAMERA", "Błąd otwarcia Camera2: $error")
+                }
+            }, cameraHandler)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd konfiguracji Camera2", e)
+            telemetryServer.broadcastStatus("ERROR_CAMERA", "Błąd konfiguracji Camera2: ${e.message}")
+        }
+    }
+
+    private fun createCameraCaptureSession() {
+        val camera = cameraDevice ?: return
+        val surface = imageReader?.surface ?: return
+
+        try {
+            val captureRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
+
+            camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    if (cameraDevice == null) return
+                    captureSession = session
+                    try {
+                        session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler)
+                        isCameraRunning.set(true)
+                        Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
+                        telemetryServer.broadcastStatus("STREAMING", "Strumień aktywny (Camera2 + Mali-G72 True Zero-Copy)")
+                    } catch (e: CameraAccessException) {
+                        Log.e(TAG, "Błąd setRepeatingRequest", e)
+                    }
+                }
+
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Konfiguracja sesji Camera2 nie powiodła się")
+                    telemetryServer.broadcastStatus("ERROR_CAMERA", "Niepowodzenie konfiguracji sesji Camera2")
+                }
+            }, cameraHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd tworzenia CaptureSession", e)
+        }
+    }
+
+    private fun startCameraThread() {
+        if (cameraThread == null) {
+            cameraThread = HandlerThread("Camera2BackgroundThread").apply {
+                start()
+                cameraHandler = Handler(looper)
+            }
+        }
+    }
+
+    private fun stopCameraThread() {
+        cameraThread?.quitSafely()
+        try {
+            cameraThread?.join()
+            cameraThread = null
+            cameraHandler = null
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Błąd zatrzymywania wątku kamery", e)
+        }
+    }
+
+    private fun calculateFps() {
+        val now = System.currentTimeMillis()
+        frameCount++
+        if (now - lastFpsCalcTimeMs >= 1000) {
+            currentFps = (frameCount * 1000f) / (now - lastFpsCalcTimeMs)
+            frameCount = 0
+            lastFpsCalcTimeMs = now
+        }
+    }
+
+    private fun buildJson(count: Int, data: FloatArray, eStop: Boolean, fpsVal: Float, topScore: Float, topClass: Int): String {
+        val q = '"'
+        val sb = StringBuilder(512)
+        sb.append("{")
+            .append(q).append("type").append(q).append(":").append(q).append("telemetry").append(q).append(",")
+            .append(q).append("fps").append(q).append(":").append(String.format(java.util.Locale.US, "%.1f", fpsVal)).append(",")
+            .append(q).append("topScore").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", topScore)).append(",")
+            .append(q).append("topClass").append(q).append(":").append(topClass).append(",")
+            .append(q).append("conf").append(q).append(":").append(confThreshold).append(",")
+            .append(q).append("eStop").append(q).append(":").append(eStop).append(",")
+            .append(q).append("count").append(q).append(":").append(count).append(",")
+            .append(q).append("objects").append(q).append(":[")
+
+        for (i in 0 until count) {
+            val base = 1 + (i * 7)
+            sb.append("{")
+                .append(q).append("zone").append(q).append(":").append(data[base].toInt()).append(",")
+                .append(q).append("class").append(q).append(":").append(data[base + 1].toInt()).append(",")
+                .append(q).append("score").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 2])).append(",")
+                .append(q).append("x").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 3])).append(",")
+                .append(q).append("y").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 4])).append(",")
+                .append(q).append("w").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 5])).append(",")
+                .append(q).append("h").append(q).append(":").append(String.format(java.util.Locale.US, "%.3f", data[base + 6]))
+            sb.append("}")
+            if (i < count - 1) sb.append(",")
+        }
+        sb.append("]}")
+        return sb.toString()
+    }
+
+    private fun sendToSTM32(count: Int, data: FloatArray, eStop: Boolean) {
+        var critCount = 0
+        var reactCount = 0
+        var horizCount = 0
+
+        for (i in 0 until count) {
+            val zone = data[1 + i * 7].toInt()
+            when (zone) {
+                0 -> critCount++
+                1 -> reactCount++
+                2 -> horizCount++
+            }
+        }
+
+        val packet = STM32UartProtocol.buildObstaclePacket(
+            emergencyStop = eStop,
+            criticalCount = critCount,
+            reactionCount = reactCount,
+            horizonCount = horizCount,
+            nearestDistanceMm = if (critCount > 0) 150 else if (reactCount > 0) 650 else 2500,
+            steerAngleDeg = 0
+        )
+        if (packet.isNotEmpty() && eStop) {
+            Log.d(TAG, "STM32 E-STOP pakiet wysłany")
+        }
+    }
+
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isYoloReady.set(false)
+        isCameraRunning.set(false)
+
+        try {
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            imageReader?.close()
+            imageReader = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd zamykania zasobów Camera2", e)
+        }
+
+        stopCameraThread()
+        backgroundInitExecutor.shutdown()
+
+        if (::telemetryServer.isInitialized) {
+            try {
+                telemetryServer.stop()
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd zamykania TelemetryServer", e)
+            }
+        }
+        yoloEngine.ClearCache()
+        yoloEngine.Destroy()
+    }
+
+    companion object {
+        private const val TAG = "Mower_Vision_Core"
+        private const val REQUEST_CODE_PERMISSIONS = 10
+        private val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.INTERNET
+        )
+    }
+}
