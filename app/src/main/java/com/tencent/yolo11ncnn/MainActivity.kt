@@ -206,7 +206,8 @@ class MainActivity : AppCompatActivity() {
 
             // Prefer a square stream; otherwise choose the closest aspect ratio and
             // report the mismatch instead of assuming 320x320 is supported by the HAL.
-            val inputSize = yuvSizes.minByOrNull { size ->
+            val usableSizes = yuvSizes.filter { minOf(it.width, it.height) >= 240 }.ifEmpty { yuvSizes }
+            val inputSize = usableSizes.minByOrNull { size ->
                 val aspectPenalty = kotlin.math.abs(size.width.toDouble() / size.height.toDouble() - 1.0) * 10000.0
                 val areaPenalty = kotlin.math.abs(size.width * size.height - 320 * 320).toDouble() / 1000.0
                 aspectPenalty + areaPenalty
@@ -267,8 +268,8 @@ class MainActivity : AppCompatActivity() {
                         val count = rawCount.coerceAtLeast(0)
                         if (rawCount < 0) Log.e(TAG, "Detekcja nie powiodła się: code=$rawCount frame=$frameId")
 
-                        val topScore = yoloEngine.GetTopScore()
-                        val topClass = yoloEngine.GetTopClass()
+                        val topScore = if (rawCount >= 0) yoloEngine.GetTopScore() else 0f
+                        val topClass = if (rawCount >= 0) yoloEngine.GetTopClass() else -1
 
                         if (frameId % 30L == 0L) {
                             Log.i(TAG, "Frame=$frameId imageTs=$imageTimestampNs FPS=" +
