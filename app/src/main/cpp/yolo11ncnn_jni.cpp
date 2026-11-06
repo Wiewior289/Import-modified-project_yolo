@@ -36,8 +36,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 
     const int vk_ret = ncnn::create_gpu_instance();
     if (vk_ret != 0) {
+        // Keep the Java diagnostics server usable; Init() will report Vulkan unavailable.
         LOGE("ncnn::create_gpu_instance failed: %d", vk_ret);
-        return JNI_ERR;
+        return JNI_VERSION_1_6;
     }
 
     g_ncnn_gpu_instance_ready = true;
