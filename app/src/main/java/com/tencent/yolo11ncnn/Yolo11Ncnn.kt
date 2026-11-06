@@ -20,9 +20,9 @@ class Yolo11Ncnn {
         const val MODEL_YOLO11S = 1
         const val MODEL_YOLO11M = 2
 
-        const val ZONE_CRITICAL = 0
-        const val ZONE_REACTION = 1
-        const val ZONE_HORIZON  = 2
+        const val ZONE_NEAR = 0
+        const val ZONE_MID = 1
+        const val ZONE_FAR = 2
     }
 
     /**
@@ -57,16 +57,6 @@ class Yolo11Ncnn {
      * Returns the class ID corresponding to the highest raw prediction score.
      */
     external fun GetTopClass(): Int
-
-    /**
-     * Returns true if any obstacle is currently inside Zone 0 (Critical Zone).
-     */
-    external fun IsEmergencyStop(): Boolean
-
-    /**
-     * Clears the latch on Emergency Stop.
-     */
-    external fun ResetEmergencyStop()
 
     /**
      * Releases cached Vulkan pipelines and GPU textures.
