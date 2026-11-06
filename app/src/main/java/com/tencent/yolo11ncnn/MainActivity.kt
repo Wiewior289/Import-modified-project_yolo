@@ -141,20 +141,12 @@ class MainActivity : AppCompatActivity() {
                     startCamera2()
                 }
             } else {
-                Log.w(TAG, "Vulkan Init nie powiódł się, fallback na CPU...")
-                telemetryServer.broadcastStatus("WARN_VULKAN", "Vulkan niedostępny, fallback CPU...")
-
-                val cpuSuccess = yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, false)
-                if (cpuSuccess) {
-                    isYoloReady.set(true)
-                    telemetryServer.broadcastStatus("YOLO_READY", "YOLO11 gotowe w trybie CPU")
-                    runOnUiThread {
-                        startCamera2()
-                    }
-                } else {
-                    Log.e(TAG, "Niepowodzenie ładowania wag z assets!")
-                    telemetryServer.broadcastStatus("ERROR_YOLO", "Błąd ładowania parametrów modelu!")
-                }
+                isYoloReady.set(false)
+                Log.e(TAG, "Vulkan/AHB init failed; refusing to start a CPU path that cannot consume AHardwareBuffer")
+                telemetryServer.broadcastStatus(
+                    "ERROR_AHB_VULKAN",
+                    "Import AHardwareBuffer do Vulkan niedostępny. Ścieżka CPU nie jest zaimplementowana."
+                )
             }
         }
     }
