@@ -5,7 +5,7 @@ import android.hardware.HardwareBuffer
 
 /**
  * ============================================================================
- * Yolo11Ncnn - Kotlin JNI Wrapper for Mali-G72 Zero-Copy Inference
+ * Yolo11Ncnn - Kotlin JNI Wrapper for Mali-G72 AHardwareBuffer Input
  * Target: Samsung Galaxy S9+ (Mali-G72 MP18 + Exynos 9810)
  * ============================================================================
  */
@@ -36,7 +36,7 @@ class Yolo11Ncnn {
     ): Boolean
 
     /**
-     * ULTRA ZERO-COPY & ZERO-GC METHOD:
+     * AHardwareBuffer input method:
      * Directly fills pre-allocated [outBuffer] with detections from [hardwareBuffer].
      * @return Number of detected objects.
      */
