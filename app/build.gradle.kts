@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.tencent.yolo11ncnn"
-        minSdk = 28 // Wymagane dla AHardwareBuffer Zero-Copy & GPU sampled image
+        minSdk = 29 // Required for ImageReader.newInstance(..., usage) with GPU_SAMPLED_IMAGE
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
