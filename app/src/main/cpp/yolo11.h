@@ -3,7 +3,7 @@
 
 /**
  * ============================================================================
- * YOLO11 NCNN Zero-Copy AHardwareBuffer Engine for Autonomous Robotic Mower
+ * YOLO11 NCNN AHardwareBuffer Vulkan Import Engine for Autonomous Robotic Mower
  * Platform: Samsung Galaxy S9+ (Samsung Exynos 9810 + Mali-G72 MP18 Bifrost GPU)
  * Actuator MCU: STM32F405 (UART/CAN control interface)
  * Framework: Tencent ncnn (Vulkan GPU Acceleration & AHardwareBuffer Zero-Copy)
@@ -36,7 +36,7 @@ enum ObstacleZone {
 };
 
 struct Object {
-    int zone_id;       // 0: Critical, 1: Reaction, 2: Horizon
+    int zone_id;       // 0: Near image band, 1: Mid image band, 2: Far image band
     int label;         // Class index (COCO or custom mower obstacle class)
     float prob;        // Detection confidence [0.0, 1.0]
     float x;           // Bounding box left (pixel coordinate)
