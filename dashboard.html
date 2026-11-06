@@ -72,7 +72,7 @@
     .btn-slate:hover { background: #475569; }
     .video-viewport {
       position: relative;
-      aspect-ratio: 4 / 3;
+      aspect-ratio: 1 / 1;
       background: #020617;
       border: 2px solid #334155;
       border-radius: 12px;
@@ -168,7 +168,7 @@
       <h1>Kosiarka YOLO11 Vision Dashboard (Lokalny Klient)</h1>
       <p>Direct WebSocket: ADB USB (localhost:8080) lub Wi-Fi (192.168.223.127:8080)</p>
     </div>
-    <div class="badge" id="estopBadge">STAN BEZPIECZNY</div>
+    <div class="badge">FRAME: <span id="frameVal">-</span></div>
   </div>
 
   <div class="conn-bar card">
@@ -203,32 +203,28 @@
           <span>STREFA 2 &uarr; | STREFA 1 &darr;</span>
         </div>
         <div class="line-critical">
-          <span>STREFA KRYTYCZNA (y = 0.70) &bull; TWARDY E-STOP</span>
+          <span>GRANICA STREFY BLISKIEJ (y = 0.70) • PODZIAŁ DIAGNOSTYCZNY</span>
           <span>STREFA 1 &uarr; | STREFA 0 &darr;</span>
         </div>
         <div id="obstacleContainer"></div>
       </div>
 
-      <div style="display: flex; gap: 10px;">
-        <button class="btn btn-red" style="flex: 1; padding: 12px;" onclick="sendCmd('EMERGENCY_STOP')">
-          🛑 WYMUŚ TWARDY E-STOP (ZATRZYMAJ NÓŻ)
-        </button>
-        <button class="btn-slate" style="padding: 12px 20px;" onclick="sendCmd('RESET_ESTOP')">
-          🔄 Zresetuj E-STOP
-        </button>
-      </div>
     </div>
 
     <div>
       <div class="card" style="margin-bottom: 20px;">
         <div class="metrics">
           <div class="metric-box">
-            <span>FPS KAMERY:</span>
+            <span>FPS PRZETWARZANIA:</span>
             <strong id="fpsVal">0.0</strong>
           </div>
           <div class="metric-box">
             <span>OBIEKTY:</span>
             <strong id="countVal" style="color: #34d399;">0</strong>
+          </div>
+          <div class="metric-box">
+            <span>ID KLATKI:</span>
+            <strong id="frameMetric">-</strong>
           </div>
           <div class="metric-box">
             <span>TOP KANDYDAT:</span>
@@ -320,14 +316,9 @@
         document.getElementById('topClassVal').innerText = (clsId >= 0 && clsId < COCO.length) ? COCO[clsId] : clsId;
       }
 
-      const estop = Boolean(d.eStop);
-      const b = document.getElementById('estopBadge');
-      if (estop) {
-        b.innerText = 'ALARM: E-STOP (ZATRZYMANO NÓŻ)';
-        b.className = 'status-pill status-alarm';
-      } else {
-        b.innerText = 'STAN BEZPIECZNY';
-        b.className = 'status-pill status-ok';
+      if (d.frameId !== undefined) {
+        document.getElementById('frameVal').innerText = d.frameId;
+        document.getElementById('frameMetric').innerText = d.frameId;
       }
 
       renderObstacles(d.objects || []);
@@ -341,10 +332,10 @@
         const isCrit = o.zone === 0;
         const isReact = o.zone === 1;
         div.className = 'obstacle ' + (isCrit ? 'crit' : isReact ? 'react' : 'horiz');
-        div.style.left = (Math.max(2, Math.min(85, o.x * 100))) + '%';
-        div.style.top = (Math.max(5, Math.min(85, o.y * 100))) + '%';
-        div.style.width = (Math.max(10, o.w * 100)) + '%';
-        div.style.height = (Math.max(8, o.h * 100)) + '%';
+        div.style.left = (o.x * 100) + '%';
+        div.style.top = (o.y * 100) + '%';
+        div.style.width = (o.w * 100) + '%';
+        div.style.height = (o.h * 100) + '%';
 
         const name = (o.class >= 0 && o.class < COCO.length) ? COCO[o.class] : 'cls_' + o.class;
         div.innerHTML = `
@@ -355,15 +346,6 @@
         `;
         c.appendChild(div);
       });
-    }
-
-    function sendCmd(cmd) {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ cmd: cmd }));
-        addLog('Wysłano komendę: ' + cmd);
-      } else {
-        addLog('Brak aktywnego połączenia WebSocket!');
-      }
     }
 
     function onConfChange(val) {
