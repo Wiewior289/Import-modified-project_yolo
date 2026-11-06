@@ -26,21 +26,40 @@ static const int MAX_DETECTION_FLOATS = 1 + 64 * 7;
 static float g_flat_buffer[MAX_DETECTION_FLOATS];
 static std::vector<Object> g_objects_scratchpad;
 static std::atomic<bool> g_first_ahb_logged(false);
+static bool g_ncnn_gpu_instance_ready = false;
 
 extern "C" {
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     LOGI("JNI_OnLoad called for YOLO11 AHB Import Mali-G72 Native Module");
+
+    const int vk_ret = ncnn::create_gpu_instance();
+    if (vk_ret != 0) {
+        LOGE("ncnn::create_gpu_instance failed: %d", vk_ret);
+        return JNI_ERR;
+    }
+
+    g_ncnn_gpu_instance_ready = true;
+    const int gpu_count = ncnn::get_gpu_count();
+    LOGI("NCNN Vulkan instance ready; detected GPU count=%d", gpu_count);
     return JNI_VERSION_1_6;
 }
 
-JNIEXPORT void JNI_OnUnload(JavaVM* vm, void* reserved)
+JNIEXPORT void JNICALL
+JNI_OnUnload(JavaVM* vm, void* reserved)
 {
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_yolo) {
-        delete g_yolo;
-        g_yolo = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_yolo) {
+            delete g_yolo;
+            g_yolo = nullptr;
+        }
+    }
+
+    if (g_ncnn_gpu_instance_ready) {
+        ncnn::destroy_gpu_instance();
+        g_ncnn_gpu_instance_ready = false;
     }
 }
 
