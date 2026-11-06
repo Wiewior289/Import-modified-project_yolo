@@ -10,8 +10,8 @@
 #include "yolo11.h"
 
 #include <android/log.h>
-#include <poll.h>
-#include <unistd.h>
+#include <chrono>
+#include <new>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -23,21 +23,10 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 Yolo11::Yolo11()
-    : vkdev(nullptr),
-      scale_layer(nullptr),
-      cached_ahb_pipeline(nullptr),
-      cached_ahb_format(0),
-      cached_ahb_width(0),
-      cached_ahb_height(0),
-      cached_ahb_rotate(1),
-      target_w(320),
-      target_h(320),
-      num_classes(80),
-      model_loaded(false),
-      use_vulkan_compute(true),
-      emergency_stop_triggered(false),
-      last_top_score(0.0f),
-      last_top_class(-1)
+    : vkdev(nullptr), scale_layer(nullptr), ahb_cache_clock(0),
+      target_w(320), target_h(320), num_classes(80),
+      model_loaded(false), use_vulkan_compute(true),
+      last_top_score(0.0f), last_top_class(-1)
 {
     std::memset(dfl_distribution_scratchpad, 0, sizeof(dfl_distribution_scratchpad));
 }
@@ -56,17 +45,26 @@ Yolo11::~Yolo11()
     net.clear();
 }
 
+void Yolo11::destroy_ahb_cache_entry(AHBImportCacheEntry* entry)
+{
+    if (!entry) return;
+    delete entry->pipeline;
+    entry->pipeline = nullptr;
+    entry->src = ncnn::VkImageMat();
+    delete entry->allocator;
+    entry->allocator = nullptr;
+    if (entry->ahb) {
+        AHardwareBuffer_release(entry->ahb);
+        entry->ahb = nullptr;
+    }
+    delete entry;
+}
+
 void Yolo11::clear_ahb_cache()
 {
-    if (cached_ahb_pipeline) {
-        LOGI("Releasing cached Vulkan ImportAndroidHardwareBufferPipeline...");
-        delete cached_ahb_pipeline;
-        cached_ahb_pipeline = nullptr;
-    }
-    cached_ahb_format = 0;
-    cached_ahb_width = 0;
-    cached_ahb_height = 0;
-    cached_ahb_rotate = 1;
+    for (auto& item : ahb_import_cache) destroy_ahb_cache_entry(item.second);
+    ahb_import_cache.clear();
+    ahb_cache_clock = 0;
 }
 
 int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu)
@@ -83,30 +81,27 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
     target_h = target_size;
     use_vulkan_compute = use_gpu;
     model_loaded = false;
-    emergency_stop_triggered = false;
     last_top_score = 0.0f;
     last_top_class = -1;
 
-    int gpu_count = ncnn::get_gpu_count();
-    if (use_gpu && gpu_count > 0) {
-        vkdev = ncnn::get_gpu_device(0);
-        if (!vkdev) {
-            LOGW("GPU device 0 returned null, falling back to CPU");
-            use_vulkan_compute = false;
-        } else {
-            const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
-            if (ahb_ext <= 0) {
-                LOGW("Vulkan driver lacks VK_ANDROID_external_memory_android_hardware_buffer (ver %d)", ahb_ext);
-            } else {
-                LOGI("Vulkan AHB zero-copy extension detected: version %d on Mali-G72", ahb_ext);
-            }
-
-            net.set_vulkan_device(vkdev);
-        }
-    } else {
-        use_vulkan_compute = false;
-        vkdev = nullptr;
+    const int gpu_count = ncnn::get_gpu_count();
+    if (!use_gpu || gpu_count <= 0) {
+        LOGE("AHB camera inference requires Vulkan; CPU fallback is not implemented in this path");
+        return -4;
     }
+    vkdev = ncnn::get_gpu_device(0);
+    if (!vkdev || !vkdev->is_valid()) {
+        LOGE("No valid Vulkan device available for AHB import");
+        return -4;
+    }
+    const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
+    if (ahb_ext <= 0) {
+        LOGE("Vulkan device lacks VK_ANDROID_external_memory_android_hardware_buffer (version %d)", ahb_ext);
+        return -4;
+    }
+    use_vulkan_compute = true;
+    net.set_vulkan_device(vkdev);
+    LOGI("AHB import extension available (spec version %d)", ahb_ext);
 
     net.opt.use_vulkan_compute  = use_vulkan_compute;
     net.opt.use_fp16_packed     = use_vulkan_compute;
@@ -211,158 +206,181 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
     }
 }
 
-int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh, std::vector<Object>& objects, int rotate_type, int fence_fd)                                                                       
-{                                                                               
-    if (!model_loaded) {                                                        
-        LOGE("detect_ahb failed: Model not loaded");                            
-        return -1;                                                              
-    }                                                                           
-                                                                                
-    if (!ahb) {                                                                 
-        LOGE("detect_ahb failed: Null AHardwareBuffer");                        
-        return -2;                                                              
-    }                                                                           
-                                                                                
-    if (!use_vulkan_compute || !vkdev) {                                        
-        LOGE("detect_ahb requires active VulkanDevice on Mali-G72");            
-        return -3;                                                              
-    }                                                                           
-                                                                                
-    // Synchronizacja z Camera2 HAL (jesli przekazano fence_fd)                 
-    if (fence_fd >= 0) {                                                        
-        struct pollfd pfd;                                                      
-        pfd.fd = fence_fd;                                                      
-        pfd.events = POLLIN;                                                    
-        int poll_ret = poll(&pfd, 1, 300); // 300ms timeout                     
-        if (poll_ret < 0) {                                                     
-            LOGW("sync_wait poll fence failed");                                
-        }                                                                       
-        close(fence_fd);                                                        
-    }                                                                           
-                                                                                
-    // ------------------------------------------------------------------------ 
-    // Step 1: Manage AHardwareBuffer Pipeline Cache with Hardware Rotation     
-    // ------------------------------------------------------------------------ 
-    AHardwareBuffer_Desc desc;                                                  
-    AHardwareBuffer_describe(ahb, &desc);                                       
-                                                                                
-    if (!cached_ahb_pipeline ||                                                 
-        cached_ahb_format != static_cast<int>(desc.format) ||                   
-        cached_ahb_width  != static_cast<int>(desc.width) ||                    
-        cached_ahb_height != static_cast<int>(desc.height) ||                   
-        cached_ahb_rotate != rotate_type)                                       
-    {                                                                           
-        if (cached_ahb_pipeline) {                                              
-            delete cached_ahb_pipeline;                                         
-            cached_ahb_pipeline = nullptr;                                      
-        }                                                                       
-                                                                                
-        LOGI("Compiling ImportAndroidHardwareBufferPipeline: fmt=%u (%ux%u) rotate=%d...",                                                                  
-             desc.format, desc.width, desc.height, rotate_type);                
-                                                                                
-        ncnn::VkAndroidHardwareBufferImageAllocator init_alloc(vkdev, ahb);     
-        cached_ahb_pipeline = new ncnn::ImportAndroidHardwareBufferPipeline(vkdev);                               
-                                                                                
-        ncnn::Option opt = net.opt;                                             
-		opt.use_vulkan_compute = true;                                          
-		opt.use_fp16_storage = false;    
-		opt.use_fp16_packed = false;
+int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                         std::vector<Object>& objects, int rotate_type)
+{
+    last_top_score = 0.0f;
+    last_top_class = -1;
+    objects.clear();
+    if (!model_loaded) return -1;
+    if (!ahb) return -2;
+    if (!use_vulkan_compute || !vkdev) return -3;
 
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(ahb, &desc);
+    if (desc.width == 0 || desc.height == 0 ||
+        (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0) {
+        LOGE("AHB not importable: %ux%u usage=0x%llx; GPU_SAMPLED_IMAGE required",
+             desc.width, desc.height, static_cast<unsigned long long>(desc.usage));
+        return -4;
+    }
 
-                                                                                
-        int pipe_ret = cached_ahb_pipeline->create(&init_alloc, 1, rotate_type, target_w, target_h, opt);                                                       
-        if (pipe_ret != 0) {                                                    
-            LOGE("Failed to create ImportAndroidHardwareBufferPipeline: %d", pipe_ret);                                                                      
-            delete cached_ahb_pipeline;                                         
-            cached_ahb_pipeline = nullptr;                                      
-            return -4;                                                          
-        }                                                                       
-                                                                                
-        cached_ahb_format = static_cast<int>(desc.format);                      
-        cached_ahb_width  = static_cast<int>(desc.width);                       
-        cached_ahb_height = static_cast<int>(desc.height);                      
-        cached_ahb_rotate = rotate_type;                                        
-        LOGI("ImportAndroidHardwareBufferPipeline compiled and cached successfully!");                                                                
-    }                                                                           
-                                                                                
-    // ------------------------------------------------------------------------ 
-    // Step 2: TRUE ZERO-COPY GPU Pipeline: Import -> Scale (GPU) -> Convert Packing                                                                         
-    // ------------------------------------------------------------------------ 
-    ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();        
-    ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();  
-                                                                                
-    ncnn::Option opt = net.opt;                                                 
-    opt.blob_vkallocator = blob_allocator;                                      
-    opt.staging_vkallocator = staging_allocator;                                
-                                                                                
-    ncnn::VkAndroidHardwareBufferImageAllocator frame_alloc(vkdev, ahb);        
-    ncnn::VkImageMat src = ncnn::VkImageMat::from_android_hardware_buffer(&frame_alloc);                   
-                                                                                
-    ncnn::VkMat dst;                                                            
-    dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);           
-                                                                                
-    ncnn::VkCompute cmd(vkdev);                                                 
-    cmd.record_import_android_hardware_buffer(cached_ahb_pipeline, src, dst);   
-                                                                                
-    ncnn::VkMat dst_normalized;                                                 
-    if (scale_layer) {                                                          
-        scale_layer->forward(dst, dst_normalized, cmd, opt);                    
-    } else {                                                                    
-        dst_normalized = dst;                                                   
-    }                                                                           
-                                                                                
-    int target_elempack = 1;                                                    
-    int cast_type_to = 0; // auto                                               
-    if (opt.use_fp16_storage || opt.use_fp16_packed) {                          
-        cast_type_to = 2; // fp16                                               
-    }                                                                           
-                                                                                
-    ncnn::VkMat in_gpu;                                                         
-    vkdev->convert_packing(dst_normalized, in_gpu, target_elempack, cast_type_to, cmd, opt);                                                        
-    
-	opt.blob_vkallocator->clear();
-    cmd.submit_and_wait();                                                      
-                                                                                
-    // ------------------------------------------------------------------------ 
-    // Step 3: Run YOLO11 GPU Inference on Mali-G72 MP18 (VkMat Input)          
-    // ------------------------------------------------------------------------ 
-    ncnn::Extractor ex = net.create_extractor();                                
-    ex.set_blob_vkallocator(blob_allocator);                                    
-    ex.set_workspace_vkallocator(blob_allocator);                               
-    ex.set_staging_vkallocator(staging_allocator);
-
-    ex.input("in0", in_gpu);
-
-    ncnn::Mat out;
-    int ret_extract = ex.extract("out0", out);
-
-    vkdev->reclaim_blob_allocator(blob_allocator);
-    vkdev->reclaim_staging_allocator(staging_allocator);
-
-    if (ret_extract != 0) {
-        LOGE("ex.extract('out0') failed with code: %d", ret_extract);
+    ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
+    if (!blob_allocator || !staging_allocator) {
+        if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
+        if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
+        LOGE("Failed to acquire Vulkan frame allocators");
         return -5;
     }
 
-    // ------------------------------------------------------------------------
-    // Step 4: Parse DFL & Class Logits (Adaptive 2D/3D Tensor Shape Support)
-    // ------------------------------------------------------------------------
+    ncnn::Mat out;
+    int execute_ret = 0;
+    double cache_create_ms = 0.0, preprocess_ms = 0.0, infer_readback_ms = 0.0;
+    const auto frame_start = std::chrono::steady_clock::now();
+
+    {
+        ncnn::Option opt = net.opt;
+        opt.use_vulkan_compute = true;
+        opt.blob_vkallocator = blob_allocator;
+        opt.staging_vkallocator = staging_allocator;
+
+        auto cache_it = ahb_import_cache.find(ahb);
+        if (cache_it == ahb_import_cache.end()) {
+            if (ahb_import_cache.size() >= AHB_CACHE_LIMIT) {
+                auto oldest = ahb_import_cache.begin();
+                for (auto it = ahb_import_cache.begin(); it != ahb_import_cache.end(); ++it)
+                    if (it->second->last_used < oldest->second->last_used) oldest = it;
+                LOGI("Evicting least-recently-used AHB cache entry");
+                destroy_ahb_cache_entry(oldest->second);
+                ahb_import_cache.erase(oldest);
+            }
+
+            auto* entry = new (std::nothrow) AHBImportCacheEntry();
+            if (!entry) execute_ret = -6;
+            else {
+                AHardwareBuffer_acquire(ahb);
+                entry->ahb = ahb;
+                entry->allocator = new (std::nothrow) ncnn::VkAndroidHardwareBufferImageAllocator(vkdev, ahb);
+                if (!entry->allocator) {
+                    destroy_ahb_cache_entry(entry);
+                    execute_ret = -6;
+                } else {
+                    entry->src = ncnn::VkImageMat::from_android_hardware_buffer(entry->allocator);
+                    if (entry->src.empty()) {
+                        LOGE("VkImageMat::from_android_hardware_buffer returned empty image");
+                        destroy_ahb_cache_entry(entry);
+                        execute_ret = -6;
+                    } else {
+                        entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
+                        if (!entry->pipeline) {
+                            destroy_ahb_cache_entry(entry);
+                            execute_ret = -6;
+                        } else {
+                            ncnn::Option pipeline_opt = opt;
+                            pipeline_opt.use_fp16_storage = false;
+                            pipeline_opt.use_fp16_packed = false;
+                            const auto t = std::chrono::steady_clock::now();
+                            const int pr = entry->pipeline->create(entry->allocator, 1, rotate_type,
+                                                                    target_w, target_h, pipeline_opt);
+                            cache_create_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t).count();
+                            if (pr != 0) {
+                                LOGE("ImportAndroidHardwareBufferPipeline::create failed: %d", pr);
+                                destroy_ahb_cache_entry(entry);
+                                execute_ret = -6;
+                            } else {
+                                entry->rotate_type = rotate_type;
+                                entry->last_used = ++ahb_cache_clock;
+                                ahb_import_cache.emplace(ahb, entry);
+                                cache_it = ahb_import_cache.find(ahb);
+                                LOGI("Created AHB cache entry: %ux%u fmt=%u cache=%zu",
+                                     desc.width, desc.height, desc.format, ahb_import_cache.size());
+                            }
+                        }
+                    }
+                }
+            }
+        } else cache_it->second->last_used = ++ahb_cache_clock;
+
+        if (execute_ret == 0) {
+            AHBImportCacheEntry* entry = cache_it->second;
+            if (!entry->pipeline || entry->rotate_type != rotate_type) {
+                delete entry->pipeline;
+                entry->pipeline = nullptr;
+                ncnn::Option pipeline_opt = opt;
+                pipeline_opt.use_fp16_storage = false;
+                pipeline_opt.use_fp16_packed = false;
+                const auto t = std::chrono::steady_clock::now();
+                entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
+                const int pr = entry->pipeline
+                    ? entry->pipeline->create(entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt)
+                    : -1;
+                cache_create_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t).count();
+                if (pr != 0) {
+                    LOGE("Rebuilding AHB import pipeline failed: %d", pr);
+                    delete entry->pipeline;
+                    entry->pipeline = nullptr;
+                    execute_ret = -7;
+                } else entry->rotate_type = rotate_type;
+            }
+
+            if (execute_ret == 0) {
+                ncnn::VkMat dst;
+                dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);
+                if (dst.empty()) execute_ret = -8;
+                else {
+                    ncnn::VkMat dst_normalized, in_gpu;
+                    ncnn::VkCompute cmd(vkdev);
+                    cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
+                    execute_ret = scale_layer
+                        ? scale_layer->forward(dst, dst_normalized, cmd, opt)
+                        : -9;
+                    if (execute_ret == 0) {
+                        const int pack = 1;
+                        const int cast = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
+                        vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, cmd, opt);
+                        const int sr = cmd.submit_and_wait();
+                        if (sr != 0) execute_ret = -10;
+                    }
+                    if (execute_ret == 0) {
+                        const auto t = std::chrono::steady_clock::now();
+                        ncnn::Extractor ex = net.create_extractor();
+                        ex.set_blob_vkallocator(blob_allocator);
+                        ex.set_workspace_vkallocator(blob_allocator);
+                        ex.set_staging_vkallocator(staging_allocator);
+                        ex.input("in0", in_gpu);
+                        execute_ret = ex.extract("out0", out);
+                        infer_readback_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t).count();
+                    }
+                }
+            }
+        }
+        preprocess_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - frame_start).count() - infer_readback_ms;
+    } // All per-frame VkMat / VkCompute / Extractor references die before allocator reclaim.
+
+    vkdev->reclaim_blob_allocator(blob_allocator);
+    vkdev->reclaim_staging_allocator(staging_allocator);
+    if (execute_ret != 0) {
+        LOGE("AHB frame failed at GPU stage (code=%d)", execute_ret);
+        return -11;
+    }
+
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
-
-    // ------------------------------------------------------------------------
-    // Step 5: Non-Maximum Suppression (NMS) & 3-Zone Safety Classification
-    // ------------------------------------------------------------------------
     objects.clear();
-    emergency_stop_triggered = false;
     nms_sorted_bboxes(nms_thresh, objects);
 
     static int s_frame_log = 0;
     if (++s_frame_log % 30 == 0) {
-        LOGI("Inference OK: out(dims=%d, w=%d, h=%d, c=%d) | top_score=%.3f (class=%d) | obj_count=%zu",
-             out.dims, out.w, out.h, out.c, last_top_score, last_top_class, objects.size());
+        LOGI("Pipeline: preprocess=%.2fms cache_create=%.2fms infer+readback=%.2fms | out(dims=%d w=%d h=%d c=%d) proposals=%zu detections=%zu top=%.3f cls=%d",
+             preprocess_ms, cache_create_ms, infer_readback_ms,
+             out.dims, out.w, out.h, out.c, proposal_scratchpad.size(),
+             objects.size(), last_top_score, last_top_class);
     }
-
     return 0;
 }
 
@@ -405,8 +423,13 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
     }
 
     const int cls_count = out_flat.w - 64;
+    if (cls_count != num_classes || total_anchors != static_cast<int>(grid_strides.size())) {
+        LOGE("Unexpected YOLO output layout: features=%d expected=%d anchors=%d expected=%zu",
+             out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
+        return;
+    }
 
-    for (int i = 0; i < total_anchors && i < static_cast<int>(grid_strides.size()); i++) {
+    for (int i = 0; i < total_anchors; i++) {
         const float* feat_ptr = out_flat.row(i);
         const float* cls_ptr = feat_ptr + 64;
 
@@ -415,6 +438,7 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
 
         for (int c = 0; c < cls_count; c++) {
             float logit = cls_ptr[c];
+            if (!std::isfinite(logit)) continue;
             float score = 1.0f / (1.0f + std::exp(-logit));
             if (score > best_score) {
                 best_score = score;
@@ -432,13 +456,17 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         }
 
         float pred_ltrb[4];
+        bool valid_dfl = true;
         for (int k = 0; k < 4; k++) {
             const float* dfl_reg = feat_ptr + (k * REG_MAX);
 
             float max_val = dfl_reg[0];
+            if (!std::isfinite(max_val)) { valid_dfl = false; break; }
             for (int j = 1; j < REG_MAX; j++) {
+                if (!std::isfinite(dfl_reg[j])) { valid_dfl = false; break; }
                 if (dfl_reg[j] > max_val) max_val = dfl_reg[j];
             }
+            if (!valid_dfl) break;
 
             float sum_exp = 0.0f;
             for (int j = 0; j < REG_MAX; j++) {
@@ -446,6 +474,7 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
                 sum_exp += dfl_distribution_scratchpad[j];
             }
 
+            if (sum_exp <= 0.0f || !std::isfinite(sum_exp)) { valid_dfl = false; break; }
             const float inv_sum = 1.0f / sum_exp;
             float expected_val = 0.0f;
             for (int j = 0; j < REG_MAX; j++) {
@@ -453,6 +482,7 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
             }
             pred_ltrb[k] = expected_val;
         }
+        if (!valid_dfl) continue;
 
         const float stride = static_cast<float>(grid_strides[i].stride);
         const float grid0  = static_cast<float>(grid_strides[i].grid0);
@@ -477,7 +507,7 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         obj.y = y0;
         obj.w = bw;
         obj.h = bh;
-        obj.zone_id = ZONE_REACTION;
+        obj.zone_id = ZONE_MID;
 
         proposal_scratchpad.push_back(obj);
     }
@@ -538,21 +568,13 @@ void Yolo11::nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output)
     }
 
     output.clear();
-    emergency_stop_triggered = false;
 
     for (size_t i = 0; i < candidates_scratchpad.size(); i++) {
         Object obj = candidates_scratchpad[i];
-        float bottom_y = obj.y + obj.h;
-        float norm_bottom_y = bottom_y / static_cast<float>(target_h);
-
-        if (norm_bottom_y > 0.70f) {
-            obj.zone_id = ZONE_CRITICAL;
-            emergency_stop_triggered = true;
-        } else if (norm_bottom_y >= 0.35f) {
-            obj.zone_id = ZONE_REACTION;
-        } else {
-            obj.zone_id = ZONE_HORIZON;
-        }
+        const float norm_bottom_y = (obj.y + obj.h) / static_cast<float>(target_h);
+        if (norm_bottom_y > 0.70f) obj.zone_id = ZONE_NEAR;
+        else if (norm_bottom_y >= 0.35f) obj.zone_id = ZONE_MID;
+        else obj.zone_id = ZONE_FAR;
 
         output.push_back(obj);
     }
