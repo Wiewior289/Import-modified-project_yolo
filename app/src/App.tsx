@@ -7,8 +7,6 @@ import {
   Copy,
   Check,
   Download,
-  AlertTriangle,
-  RotateCcw,
   Compass,
   Radio,
   Sliders,
@@ -177,12 +175,12 @@ export default function App() {
   // WebSocket Live Telemetry State
   const [wsUrl, setWsUrl] = useState<string>('ws://192.168.223.127:8080');
   const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
-  const [isSimulated, setIsSimulated] = useState<boolean>(true);
+  const [isSimulated, setIsSimulated] = useState<boolean>(false);
   const [receivedDetections, setReceivedDetections] = useState<any[]>([]);
-  const [isEmergencyStop, setIsEmergencyStop] = useState<boolean>(false);
-  const [fps, setFps] = useState<number>(15);
-  const [topScore, setTopScore] = useState<number>(0.18);
-  const [topClass, setTopClass] = useState<number>(0);
+  const [fps, setFps] = useState<number>(0);
+  const [topScore, setTopScore] = useState<number>(0);
+  const [topClass, setTopClass] = useState<number>(-1);
+  const [frameId, setFrameId] = useState<number>(0);
   const [confThreshold, setConfThreshold] = useState<number>(0.25);
   const [lastPacketTime, setLastPacketTime] = useState<string>('Oczekiwanie...');
   const [pipelineState, setPipelineState] = useState<{
@@ -231,19 +229,18 @@ export default function App() {
             h: 0.14
           }
         ]);
-        setIsEmergencyStop(zoneId === 0);
       } else {
         setReceivedDetections([]);
-        setIsEmergencyStop(false);
       }
 
       setFps(Math.floor(13 + Math.random() * 4));
+      setFrameId((prev) => prev + 1);
       setLastPacketTime(new Date().toLocaleTimeString());
       setPipelineState({
-        server: 'online',
-        yolo: 'ready',
-        camera: 'streaming',
-        details: 'Tryb symulacji: Mali-G72 MP18 (Zero-Copy AHB)'
+        server: 'idle',
+        yolo: 'idle',
+        camera: 'idle',
+        details: 'DANE SYNTETYCZNE: symulacja UI, bez kamery i inferencji NCNN'
       });
     }, 150);
 
@@ -288,7 +285,7 @@ export default function App() {
             }
           } else if (data.type === 'telemetry') {
             setReceivedDetections(data.objects || []);
-            setIsEmergencyStop(Boolean(data.eStop));
+            if (data.frameId !== undefined) setFrameId(parseInt(data.frameId, 10));
             if (data.fps) {
               setFps(parseFloat(data.fps));
             }
@@ -302,7 +299,7 @@ export default function App() {
               setConfThreshold(parseFloat(data.conf));
             }
             setLastPacketTime(new Date().toLocaleTimeString());
-            setPipelineState(prev => ({ ...prev, camera: 'streaming', details: `Klatka: ${data.count} obiektów, TopCandidate: ${(parseFloat(data.topScore || 0) * 100).toFixed(1)}%` }));
+            setPipelineState(prev => ({ ...prev, camera: 'streaming', details: `Frame #${data.frameId ?? '?'}: ${data.count} obiektów, TopCandidate: ${(parseFloat(data.topScore || 0) * 100).toFixed(1)}%` }));
           }
         } catch (e) {
           // ignore invalid json
@@ -341,15 +338,9 @@ export default function App() {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(payload);
     } else {
-      if (cmd === 'EMERGENCY_STOP') {
-        setIsEmergencyStop(true);
-        addLog('[SYMULACJA] E-STOP aktywowany.');
-      } else if (cmd === 'RESET_ESTOP') {
-        setIsEmergencyStop(false);
-        addLog('[SYMULACJA] E-STOP zresetowany.');
-      } else if (cmd === 'SET_PARAMS') {
+      if (cmd === 'SET_PARAMS') {
         if (extra.conf !== undefined) setConfThreshold(extra.conf);
-        addLog(`[SYMULACJA] Zmieniono próg na ${extra.conf}`);
+        addLog(`[SYMULACJA UI] Zmieniono próg na ${extra.conf}`);
       }
     }
   };
@@ -506,7 +497,7 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center space-x-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-slate-800">
-                  <span className="text-xs text-slate-300">Symulacja:</span>
+                  <span className="text-xs text-slate-300">Dane syntetyczne:</span>
                   <button
                     onClick={() => setIsSimulated(!isSimulated)}
                     className={`px-2 py-0.5 rounded text-[11px] font-bold ${
@@ -580,7 +571,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Live Field of View & Emergency Stop Controls */}
+            {/* Geometry view of normalized model detections */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               {/* Camera Video View with 3-Zone Overlay */}
               <div className="lg:col-span-8 p-6 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
@@ -588,22 +579,17 @@ export default function App() {
                   <div className="flex items-center space-x-2">
                     <h3 className="font-bold text-white text-sm flex items-center space-x-2">
                       <Compass className="w-4 h-4 text-emerald-400" />
-                      <span>Pole Widzenia &bull; Podział Horyzontalny 3 Stref</span>
+                      <span>Podgląd geometrii detekcji • wejście modelu 320×320</span>
                     </h3>
                     <span className="text-xs font-mono text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/30">
                       {fps} FPS (Mali-G72)
                     </span>
                   </div>
 
-                  <span className={`text-xs px-2.5 py-1 rounded-full font-bold font-mono ${
-                    isEmergencyStop ? 'bg-red-600 text-white animate-pulse' : 'bg-emerald-600/30 text-emerald-300 border border-emerald-500/40'
-                  }`}>
-                    {isEmergencyStop ? 'ALARM: E-STOP AKTYWNY (ZATRZYMANO NÓŻ)' : 'STAN BEZPIECZNY'}
-                  </span>
                 </div>
 
                 {/* Video Area */}
-                <div className="relative aspect-[4/3] rounded-xl overflow-hidden border border-slate-700 bg-slate-950 shadow-inner select-none">
+                <div className="relative aspect-square rounded-xl overflow-hidden border border-slate-700 bg-slate-950 shadow-inner select-none">
                   <div className="absolute inset-0 bg-gradient-to-b from-sky-950/30 via-emerald-950/20 to-green-950/70" />
 
                   {/* Horizon Line (35%) */}
@@ -614,26 +600,27 @@ export default function App() {
 
                   {/* Critical Danger Line (70%) */}
                   <div className="absolute top-[70%] left-0 right-0 border-b-2 border-dashed border-red-500/80 flex items-center justify-between px-3 text-[10px] font-mono text-red-400 bg-red-950/60 py-0.5">
-                    <span>STREFA KRYTYCZNA NOŻA (y = 0.70) &bull; TWARDY E-STOP</span>
+                    <span>GRANICA STREFY BLISKIEJ (y = 0.70) • PODZIAŁ DIAGNOSTYCZNY</span>
                     <span>STREFA 1 &uarr; | STREFA 0 &darr;</span>
                   </div>
 
                   {/* Render Received Obstacles */}
                   {receivedDetections.map((obj, idx) => {
-                    const isDanger = obj.zone === 0;
+                    const isNear = obj.zone === 0;
                     const isReaction = obj.zone === 1;
                     const labelName = (obj.class >= 0 && obj.class < COCO_CLASSES.length) ? COCO_CLASSES[obj.class] : `cls_${obj.class}`;
                     return (
                       <div
                         key={idx}
                         style={{
-                          left: `${Math.max(5, Math.min(85, obj.x * 100))}%`,
-                          top: `${Math.max(10, Math.min(85, obj.y * 100))}%`,
-                          width: `${Math.max(12, obj.w * 100)}%`,
-                          height: `${Math.max(10, obj.h * 100)}%`
+                          left: `${obj.x * 100}%`,
+                          top: `${obj.y * 100}%`,
+                          width: `${obj.w * 100}%`,
+                          height: `${obj.h * 100}%`,
+                          boxSizing: 'border-box'
                         }}
                         className={`absolute rounded border-2 shadow-2xl transition-all duration-75 flex flex-col justify-between p-1 ${
-                          isDanger
+                          isNear
                             ? 'border-red-500 bg-red-500/40 animate-pulse'
                             : isReaction
                             ? 'border-amber-500 bg-amber-500/20'
@@ -652,28 +639,11 @@ export default function App() {
                   })}
 
                   <div className="absolute bottom-2 right-3 text-[11px] font-mono text-slate-400 bg-slate-950/90 px-2 py-1 rounded border border-slate-700">
-                    Ostrze kosiarki &bull; STM32F405 (y = 1.00)
+                    DÓŁ KADRU • y = 1.00
                   </div>
                 </div>
 
-                {/* Control Action Buttons */}
-                <div className="flex items-center space-x-3 pt-2">
-                  <button
-                    onClick={() => sendWsCommand('EMERGENCY_STOP')}
-                    className="flex-1 py-3 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white rounded-xl font-bold text-sm transition shadow-lg shadow-red-600/30 flex items-center justify-center space-x-2"
-                  >
-                    <AlertTriangle className="w-5 h-5" />
-                    <span>WYŚLIJ TWARDY E-STOP (ZATRZYMAJ KOSIARKĘ)</span>
-                  </button>
 
-                  <button
-                    onClick={() => sendWsCommand('RESET_ESTOP')}
-                    className="px-6 py-3 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl font-medium text-sm transition border border-slate-700 flex items-center space-x-2"
-                  >
-                    <RotateCcw className="w-4 h-4 text-emerald-400" />
-                    <span>Zresetuj E-STOP</span>
-                  </button>
-                </div>
               </div>
 
               {/* Telemetry Sidebar */}
@@ -683,7 +653,7 @@ export default function App() {
 
                   <div className="grid grid-cols-2 gap-3">
                     <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
-                      <span className="text-[10px] text-slate-500 font-mono block">FPS SILNIKA:</span>
+                      <span className="text-[10px] text-slate-500 font-mono block">FPS PRZETWARZANIA:</span>
                       <span className="text-xl font-bold font-mono text-emerald-400">{fps} FPS</span>
                     </div>
 
@@ -700,6 +670,10 @@ export default function App() {
                     <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
                       <span className="text-[10px] text-slate-500 font-mono block">OSTATNI PAKIET:</span>
                       <span className="text-xs font-bold font-mono text-slate-300">{lastPacketTime}</span>
+                    </div>
+                    <div className="p-3 rounded-xl bg-slate-950 border border-slate-800">
+                      <span className="text-[10px] text-slate-500 font-mono block">ID KLATKI:</span>
+                      <span className="text-xs font-bold font-mono text-cyan-300">{frameId || '-'}</span>
                     </div>
                   </div>
                 </div>
