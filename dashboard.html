@@ -92,7 +92,7 @@
       display: flex;
       justify-content: space-between;
     }
-    .line-critical {
+    .line-near {
       position: absolute;
       top: 70%;
       left: 0; right: 0;
@@ -115,9 +115,9 @@
       justify-content: space-between;
       transition: all 0.08s linear;
     }
-    .obstacle.crit { border-color: #ef4444; background: rgba(239, 68, 68, 0.35); }
-    .obstacle.react { border-color: #f59e0b; background: rgba(245, 158, 11, 0.2); }
-    .obstacle.horiz { border-color: #10b981; background: rgba(16, 185, 129, 0.2); }
+    .obstacle.near { border-color: #22d3ee; background: rgba(34, 211, 238, 0.18); }
+    .obstacle.mid { border-color: #f59e0b; background: rgba(245, 158, 11, 0.2); }
+    .obstacle.far { border-color: #10b981; background: rgba(16, 185, 129, 0.2); }
     .obstacle-tag {
       background: rgba(2, 6, 23, 0.85);
       color: #fff;
@@ -202,10 +202,11 @@
           <span>HORYZONT (y = 0.35) &bull; ODOMETRIA</span>
           <span>STREFA 2 &uarr; | STREFA 1 &darr;</span>
         </div>
-        <div class="line-critical">
+        <div class="line-near">
           <span>GRANICA STREFY BLISKIEJ (y = 0.70) • PODZIAŁ DIAGNOSTYCZNY</span>
           <span>STREFA 1 &uarr; | STREFA 0 &darr;</span>
         </div>
+        <div class="badge" style="position:absolute;top:8px;right:8px;z-index:5;">GEOMETRIA DETEKCJI • BEZ OBRAZU KAMERY</div>
         <div id="obstacleContainer"></div>
       </div>
 
@@ -329,9 +330,9 @@
       c.innerHTML = '';
       objs.forEach(o => {
         const div = document.createElement('div');
-        const isCrit = o.zone === 0;
-        const isReact = o.zone === 1;
-        div.className = 'obstacle ' + (isCrit ? 'crit' : isReact ? 'react' : 'horiz');
+        const isNear = o.zone === 0;
+        const isMid = o.zone === 1;
+        div.className = 'obstacle ' + (isNear ? 'near' : isMid ? 'mid' : 'far');
         div.style.left = (o.x * 100) + '%';
         div.style.top = (o.y * 100) + '%';
         div.style.width = (o.w * 100) + '%';
