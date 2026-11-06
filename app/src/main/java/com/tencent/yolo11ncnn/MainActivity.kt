@@ -197,7 +197,7 @@ class MainActivity : AppCompatActivity() {
             // Android 10+ ImageReader overload propagates GPU_SAMPLED_IMAGE to HAL buffers.
             imageReader = ImageReader.newInstance(
                 320, 320, ImageFormat.YUV_420_888, 3,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+                HardwareBuffer.USAGE_CPU_READ_OFTEN or HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
             )
 
             imageReader?.setOnImageAvailableListener({ reader ->
@@ -316,7 +316,7 @@ class MainActivity : AppCompatActivity() {
                         session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler)
                         isCameraRunning.set(true)
                         Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
-                        telemetryServer.broadcastStatus("STREAMING", "Strumień aktywny (Camera2 + Mali-G72 True Zero-Copy)")
+                        telemetryServer.broadcastStatus("STREAMING", "Camera2 AHB → Vulkan import aktywny; wyniki modelu są odczytywane do CPU")
                     } catch (e: CameraAccessException) {
                         Log.e(TAG, "Błąd setRepeatingRequest", e)
                     }
