@@ -23,7 +23,7 @@ android {
                 cppFlags("-std=c++17 -O3 -fopenmp")
                 arguments(
                     "-DANDROID_STL=c++_shared",
-                    "-DANDROID_PLATFORM=android-28"
+                    "-DANDROID_PLATFORM=android-29"
                 )
             }
         }
