@@ -582,7 +582,7 @@ export default function App() {
                       <span>Podgląd geometrii detekcji • wejście modelu 320×320</span>
                     </h3>
                     <span className="text-xs font-mono text-emerald-400 bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-500/30">
-                      {fps} FPS (Mali-G72)
+                      {fps} FPS
                     </span>
                   </div>
 
@@ -591,6 +591,9 @@ export default function App() {
                 {/* Video Area */}
                 <div className="relative aspect-square rounded-xl overflow-hidden border border-slate-700 bg-slate-950 shadow-inner select-none">
                   <div className="absolute inset-0 bg-gradient-to-b from-sky-950/30 via-emerald-950/20 to-green-950/70" />
+                  <div className="absolute top-2 right-2 z-10 rounded bg-slate-950/80 px-2 py-1 text-[9px] font-mono text-slate-300">
+                    PODGLĄD GEOMETRII • BEZ OBRAZU KAMERY
+                  </div>
 
                   {/* Horizon Line (35%) */}
                   <div className="absolute top-[35%] left-0 right-0 border-b-2 border-dashed border-emerald-500/50 flex items-center justify-between px-3 text-[10px] font-mono text-emerald-400 bg-emerald-950/40 py-0.5">
@@ -621,7 +624,7 @@ export default function App() {
                         }}
                         className={`absolute rounded border-2 shadow-2xl transition-all duration-75 flex flex-col justify-between p-1 ${
                           isNear
-                            ? 'border-red-500 bg-red-500/40 animate-pulse'
+                            ? 'border-cyan-400 bg-cyan-400/20'
                             : isReaction
                             ? 'border-amber-500 bg-amber-500/20'
                             : 'border-emerald-500 bg-emerald-500/20'
