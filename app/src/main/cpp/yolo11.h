@@ -15,6 +15,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <unordered_map>
 
 // NCNN includes
 #include "net.h"
@@ -24,10 +25,10 @@
 #include "layer.h"
 #include "layer_type.h"
 
-// Horizontal Zone IDs based on robot safety distance:
-// Zone 0: CRITICAL (Immediate Danger / Cutter Blade Zone: bottom_y > 0.70) -> Emergency Stop
-// Zone 1: REACTION (Path Planning / Obstacle Avoidance Zone: 0.35 <= bottom_y <= 0.70)
-// Zone 2: HORIZON  (Far Field / Visual Odometry & Landmarks: bottom_y < 0.35)
+// Diagnostic image bands only. These are image-relative regions, not safety distances.
+// Zone 0: NEAR (bottom_y > 0.70)
+// Zone 1: MID  (0.35 <= bottom_y <= 0.70)
+// Zone 2: FAR  (bottom_y < 0.35)
 enum ObstacleZone {
     ZONE_CRITICAL = 0,
     ZONE_REACTION = 1,
@@ -84,16 +85,6 @@ public:
     int pack_detections_flat(const std::vector<Object>& objects, float* out_buffer, int max_capacity);
 
     /**
-     * Returns true if any detected obstacle is inside Zone 0 (Critical Zone: bottom_y > 0.70).
-     */
-    bool is_emergency_stop_active() const { return emergency_stop_triggered; }
-
-    /**
-     * Resets the Emergency Stop flag.
-     */
-    void reset_emergency_stop() { emergency_stop_triggered = false; }
-
-    /**
      * Diagnostics: Returns highest raw score and class seen in last frame (before conf_thresh filtering)
      */
     float get_top_candidate_score() const { return last_top_score; }
@@ -121,12 +112,26 @@ private:
     ncnn::VulkanDevice* vkdev;
     ncnn::Layer* scale_layer;
 
-    // Cached Vulkan Import Pipeline for AHardwareBuffer (eliminates 24ms shader compile overhead)
-    ncnn::ImportAndroidHardwareBufferPipeline* cached_ahb_pipeline;
-    int cached_ahb_format;
-    int cached_ahb_width;
-    int cached_ahb_height;
-    int cached_ahb_rotate;
+    // Cache entries are keyed by the actual AHardwareBuffer pointer. Each entry
+    // owns an AHB reference and keeps allocator, imported VkImageMat and pipeline
+    // alive together for the lifetime of the camera buffer.
+    struct AHBImportCacheEntry {
+        AHardwareBuffer* ahb;
+        ncnn::VkAndroidHardwareBufferImageAllocator* allocator;
+        ncnn::ImportAndroidHardwareBufferPipeline* pipeline;
+        ncnn::VkImageMat src;
+        int rotate_type;
+        uint64_t last_used;
+
+        AHBImportCacheEntry()
+            : ahb(nullptr), allocator(nullptr), pipeline(nullptr),
+              rotate_type(1), last_used(0) {}
+    };
+
+    static constexpr size_t AHB_CACHE_LIMIT = 8;
+    std::unordered_map<AHardwareBuffer*, AHBImportCacheEntry*> ahb_import_cache;
+    uint64_t ahb_cache_clock;
+    void destroy_ahb_cache_entry(AHBImportCacheEntry* entry);
 
     // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
     std::vector<GridAndStride> grid_strides;
@@ -140,7 +145,6 @@ private:
     int num_classes;
     bool model_loaded;
     bool use_vulkan_compute;
-    bool emergency_stop_triggered;
 
     // Live diagnostics for raw score inspection
     float last_top_score;
