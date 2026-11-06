@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * JNI Interface for YOLO11 Zero-Copy AHardwareBuffer Mower Vision System
+ * JNI Interface for YOLO11 AHardwareBuffer Vulkan Import Test Harness
  * Target: Samsung Galaxy S9+ (Mali-G72 MP18)
  * ============================================================================
  */
@@ -31,7 +31,7 @@ extern "C" {
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
-    LOGI("JNI_OnLoad called for YOLO11 Zero-Copy Mali-G72 Native Module");
+    LOGI("JNI_OnLoad called for YOLO11 AHB Import Mali-G72 Native Module");
     return JNI_VERSION_1_6;
 }
 
