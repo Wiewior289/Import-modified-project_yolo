@@ -254,14 +254,21 @@ class MainActivity : AppCompatActivity() {
                         detectionBuffer.fill(0f)
                         var rawCount = -1
                         val hwBuffer = image.hardwareBuffer
-                        try {
-                            rawCount = yoloEngine.DetectAHBDirect(
-                                hwBuffer, detectionBuffer, confThreshold, nmsThreshold, rotateType
-                            )
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Błąd DetectAHBDirect frame=$frameId", e)
-                        } finally {
-                            hwBuffer.close()
+                        if (hwBuffer == null) {
+                            // Image.hardwareBuffer is nullable in the Android API.
+                            // Keep the frame invalid rather than passing null through JNI.
+                            Log.e(TAG, "Image.hardwareBuffer == null for frame=$frameId")
+                            rawCount = -4
+                        } else {
+                            try {
+                                rawCount = yoloEngine.DetectAHBDirect(
+                                    hwBuffer, detectionBuffer, confThreshold, nmsThreshold, rotateType
+                                )
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Błąd DetectAHBDirect frame=$frameId", e)
+                            } finally {
+                                hwBuffer.close()
+                            }
                         }
 
                         updateProcessingFps()
