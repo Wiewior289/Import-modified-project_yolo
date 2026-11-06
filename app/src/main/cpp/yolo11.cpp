@@ -130,42 +130,87 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
         return -3;                                                              
     }                                                                           
                                                                                 
-    if (use_vulkan_compute && vkdev) {                                          
-        if (scale_layer) {                                                      
-            scale_layer->destroy_pipeline(net.opt);                             
-            delete scale_layer;                                                 
-            scale_layer = nullptr;                                              
-        }                                                                       
-                                                                                
-        scale_layer = ncnn::create_layer(ncnn::LayerType::Scale);               
-        scale_layer->vkdev = vkdev;                                             
-                                                                                
-        ncnn::ParamDict pd;                                                     
-        pd.set(0, 1); 
-        pd.set(1, 0); 
-        scale_layer->load_param(pd);                                            
-                                                                                
-        ncnn::Mat weights[1];                                                   
-        weights[0].create(1);                                                   
-        weights[0][0] = 1.0f / 255.0f;                                          
-        ncnn::ModelBinFromMatArray mb(weights);                                 
-        scale_layer->load_model(mb);                                            
-                                                                                
-        ncnn::Option opt = net.opt;                                             
-        opt.blob_vkallocator = vkdev->acquire_blob_allocator();                 
-        opt.staging_vkallocator = vkdev->acquire_staging_allocator();           
-                                                                                
-        ncnn::VkTransfer cmd_transfer(vkdev);                                   
-        scale_layer->upload_model(cmd_transfer, opt);                           
-        cmd_transfer.submit_and_wait();                                         
-                                                                                
-        scale_layer->create_pipeline(opt);                                      
-                                                                                
-        vkdev->reclaim_blob_allocator(opt.blob_vkallocator);                    
-        vkdev->reclaim_staging_allocator(opt.staging_vkallocator);              
-        LOGI("GPU-side Scale Layer [0..255] -> [0..1] initialized on Mali-G72");
-    }                                                                           
-                                                                                
+    if (!use_vulkan_compute || !vkdev) {
+        LOGE("Vulkan initialization did not complete");
+        return -5;
+    }
+
+    if (scale_layer) {
+        scale_layer->destroy_pipeline(net.opt);
+        delete scale_layer;
+        scale_layer = nullptr;
+    }
+
+    scale_layer = ncnn::create_layer(ncnn::LayerType::Scale);
+    if (!scale_layer) {
+        LOGE("Failed to create ncnn Scale layer");
+        return -5;
+    }
+    scale_layer->vkdev = vkdev;
+
+    ncnn::ParamDict pd;
+    pd.set(0, 1);
+    pd.set(1, 0);
+    if (scale_layer->load_param(pd) != 0) {
+        LOGE("Failed to load Scale layer parameters");
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
+
+    ncnn::Mat weights[1];
+    weights[0].create(1);
+    if (weights[0].empty()) {
+        LOGE("Failed to allocate Scale layer weights");
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
+    weights[0][0] = 1.0f / 255.0f;
+    ncnn::ModelBinFromMatArray mb(weights);
+    if (scale_layer->load_model(mb) != 0) {
+        LOGE("Failed to load Scale layer weights");
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
+
+    ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* scale_staging_allocator = vkdev->acquire_staging_allocator();
+    if (!scale_blob_allocator || !scale_staging_allocator) {
+        if (scale_blob_allocator) vkdev->reclaim_blob_allocator(scale_blob_allocator);
+        if (scale_staging_allocator) vkdev->reclaim_staging_allocator(scale_staging_allocator);
+        LOGE("Failed to acquire allocators for Scale layer upload");
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
+
+    int scale_init_ret = 0;
+    {
+        ncnn::Option scale_opt = net.opt;
+        scale_opt.blob_vkallocator = scale_blob_allocator;
+        scale_opt.staging_vkallocator = scale_staging_allocator;
+
+        ncnn::VkTransfer cmd_transfer(vkdev);
+        scale_init_ret = scale_layer->upload_model(cmd_transfer, scale_opt);
+        if (scale_init_ret == 0) scale_init_ret = cmd_transfer.submit_and_wait();
+        if (scale_init_ret == 0) scale_init_ret = scale_layer->create_pipeline(scale_opt);
+    }
+
+    vkdev->reclaim_blob_allocator(scale_blob_allocator);
+    vkdev->reclaim_staging_allocator(scale_staging_allocator);
+
+    if (scale_init_ret != 0) {
+        LOGE("GPU Scale layer initialization failed: %d", scale_init_ret);
+        scale_layer->destroy_pipeline(net.opt);
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
+
+    LOGI("GPU Scale layer initialized: RGB [0,255] -> [0,1]");
+
     generate_grids_and_stride(target_w, target_h);
 
     const size_t total_anchors = grid_strides.size();
