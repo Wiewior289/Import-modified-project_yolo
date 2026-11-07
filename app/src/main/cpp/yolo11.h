@@ -123,6 +123,10 @@ private:
     static constexpr size_t AHB_CACHE_LIMIT = 8;
     std::unordered_map<AHardwareBuffer*, AHBImportCacheEntry*> ahb_import_cache;
     uint64_t ahb_cache_clock;
+    uint64_t ahb_cache_hits;
+    uint64_t ahb_cache_misses;
+    uint64_t ahb_cache_evictions;
+    uint64_t ahb_cache_rotate_rebuilds;
     void destroy_ahb_cache_entry(AHBImportCacheEntry* entry);
 
     // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
