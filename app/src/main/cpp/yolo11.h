@@ -29,6 +29,12 @@
 // Zone 0: NEAR (bottom_y > 0.70)
 // Zone 1: MID  (0.35 <= bottom_y <= 0.70)
 // Zone 2: FAR  (bottom_y < 0.35)
+enum YoloComputeMode {
+    YOLO_COMPUTE_CPU = 0,
+    YOLO_COMPUTE_VULKAN = 1,
+    YOLO_COMPUTE_VULKAN_AHB = 2
+};
+
 enum ObstacleZone {
     ZONE_NEAR = 0,
     ZONE_MID  = 1,
@@ -60,15 +66,16 @@ public:
      * Initializes NCNN, Vulkan compute engine, Mali-G72 shader optimizations,
      * and loads model weights from Android assets.
      */
-    int load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu = true);
+    int load(AAssetManager* mgr, const char* modeltype, int target_size,
+             int requested_compute_mode = YOLO_COMPUTE_VULKAN_AHB);
 
     /**
      * Imports a Camera2 AHardwareBuffer into Vulkan and runs YOLO on its VkMat.
      * The caller keeps the originating Image alive for this call. Cache entries
      * retain their own AHardwareBuffer reference beyond the call.
      */
-    int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                   std::vector<Object>& objects, int rotate_type = 1);
+    int detect_frame(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                     std::vector<Object>& objects, int rotate_type = 1);
 
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
@@ -95,6 +102,10 @@ public:
     bool is_ready() const { return model_loaded; }
 
 private:
+    int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                   std::vector<Object>& objects, int rotate_type);
+    int detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                             std::vector<Object>& objects, int rotate_type);
     void generate_grids_and_stride(int target_w, int target_h);
     void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
     void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);
@@ -120,7 +131,7 @@ private:
               rotate_type(1), last_used(0) {}
     };
 
-    static constexpr size_t AHB_CACHE_LIMIT = 8;
+    static constexpr size_t AHB_CACHE_LIMIT = 12;
     std::unordered_map<AHardwareBuffer*, AHBImportCacheEntry*> ahb_import_cache;
     uint64_t ahb_cache_clock;
     uint64_t ahb_cache_hits;
@@ -141,6 +152,7 @@ private:
     int num_classes;
     bool model_loaded;
     bool use_vulkan_compute;
+    int compute_mode;
 
     // Live diagnostics for raw score inspection
     float last_top_score;
