@@ -24,6 +24,8 @@
 
 Yolo11::Yolo11()
     : vkdev(nullptr), scale_layer(nullptr), ahb_cache_clock(0),
+      ahb_cache_hits(0), ahb_cache_misses(0), ahb_cache_evictions(0),
+      ahb_cache_rotate_rebuilds(0),
       target_w(320), target_h(320), num_classes(80),
       model_loaded(false), use_vulkan_compute(true),
       last_top_score(0.0f), last_top_class(-1)
@@ -65,6 +67,10 @@ void Yolo11::clear_ahb_cache()
     for (auto& item : ahb_import_cache) destroy_ahb_cache_entry(item.second);
     ahb_import_cache.clear();
     ahb_cache_clock = 0;
+    ahb_cache_hits = 0;
+    ahb_cache_misses = 0;
+    ahb_cache_evictions = 0;
+    ahb_cache_rotate_rebuilds = 0;
 }
 
 int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu)
@@ -261,6 +267,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
     if (!ahb) return -2;
     if (!use_vulkan_compute || !vkdev) return -3;
 
+    const auto frame_start = std::chrono::steady_clock::now();
+
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
     if (desc.width == 0 || desc.height == 0 ||
@@ -281,8 +289,21 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
 
     ncnn::Mat out;
     int execute_ret = 0;
-    double cache_create_ms = 0.0, preprocess_ms = 0.0, infer_readback_ms = 0.0;
-    const auto frame_start = std::chrono::steady_clock::now();
+
+    // Cache timings are intentionally separated. The old cache_create_ms only
+    // measured pipe.create(), hiding allocator construction and AHB image import.
+    double cache_lookup_ms = 0.0;
+    double allocator_create_ms = 0.0;
+    double image_import_ms = 0.0;
+    double pipeline_create_ms = 0.0;
+    double preprocess_record_ms = 0.0;
+    double preprocess_wait_ms = 0.0;
+    double infer_encode_ms = 0.0;
+    double infer_wait_ms = 0.0;
+    double readback_record_ms = 0.0;
+    double readback_wait_ms = 0.0;
+    double postprocess_ms = 0.0;
+    bool cache_hit = false;
 
     {
         ncnn::Option opt = net.opt;
@@ -290,28 +311,52 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
         opt.blob_vkallocator = blob_allocator;
         opt.staging_vkallocator = staging_allocator;
 
+        const auto lookup_start = std::chrono::steady_clock::now();
         auto cache_it = ahb_import_cache.find(ahb);
+        cache_lookup_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - lookup_start).count();
+
         if (cache_it == ahb_import_cache.end()) {
+            ++ahb_cache_misses;
+
             if (ahb_import_cache.size() >= AHB_CACHE_LIMIT) {
                 auto oldest = ahb_import_cache.begin();
-                for (auto it = ahb_import_cache.begin(); it != ahb_import_cache.end(); ++it)
+                for (auto it = ahb_import_cache.begin(); it != ahb_import_cache.end(); ++it) {
                     if (it->second->last_used < oldest->second->last_used) oldest = it;
-                LOGI("Evicting least-recently-used AHB cache entry");
+                }
+
+                ++ahb_cache_evictions;
+                LOGW("AHB_CACHE_EVICT ptr=%p entries_before=%zu hits=%llu misses=%llu evictions=%llu",
+                     static_cast<void*>(oldest->first), ahb_import_cache.size(),
+                     static_cast<unsigned long long>(ahb_cache_hits),
+                     static_cast<unsigned long long>(ahb_cache_misses),
+                     static_cast<unsigned long long>(ahb_cache_evictions));
+
                 destroy_ahb_cache_entry(oldest->second);
                 ahb_import_cache.erase(oldest);
             }
 
             auto* entry = new (std::nothrow) AHBImportCacheEntry();
-            if (!entry) execute_ret = -6;
-            else {
+            if (!entry) {
+                execute_ret = -6;
+            } else {
                 AHardwareBuffer_acquire(ahb);
                 entry->ahb = ahb;
+
+                auto t = std::chrono::steady_clock::now();
                 entry->allocator = new (std::nothrow) ncnn::VkAndroidHardwareBufferImageAllocator(vkdev, ahb);
+                allocator_create_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t).count();
+
                 if (!entry->allocator) {
                     destroy_ahb_cache_entry(entry);
                     execute_ret = -6;
                 } else {
+                    t = std::chrono::steady_clock::now();
                     entry->src = ncnn::VkImageMat::from_android_hardware_buffer(entry->allocator);
+                    image_import_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t).count();
+
                     if (entry->src.empty()) {
                         LOGE("VkImageMat::from_android_hardware_buffer returned empty image");
                         destroy_ahb_cache_entry(entry);
@@ -325,11 +370,14 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                             ncnn::Option pipeline_opt = opt;
                             pipeline_opt.use_fp16_storage = false;
                             pipeline_opt.use_fp16_packed = false;
-                            const auto t = std::chrono::steady_clock::now();
-                            const int pr = entry->pipeline->create(entry->allocator, 1, rotate_type,
-                                                                    target_w, target_h, pipeline_opt);
-                            cache_create_ms = std::chrono::duration<double, std::milli>(
+
+                            t = std::chrono::steady_clock::now();
+                            const int pr = entry->pipeline->create(
+                                entry->allocator, 1, rotate_type,
+                                target_w, target_h, pipeline_opt);
+                            pipeline_create_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t).count();
+
                             if (pr != 0) {
                                 LOGE("ImportAndroidHardwareBufferPipeline::create failed: %d", pr);
                                 destroy_ahb_cache_entry(entry);
@@ -339,76 +387,158 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                                 entry->last_used = ++ahb_cache_clock;
                                 ahb_import_cache.emplace(ahb, entry);
                                 cache_it = ahb_import_cache.find(ahb);
-                                LOGI("Created AHB cache entry: %ux%u fmt=%u cache=%zu",
-                                     desc.width, desc.height, desc.format, ahb_import_cache.size());
+
+                                LOGI("AHB_CACHE_MISS ptr=%p %ux%u stride=%u fmt=%u layers=%u usage=0x%llx "
+                                     "alloc=%.3fms import=%.3fms pipe=%.3fms entries=%zu",
+                                     static_cast<void*>(ahb), desc.width, desc.height, desc.stride,
+                                     desc.format, desc.layers,
+                                     static_cast<unsigned long long>(desc.usage),
+                                     allocator_create_ms, image_import_ms, pipeline_create_ms,
+                                     ahb_import_cache.size());
                             }
                         }
                     }
                 }
             }
-        } else cache_it->second->last_used = ++ahb_cache_clock;
+        } else {
+            cache_hit = true;
+            ++ahb_cache_hits;
+            cache_it->second->last_used = ++ahb_cache_clock;
+        }
 
         if (execute_ret == 0) {
             AHBImportCacheEntry* entry = cache_it->second;
+
             if (!entry->pipeline || entry->rotate_type != rotate_type) {
+                ++ahb_cache_rotate_rebuilds;
                 delete entry->pipeline;
                 entry->pipeline = nullptr;
+
                 ncnn::Option pipeline_opt = opt;
                 pipeline_opt.use_fp16_storage = false;
                 pipeline_opt.use_fp16_packed = false;
+
                 const auto t = std::chrono::steady_clock::now();
                 entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
                 const int pr = entry->pipeline
-                    ? entry->pipeline->create(entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt)
+                    ? entry->pipeline->create(entry->allocator, 1, rotate_type,
+                                              target_w, target_h, pipeline_opt)
                     : -1;
-                cache_create_ms = std::chrono::duration<double, std::milli>(
+                pipeline_create_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t).count();
+
                 if (pr != 0) {
                     LOGE("Rebuilding AHB import pipeline failed: %d", pr);
                     delete entry->pipeline;
                     entry->pipeline = nullptr;
                     execute_ret = -7;
-                } else entry->rotate_type = rotate_type;
+                } else {
+                    entry->rotate_type = rotate_type;
+                }
             }
 
             if (execute_ret == 0) {
                 ncnn::VkMat dst;
                 dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);
-                if (dst.empty()) execute_ret = -8;
-                else {
-                    ncnn::VkMat dst_normalized, in_gpu;
-                    ncnn::VkCompute cmd(vkdev);
-                    cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
+                if (dst.empty()) {
+                    execute_ret = -8;
+                } else {
+                    ncnn::VkMat dst_normalized;
+                    ncnn::VkMat in_gpu;
+
+                    // Stage 1: AHB import + preprocessing. This command still waits
+                    // before inference because this diagnostic build isolates phases.
+                    ncnn::VkCompute preprocess_cmd(vkdev);
+                    auto t = std::chrono::steady_clock::now();
+
+                    preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
                     execute_ret = scale_layer
-                        ? scale_layer->forward(dst, dst_normalized, cmd, opt)
+                        ? scale_layer->forward(dst, dst_normalized, preprocess_cmd, opt)
                         : -9;
+
                     if (execute_ret == 0) {
                         const int pack = 1;
                         const int cast = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
-                        vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, cmd, opt);
-                        const int sr = cmd.submit_and_wait();
-                        if (sr != 0) execute_ret = -10;
+                        vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, preprocess_cmd, opt);
                     }
+
+                    preprocess_record_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t).count();
+
                     if (execute_ret == 0) {
-                        const auto t = std::chrono::steady_clock::now();
+                        t = std::chrono::steady_clock::now();
+                        execute_ret = preprocess_cmd.submit_and_wait();
+                        preprocess_wait_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t).count();
+                        if (execute_ret != 0) {
+                            LOGE("Preprocess submit_and_wait failed: %d", execute_ret);
+                            execute_ret = -10;
+                        }
+                    }
+
+                    // Stage 2: GPU inference only. Extract to VkMat so the model
+                    // execution can complete without downloading the tensor to CPU.
+                    ncnn::VkMat out_gpu;
+                    if (execute_ret == 0) {
                         ncnn::Extractor ex = net.create_extractor();
                         ex.set_blob_vkallocator(blob_allocator);
                         ex.set_workspace_vkallocator(blob_allocator);
                         ex.set_staging_vkallocator(staging_allocator);
                         ex.input("in0", in_gpu);
-                        execute_ret = ex.extract("out0", out);
-                        infer_readback_ms = std::chrono::duration<double, std::milli>(
+
+                        ncnn::VkCompute infer_cmd(vkdev);
+                        t = std::chrono::steady_clock::now();
+                        execute_ret = ex.extract("out0", out_gpu, infer_cmd);
+                        infer_encode_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t).count();
+
+                        if (execute_ret == 0) {
+                            t = std::chrono::steady_clock::now();
+                            execute_ret = infer_cmd.submit_and_wait();
+                            infer_wait_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t).count();
+                            if (execute_ret != 0) {
+                                LOGE("Inference submit_and_wait failed: %d", execute_ret);
+                                execute_ret = -11;
+                            }
+                        }
+                    }
+
+                    // Stage 3: explicit GPU -> CPU download. The timings below
+                    // distinguish CPU-side download recording from submit/wait.
+                    if (execute_ret == 0) {
+                        ncnn::VkCompute download_cmd(vkdev);
+
+                        t = std::chrono::steady_clock::now();
+                        download_cmd.record_download(out_gpu, out, opt);
+                        readback_record_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t).count();
+
+                        t = std::chrono::steady_clock::now();
+                        execute_ret = download_cmd.submit_and_wait();
+                        readback_wait_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t).count();
+                        if (execute_ret != 0) {
+                            LOGE("Readback submit_and_wait failed: %d", execute_ret);
+                            execute_ret = -12;
+                        }
+
+                        if (execute_ret == 0) {
+                            LOGD("Tensor GPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d; "
+                                 "CPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
+                                 out_gpu.dims, out_gpu.w, out_gpu.h, out_gpu.c,
+                                 out_gpu.elemsize, out_gpu.elempack,
+                                 out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
+                        }
                     }
                 }
             }
         }
-        preprocess_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - frame_start).count() - infer_readback_ms;
-    } // All per-frame VkMat / VkCompute / Extractor references die before allocator reclaim.
+    } // VkMat / VkCompute / Extractor references die before allocator reclaim.
 
     vkdev->reclaim_blob_allocator(blob_allocator);
     vkdev->reclaim_staging_allocator(staging_allocator);
+
     if (execute_ret != 0) {
         LOGE("AHB frame failed at GPU stage (code=%d)", execute_ret);
         return -11;
@@ -419,15 +549,42 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
     decode_dfl_and_filter(out, conf_thresh);
     objects.clear();
     nms_sorted_bboxes(nms_thresh, objects);
-    const double postprocess_ms = std::chrono::duration<double, std::milli>(
+    postprocess_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - post_start).count();
+
+    const double preprocess_total_ms = preprocess_record_ms + preprocess_wait_ms;
+    const double infer_total_ms = infer_encode_ms + infer_wait_ms;
+    const double readback_total_ms = readback_record_ms + readback_wait_ms;
+    const double cache_setup_ms = allocator_create_ms + image_import_ms + pipeline_create_ms;
+    const double frame_total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - frame_start).count();
 
     static int s_frame_log = 0;
     if (++s_frame_log % 30 == 0) {
-        LOGI("Pipeline: preprocess=%.2fms cache_create=%.2fms infer+readback=%.2fms post=%.2fms | out(dims=%d w=%d h=%d c=%d) proposals=%zu detections=%zu top=%.3f cls=%d",
-             preprocess_ms, cache_create_ms, infer_readback_ms, postprocess_ms,
-             out.dims, out.w, out.h, out.c, proposal_scratchpad.size(),
-             objects.size(), last_top_score, last_top_class);
+        LOGI("AHB_CACHE frame=%d ptr=%p state=%s hits=%llu misses=%llu evictions=%llu "
+             "rotate_rebuilds=%llu entries=%zu lookup=%.3fms alloc=%.3fms import=%.3fms pipe=%.3fms",
+             s_frame_log, static_cast<void*>(ahb), cache_hit ? "HIT" : "MISS",
+             static_cast<unsigned long long>(ahb_cache_hits),
+             static_cast<unsigned long long>(ahb_cache_misses),
+             static_cast<unsigned long long>(ahb_cache_evictions),
+             static_cast<unsigned long long>(ahb_cache_rotate_rebuilds),
+             ahb_import_cache.size(), cache_lookup_ms, allocator_create_ms,
+             image_import_ms, pipeline_create_ms);
+
+        LOGI("Pipeline frame=%d preprocess_record=%.3fms preprocess_wait=%.3fms preprocess_total=%.3fms "
+             "infer_encode=%.3fms infer_wait=%.3fms infer_total=%.3fms "
+             "readback_record=%.3fms readback_wait=%.3fms readback_total=%.3fms "
+             "post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
+             s_frame_log, preprocess_record_ms, preprocess_wait_ms, preprocess_total_ms,
+             infer_encode_ms, infer_wait_ms, infer_total_ms,
+             readback_record_ms, readback_wait_ms, readback_total_ms,
+             postprocess_ms, cache_setup_ms, frame_total_ms);
+
+        LOGI("Tensor out(dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d) "
+             "proposals=%zu detections=%zu top=%.3f cls=%d",
+             out.dims, out.w, out.h, out.c, out.elemsize, out.elempack,
+             proposal_scratchpad.size(), objects.size(), last_top_score, last_top_class);
+
         const size_t detail_count = std::min<size_t>(objects.size(), 8);
         for (size_t i = 0; i < detail_count; i++) {
             const Object& obj = objects[i];
@@ -437,6 +594,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                  obj.zone_id);
         }
     }
+
     return 0;
 }
 
