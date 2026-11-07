@@ -71,7 +71,7 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
     jobject asset_manager,
     jint model_type_index,
     jint target_size,
-    jboolean use_gpu)
+    jint compute_mode)
 {
     std::lock_guard<std::mutex> lock(g_lock);
 
@@ -90,7 +90,7 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
         modeltype = "m";
     }
 
-    int ret = g_yolo->load(mgr, modeltype, target_size, use_gpu == JNI_TRUE);
+    int ret = g_yolo->load(mgr, modeltype, target_size, static_cast<int>(compute_mode));
     if (ret != 0) {
         LOGE("YOLO11 init failed with error code: %d", ret);
         delete g_yolo;
@@ -99,13 +99,13 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
     }
 
     g_objects_scratchpad.reserve(64);
-    LOGI("YOLO11 initialized successfully (Model: yolo11%s, Size: %d, GPU: %d)",
-         modeltype, target_size, use_gpu ? 1 : 0);
+    LOGI("YOLO11 initialized successfully (Model: yolo11%s, Size: %d, compute_mode=%d)",
+         modeltype, target_size, static_cast<int>(compute_mode));
     return JNI_TRUE;
 }
 
 JNIEXPORT jint JNICALL
-Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     JNIEnv* env,
     jobject thiz,
     jobject hardware_buffer_obj,
@@ -153,7 +153,7 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectAHBDirect(
     AHardwareBuffer_acquire(ahb);                                               
                                                                                 
     g_objects_scratchpad.clear();                                               
-    int ret = g_yolo->detect_ahb(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type);                                         
+    int ret = g_yolo->detect_frame(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type);                                         
     AHardwareBuffer_release(ahb);                                               
                                                                                 
     if (ret != 0) {
