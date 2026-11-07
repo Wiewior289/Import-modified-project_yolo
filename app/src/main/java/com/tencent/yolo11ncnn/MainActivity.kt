@@ -14,6 +14,12 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.LinearLayout
+import android.widget.Spinner
+import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ExecutorService
@@ -33,6 +39,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MainActivity : AppCompatActivity() {
 
     private val yoloEngine = Yolo11Ncnn()
+    @Volatile private var selectedComputeMode: Int = Yolo11Ncnn.COMPUTE_VULKAN_AHB
+    @Volatile private var modeGeneration: Long = 0L
+    private var modeSelectorInitialized = false
     private lateinit var telemetryServer: TelemetryServer
     private lateinit var backgroundInitExecutor: ExecutorService
 
@@ -62,7 +71,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(android.R.layout.list_content)
+        installComputeModeSelector()
 
         backgroundInitExecutor = Executors.newSingleThreadExecutor()
 
@@ -95,6 +104,109 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun installComputeModeSelector() {
+        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB")
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 16, 20, 8)
+        }
+        val label = TextView(this).apply {
+            text = "Tryb obliczeniowy NCNN"
+            textSize = 16f
+        }
+        val spinner = Spinner(this)
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+        spinner.setSelection(selectedComputeMode)
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (!modeSelectorInitialized) {
+                    modeSelectorInitialized = true
+                    if (position != selectedComputeMode) switchComputeMode(position)
+                    return
+                }
+                switchComputeMode(position)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        root.addView(label, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(spinner, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        setContentView(root)
+    }
+
+    private fun computeModeLabel(mode: Int): String = when (mode) {
+        Yolo11Ncnn.COMPUTE_CPU -> "CPU"
+        Yolo11Ncnn.COMPUTE_VULKAN -> "GPU Vulkan"
+        Yolo11Ncnn.COMPUTE_VULKAN_AHB -> "GPU Vulkan + AHB"
+        else -> "UNKNOWN($mode)"
+    }
+
+    private fun closeCameraForModeSwitch() {
+        try {
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            imageReader?.close()
+            imageReader = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd zatrzymywania kamery przy zmianie backendu", e)
+        }
+    }
+
+    private fun switchComputeMode(newMode: Int) {
+        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB ||
+            newMode == selectedComputeMode) return
+
+        selectedComputeMode = newMode
+        val generation = ++modeGeneration
+        isYoloReady.set(false)
+        isCameraRunning.set(false)
+        closeCameraForModeSwitch()
+        telemetryServer.broadcastStatus(
+            "COMPUTE_MODE_SWITCH",
+            "Przełączanie backendu na " + computeModeLabel(newMode)
+        )
+
+        // The same single-thread executor serializes mode changes after any in-flight frame.
+        backgroundInitExecutor.execute {
+            yoloEngine.Destroy()
+            val startedAt = SystemClock.elapsedRealtime()
+            val initialized = try {
+                yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
+                false
+            }
+            val durationMs = SystemClock.elapsedRealtime() - startedAt
+
+            runOnUiThread {
+                if (generation != modeGeneration) return@runOnUiThread
+                if (initialized) {
+                    isYoloReady.set(true)
+                    Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
+                    telemetryServer.broadcastStatus(
+                        "COMPUTE_MODE_READY",
+                        computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
+                    )
+                    startCamera2()
+                } else {
+                    isYoloReady.set(false)
+                    telemetryServer.broadcastStatus(
+                        "ERROR_COMPUTE_MODE",
+                        "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
+                    )
+                }
+            }
+        }
+    }
+
     private fun startTelemetryServer() {
         try {
             telemetryServer = TelemetryServer(
@@ -112,39 +224,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun launchAsyncPipeline() {
+        val modeAtStart = selectedComputeMode
+        val generationAtStart = modeGeneration
         backgroundInitExecutor.execute {
-            Log.i(TAG, "KROK 2: Ładowanie YOLO11 Vulkan w tle...")
-            telemetryServer.broadcastStatus("INIT_YOLO", "Inicjalizacja GPU Mali-G72 i ładowanie wag YOLO11...")
+            Log.i(TAG, "Ładowanie YOLO11 backend=" + computeModeLabel(modeAtStart) + " w tle...")
+            telemetryServer.broadcastStatus(
+                "INIT_YOLO",
+                "Inicjalizacja YOLO11: " + computeModeLabel(modeAtStart)
+            )
 
-            val startTime = System.currentTimeMillis()
-            var initSuccess = false
-
-            try {
-                initSuccess = yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, true)
+            val startTime = SystemClock.elapsedRealtime()
+            val initSuccess = try {
+                yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, modeAtStart)
             } catch (e: Exception) {
-                Log.e(TAG, "Błąd podczas init YOLO Vulkan", e)
+                Log.e(TAG, "Błąd podczas init backendu " + computeModeLabel(modeAtStart), e)
+                false
             }
+            val loadDuration = SystemClock.elapsedRealtime() - startTime
 
-            val loadDuration = System.currentTimeMillis() - startTime
-
-            if (initSuccess) {
-                Log.i(TAG, "YOLO11 Vulkan Init sukces w " + loadDuration + "ms")
-                isYoloReady.set(true)
-                telemetryServer.broadcastStatus("YOLO_READY", "YOLO11 gotowe na Mali-G72 (" + loadDuration + "ms)")
-
-                // KROK 3: Start natywnej kamery Camera2 DOPIERO po gotowości YOLO
-                runOnUiThread {
-                    Log.i(TAG, "KROK 3: Uruchamianie Camera2 Direct AHB...")
-                    telemetryServer.broadcastStatus("STARTING_CAMERA", "Uruchamianie Camera2 HardwareBuffer stream...")
+            runOnUiThread {
+                if (generationAtStart != modeGeneration) return@runOnUiThread
+                if (initSuccess) {
+                    Log.i(TAG, "YOLO11 " + computeModeLabel(modeAtStart) + " Init sukces w " + loadDuration + "ms")
+                    isYoloReady.set(true)
+                    telemetryServer.broadcastStatus(
+                        "YOLO_READY",
+                        computeModeLabel(modeAtStart) + " gotowy (" + loadDuration + "ms)"
+                    )
                     startCamera2()
+                } else {
+                    isYoloReady.set(false)
+                    Log.e(TAG, "Nie udało się zainicjalizować backendu " + computeModeLabel(modeAtStart))
+                    telemetryServer.broadcastStatus(
+                        "ERROR_YOLO_INIT",
+                        "Init nie powiódł się: " + computeModeLabel(modeAtStart)
+                    )
                 }
-            } else {
-                isYoloReady.set(false)
-                Log.e(TAG, "Vulkan/AHB init failed; refusing to start a CPU path that cannot consume AHardwareBuffer")
-                telemetryServer.broadcastStatus(
-                    "ERROR_AHB_VULKAN",
-                    "Import AHardwareBuffer do Vulkan niedostępny. Ścieżka CPU nie jest zaimplementowana."
-                )
             }
         }
     }
@@ -261,11 +376,11 @@ class MainActivity : AppCompatActivity() {
                             rawCount = -4
                         } else {
                             try {
-                                rawCount = yoloEngine.DetectAHBDirect(
+                                rawCount = yoloEngine.DetectFrame(
                                     hwBuffer, detectionBuffer, confThreshold, nmsThreshold, rotateType
                                 )
                             } catch (e: Exception) {
-                                Log.e(TAG, "Błąd DetectAHBDirect frame=$frameId", e)
+                                Log.e(TAG, "Błąd DetectFrame frame=$frameId", e)
                             } finally {
                                 hwBuffer.close()
                             }
