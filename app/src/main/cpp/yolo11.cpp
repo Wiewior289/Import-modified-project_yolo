@@ -507,10 +507,16 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                     // Stage 3: explicit GPU -> CPU download. The timings below
                     // distinguish CPU-side download recording from submit/wait.
                     if (execute_ret == 0) {
+                        // Extract(VkMat) preserves the network's GPU dtype/packing.
+                        // The CPU DFL decoder expects float32, unpacked values.
+                        // Convert explicitly before downloading; record_download alone
+                        // is a byte transfer and must not be treated as Extractor::extract(Mat).
+                        ncnn::VkMat out_download;
                         ncnn::VkCompute download_cmd(vkdev);
 
                         t = std::chrono::steady_clock::now();
-                        download_cmd.record_download(out_gpu, out, opt);
+                        vkdev->convert_packing(out_gpu, out_download, 1, 1, download_cmd, opt);
+                        download_cmd.record_download(out_download, out, opt);
                         readback_record_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t).count();
 
@@ -519,15 +525,18 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         readback_wait_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t).count();
                         if (execute_ret != 0) {
-                            LOGE("Readback submit_and_wait failed: %d", execute_ret);
+                            LOGE("Readback/FP32 conversion submit_and_wait failed: %d", execute_ret);
                             execute_ret = -12;
                         }
 
                         if (execute_ret == 0) {
                             LOGD("Tensor GPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d; "
+                                 "download GPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d; "
                                  "CPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
                                  out_gpu.dims, out_gpu.w, out_gpu.h, out_gpu.c,
                                  out_gpu.elemsize, out_gpu.elempack,
+                                 out_download.dims, out_download.w, out_download.h, out_download.c,
+                                 out_download.elemsize, out_download.elempack,
                                  out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
                         }
                     }
