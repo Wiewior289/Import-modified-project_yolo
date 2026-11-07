@@ -111,6 +111,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         }
 
         if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
+            LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
                 LOGE("Vulkan device lacks VK_ANDROID_external_memory_android_hardware_buffer (version %d)", ahb_ext);
@@ -424,11 +425,13 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
             ex.set_workspace_vkallocator(blob_allocator);
             ex.set_staging_vkallocator(staging_allocator);
         }
-        ex.input("in0", input);
-        const auto t = std::chrono::steady_clock::now();
-        extract_ret = ex.extract("out0", out);
-        infer_extract_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t).count();
+        extract_ret = ex.input("in0", input);
+        if (extract_ret == 0) {
+            const auto t = std::chrono::steady_clock::now();
+            extract_ret = ex.extract("out0", out);
+            infer_extract_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t).count();
+        }
     }
 
     if (compute_mode == YOLO_COMPUTE_VULKAN) {
