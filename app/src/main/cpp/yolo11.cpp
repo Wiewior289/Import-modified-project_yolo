@@ -349,7 +349,8 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
     const bool rotate_90 = (rotate_type == 6 || rotate_type == 8);
     const uint32_t rotated_w = rotate_90 ? src_h : src_w;
     const uint32_t rotated_h = rotate_90 ? src_w : src_h;
-    std::vector<unsigned char> rgb(static_cast<size_t>(rotated_w) * rotated_h * 3u);
+    cpu_rgb_scratchpad.resize(static_cast<size_t>(rotated_w) * rotated_h * 3u);
+    unsigned char* rgb_data = cpu_rgb_scratchpad.data();
 
     const unsigned char* y_data = static_cast<const unsigned char*>(yp.data);
     const unsigned char* cb_data = static_cast<const unsigned char*>(cbp.data);
@@ -376,9 +377,9 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
             else if (rotate_type == 8) { dx = sy; dy = src_w - 1u - sx; }
 
             const size_t dst = (static_cast<size_t>(dy) * rotated_w + dx) * 3u;
-            rgb[dst + 0] = static_cast<unsigned char>(std::max(0, std::min(255, r)));
-            rgb[dst + 1] = static_cast<unsigned char>(std::max(0, std::min(255, g)));
-            rgb[dst + 2] = static_cast<unsigned char>(std::max(0, std::min(255, b)));
+            rgb_data[dst + 0] = static_cast<unsigned char>(std::max(0, std::min(255, r)));
+            rgb_data[dst + 1] = static_cast<unsigned char>(std::max(0, std::min(255, g)));
+            rgb_data[dst + 2] = static_cast<unsigned char>(std::max(0, std::min(255, b)));
         }
     }
 
@@ -388,7 +389,7 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
     }
 
     ncnn::Mat input = ncnn::Mat::from_pixels_resize(
-        rgb.data(), ncnn::Mat::PIXEL_RGB, static_cast<int>(rotated_w),
+        rgb_data, ncnn::Mat::PIXEL_RGB, static_cast<int>(rotated_w),
         static_cast<int>(rotated_h), target_w, target_h);
     if (input.empty()) {
         LOGE("CPU YUV preprocess produced an empty NCNN Mat");
