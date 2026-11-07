@@ -30,7 +30,7 @@ class Yolo11Ncnn {
     }
 
     /**
-     * Initializes NCNN with CPU, Vulkan, or direct Vulkan+A​​HB input mode.
+     * Initializes NCNN with CPU, Vulkan, or direct Vulkan+AHB input mode.
      */
     external fun Init(
         mgr: AssetManager,
