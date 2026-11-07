@@ -5,7 +5,7 @@ import android.hardware.HardwareBuffer
 
 /**
  * ============================================================================
- * Yolo11Ncnn - Kotlin JNI Wrapper for Mali-G72 AHardwareBuffer Input
+ * Yolo11Ncnn - Kotlin JNI Wrapper for selectable CPU / Vulkan / AHB paths
  * Target: Samsung Galaxy S9+ (Mali-G72 MP18 + Exynos 9810)
  * ============================================================================
  */
@@ -20,27 +20,32 @@ class Yolo11Ncnn {
         const val MODEL_YOLO11S = 1
         const val MODEL_YOLO11M = 2
 
+        const val COMPUTE_CPU = 0
+        const val COMPUTE_VULKAN = 1
+        const val COMPUTE_VULKAN_AHB = 2
+
         const val ZONE_NEAR = 0
         const val ZONE_MID = 1
         const val ZONE_FAR = 2
     }
 
     /**
-     * Initializes NCNN, compiles Vulkan pipelines, and loads models from Android assets.
+     * Initializes NCNN with CPU, Vulkan, or direct Vulkan+A​​HB input mode.
      */
     external fun Init(
         mgr: AssetManager,
         modelTypeIndex: Int,
         targetSize: Int,
-        useGpu: Boolean
+        computeMode: Int
     ): Boolean
 
     /**
-     * AHardwareBuffer input method:
+     * Frame input method. The native backend selects CPU-mapped YUV, CPU-mapped
+     * YUV with Vulkan inference, or direct Vulkan AHardwareBuffer import.
      * Directly fills pre-allocated [outBuffer] with detections from [hardwareBuffer].
      * @return Number of detected objects.
      */
-    external fun DetectAHBDirect(
+    external fun DetectFrame(
         hardwareBuffer: HardwareBuffer,
         outBuffer: FloatArray,
         confThresh: Float,
