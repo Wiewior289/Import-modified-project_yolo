@@ -27,7 +27,7 @@ Yolo11::Yolo11()
       ahb_cache_hits(0), ahb_cache_misses(0), ahb_cache_evictions(0),
       ahb_cache_rotate_rebuilds(0),
       target_w(320), target_h(320), num_classes(80),
-      model_loaded(false), use_vulkan_compute(true),
+      model_loaded(false), use_vulkan_compute(true), compute_mode(YOLO_COMPUTE_VULKAN_AHB),
       last_top_score(0.0f), last_top_class(-1)
 {
     std::memset(dfl_distribution_scratchpad, 0, sizeof(dfl_distribution_scratchpad));
@@ -73,7 +73,7 @@ void Yolo11::clear_ahb_cache()
     ahb_cache_rotate_rebuilds = 0;
 }
 
-int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, bool use_gpu)
+int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int requested_compute_mode)
 {
     if (!mgr || !modeltype) {
         LOGE("Invalid AssetManager or modeltype pointer");
@@ -85,29 +85,41 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
 
     target_w = target_size;
     target_h = target_size;
-    use_vulkan_compute = use_gpu;
+    if (requested_compute_mode < YOLO_COMPUTE_CPU ||
+        requested_compute_mode > YOLO_COMPUTE_VULKAN_AHB) {
+        LOGE("Invalid compute mode: %d", requested_compute_mode);
+        return -4;
+    }
+
+    compute_mode = requested_compute_mode;
+    use_vulkan_compute = (compute_mode != YOLO_COMPUTE_CPU);
     model_loaded = false;
     last_top_score = 0.0f;
     last_top_class = -1;
+    vkdev = nullptr;
 
-    const int gpu_count = ncnn::get_gpu_count();
-    if (!use_gpu || gpu_count <= 0) {
-        LOGE("AHB camera inference requires Vulkan; CPU fallback is not implemented in this path");
-        return -4;
+    if (use_vulkan_compute) {
+        const int gpu_count = ncnn::get_gpu_count();
+        if (gpu_count <= 0) {
+            LOGE("Vulkan requested but no NCNN Vulkan device is available");
+            return -4;
+        }
+        vkdev = ncnn::get_gpu_device(0);
+        if (!vkdev || !vkdev->is_valid()) {
+            LOGE("No valid Vulkan device available");
+            return -4;
+        }
+
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
+            const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
+            if (ahb_ext <= 0) {
+                LOGE("Vulkan device lacks VK_ANDROID_external_memory_android_hardware_buffer (version %d)", ahb_ext);
+                return -4;
+            }
+            LOGI("AHB import extension available (spec version %d)", ahb_ext);
+        }
+        net.set_vulkan_device(vkdev);
     }
-    vkdev = ncnn::get_gpu_device(0);
-    if (!vkdev || !vkdev->is_valid()) {
-        LOGE("No valid Vulkan device available for AHB import");
-        return -4;
-    }
-    const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
-    if (ahb_ext <= 0) {
-        LOGE("Vulkan device lacks VK_ANDROID_external_memory_android_hardware_buffer (version %d)", ahb_ext);
-        return -4;
-    }
-    use_vulkan_compute = true;
-    net.set_vulkan_device(vkdev);
-    LOGI("AHB import extension available (spec version %d)", ahb_ext);
 
     net.opt.use_vulkan_compute  = use_vulkan_compute;
     net.opt.use_fp16_packed     = use_vulkan_compute;
@@ -121,8 +133,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
     snprintf(parampath, sizeof(parampath), "yolo11%s.param", modeltype);
     snprintf(binpath, sizeof(binpath), "yolo11%s.bin", modeltype);
 
-    LOGI("Loading YOLO11: %s, %s (target_size: %dx%d, Vulkan: %d)",
-         parampath, binpath, target_w, target_h, use_vulkan_compute ? 1 : 0);
+    LOGI("Loading YOLO11: %s, %s (target_size: %dx%d, compute_mode=%d)", 
+         parampath, binpath, target_w, target_h, compute_mode);
 
     int ret_param = net.load_param(mgr, parampath);
     if (ret_param != 0) {
@@ -136,11 +148,12 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
         return -3;                                                              
     }                                                                           
                                                                                 
-    if (!use_vulkan_compute || !vkdev) {
+    if (use_vulkan_compute && !vkdev) {
         LOGE("Vulkan initialization did not complete");
         return -5;
     }
 
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
@@ -216,6 +229,24 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, boo
     }
 
     LOGI("GPU Scale layer initialized: RGB [0,255] -> [0,1]");
+    }
+
+
+
+    // Inventory model layers and their Vulkan capabilities. This tells us where
+    // a Vulkan network may still use CPU fallback; it is not a timing profiler.
+    const auto& model_layers = net.layers();
+    LOGI("NCNN_LAYER_INVENTORY count=%zu compute_mode=%d", model_layers.size(), compute_mode);
+    for (size_t i = 0; i < model_layers.size(); ++i) {
+        const ncnn::Layer* layer = model_layers[i];
+        if (!layer) continue;
+        LOGI("NCNN_LAYER idx=%zu type=%s name=%s support_vulkan=%d support_packing=%d support_vulkan_packing=%d",
+             i, layer->type.c_str(), layer->name.c_str(),
+             layer->support_vulkan ? 1 : 0,
+             layer->support_packing ? 1 : 0,
+             layer->support_vulkan_packing ? 1 : 0);
+    }
+    LOGI("NCNN_LAYER_TIMING_NOTE: true per-layer CPU/GPU timings require the linked NCNN library built with NCNN_BENCHMARK=ON; app-only defines are insufficient.");
 
     generate_grids_and_stride(target_w, target_h);
 
@@ -257,6 +288,181 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
     }
 }
 
+int Yolo11::detect_frame(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                         std::vector<Object>& objects, int rotate_type)
+{
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
+        return detect_ahb(ahb, conf_thresh, nms_thresh, objects, rotate_type);
+    }
+    return detect_cpu_or_vulkan(ahb, conf_thresh, nms_thresh, objects, rotate_type);
+}
+
+int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                                 std::vector<Object>& objects, int rotate_type)
+{
+    last_top_score = 0.0f;
+    last_top_class = -1;
+    objects.clear();
+    if (!model_loaded) return -1;
+    if (!ahb) return -2;
+    if (compute_mode != YOLO_COMPUTE_CPU && compute_mode != YOLO_COMPUTE_VULKAN) return -3;
+    if (compute_mode == YOLO_COMPUTE_VULKAN && (!use_vulkan_compute || !vkdev)) return -3;
+
+    const auto frame_start = std::chrono::steady_clock::now();
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(ahb, &desc);
+    if (desc.width == 0 || desc.height == 0 ||
+        (desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) == 0) {
+        LOGE("CPU input path requires CPU-readable AHB; size=%ux%u usage=0x%llx",
+             desc.width, desc.height, static_cast<unsigned long long>(desc.usage));
+        return -4;
+    }
+
+    const auto preprocess_start = std::chrono::steady_clock::now();
+    AHardwareBuffer_Planes planes{};
+    int ret = AHardwareBuffer_lockPlanes(ahb, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
+                                         -1, nullptr, &planes);
+    if (ret != 0) {
+        LOGE("AHardwareBuffer_lockPlanes failed: %d", ret);
+        return -5;
+    }
+
+    if (desc.format != AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 || planes.planeCount < 3) {
+        AHardwareBuffer_unlock(ahb, nullptr);
+        LOGE("Unsupported CPU YUV format: format=%u planeCount=%u", desc.format, planes.planeCount);
+        return -6;
+    }
+
+    const uint32_t src_w = desc.width;
+    const uint32_t src_h = desc.height;
+    const auto& yp = planes.planes[0];
+    const auto& cbp = planes.planes[1];
+    const auto& crp = planes.planes[2];
+    if (!yp.data || !cbp.data || !crp.data ||
+        yp.rowStride == 0 || cbp.rowStride == 0 || crp.rowStride == 0 ||
+        yp.pixelStride == 0 || cbp.pixelStride == 0 || crp.pixelStride == 0) {
+        AHardwareBuffer_unlock(ahb, nullptr);
+        LOGE("Invalid YUV plane metadata");
+        return -7;
+    }
+
+    const bool rotate_90 = (rotate_type == 6 || rotate_type == 8);
+    const uint32_t rotated_w = rotate_90 ? src_h : src_w;
+    const uint32_t rotated_h = rotate_90 ? src_w : src_h;
+    std::vector<unsigned char> rgb(static_cast<size_t>(rotated_w) * rotated_h * 3u);
+
+    const unsigned char* y_data = static_cast<const unsigned char*>(yp.data);
+    const unsigned char* cb_data = static_cast<const unsigned char*>(cbp.data);
+    const unsigned char* cr_data = static_cast<const unsigned char*>(crp.data);
+
+    // BT.601 limited-range YUV420 to packed RGB. CPU and Vulkan baseline modes
+    // share this exact preprocessing path so backend comparison is controlled.
+    for (uint32_t sy = 0; sy < src_h; ++sy) {
+        const unsigned char* y_row = y_data + static_cast<size_t>(sy) * yp.rowStride;
+        const unsigned char* cb_row = cb_data + static_cast<size_t>(sy / 2u) * cbp.rowStride;
+        const unsigned char* cr_row = cr_data + static_cast<size_t>(sy / 2u) * crp.rowStride;
+        for (uint32_t sx = 0; sx < src_w; ++sx) {
+            const int yy = std::max(0, static_cast<int>(y_row[sx * yp.pixelStride]) - 16);
+            const int uu = static_cast<int>(cb_row[(sx / 2u) * cbp.pixelStride]) - 128;
+            const int vv = static_cast<int>(cr_row[(sx / 2u) * crp.pixelStride]) - 128;
+            const int r = (298 * yy + 409 * vv + 128) >> 8;
+            const int g = (298 * yy - 100 * uu - 208 * vv + 128) >> 8;
+            const int b = (298 * yy + 516 * uu + 128) >> 8;
+
+            uint32_t dx = sx;
+            uint32_t dy = sy;
+            if (rotate_type == 6) { dx = src_h - 1u - sy; dy = sx; }
+            else if (rotate_type == 3) { dx = src_w - 1u - sx; dy = src_h - 1u - sy; }
+            else if (rotate_type == 8) { dx = sy; dy = src_w - 1u - sx; }
+
+            const size_t dst = (static_cast<size_t>(dy) * rotated_w + dx) * 3u;
+            rgb[dst + 0] = static_cast<unsigned char>(std::max(0, std::min(255, r)));
+            rgb[dst + 1] = static_cast<unsigned char>(std::max(0, std::min(255, g)));
+            rgb[dst + 2] = static_cast<unsigned char>(std::max(0, std::min(255, b)));
+        }
+    }
+
+    const int unlock_ret = AHardwareBuffer_unlock(ahb, nullptr);
+    if (unlock_ret != 0) {
+        LOGW("AHardwareBuffer_unlock returned %d", unlock_ret);
+    }
+
+    ncnn::Mat input = ncnn::Mat::from_pixels_resize(
+        rgb.data(), ncnn::Mat::PIXEL_RGB, static_cast<int>(rotated_w),
+        static_cast<int>(rotated_h), target_w, target_h);
+    if (input.empty()) {
+        LOGE("CPU YUV preprocess produced an empty NCNN Mat");
+        return -8;
+    }
+    const float mean_vals[3] = {0.f, 0.f, 0.f};
+    const float norm_vals[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
+    input.substract_mean_normalize(mean_vals, norm_vals);
+    const double preprocess_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - preprocess_start).count();
+
+    ncnn::Mat out;
+    int extract_ret = 0;
+    double infer_extract_ms = 0.0;
+    ncnn::VkAllocator* blob_allocator = nullptr;
+    ncnn::VkAllocator* staging_allocator = nullptr;
+    if (compute_mode == YOLO_COMPUTE_VULKAN) {
+        blob_allocator = vkdev->acquire_blob_allocator();
+        staging_allocator = vkdev->acquire_staging_allocator();
+        if (!blob_allocator || !staging_allocator) {
+            if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
+            if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
+            LOGE("Failed to acquire Vulkan allocators for Mat input");
+            return -9;
+        }
+    }
+
+    {
+        ncnn::Extractor ex = net.create_extractor();
+        if (compute_mode == YOLO_COMPUTE_VULKAN) {
+            ex.set_blob_vkallocator(blob_allocator);
+            ex.set_workspace_vkallocator(blob_allocator);
+            ex.set_staging_vkallocator(staging_allocator);
+        }
+        ex.input("in0", input);
+        const auto t = std::chrono::steady_clock::now();
+        extract_ret = ex.extract("out0", out);
+        infer_extract_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t).count();
+    }
+
+    if (compute_mode == YOLO_COMPUTE_VULKAN) {
+        vkdev->reclaim_blob_allocator(blob_allocator);
+        vkdev->reclaim_staging_allocator(staging_allocator);
+    }
+    if (extract_ret != 0 || out.empty()) {
+        LOGE("Extractor::extract(out0, Mat) failed in mode=%d ret=%d", compute_mode, extract_ret);
+        return -10;
+    }
+
+    const auto post_start = std::chrono::steady_clock::now();
+    proposal_scratchpad.clear();
+    decode_dfl_and_filter(out, conf_thresh);
+    objects.clear();
+    nms_sorted_bboxes(nms_thresh, objects);
+    const double post_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_start).count();
+    const double frame_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - frame_start).count();
+
+    static int s_cpu_vk_frame_log = 0;
+    if (++s_cpu_vk_frame_log % 30 == 0) {
+        LOGI("Pipeline mode=%s frame=%d input=AHB_CPU_LOCK format=YUV420_888 "
+             "colorspace=BT601_LIMITED preprocess_cpu=%.3fms infer_extract_wall=%.3fms "
+             "post=%.3fms frame_total=%.3fms out(w=%d h=%d elemsize=%zu elempack=%d) "
+             "proposals=%zu detections=%zu top=%.3f cls=%d",
+             compute_mode == YOLO_COMPUTE_CPU ? "CPU" : "VULKAN",
+             s_cpu_vk_frame_log, preprocess_ms, infer_extract_ms, post_ms, frame_ms,
+             out.w, out.h, out.elemsize, out.elempack,
+             proposal_scratchpad.size(), objects.size(), last_top_score, last_top_class);
+    }
+    return 0;
+}
+
 int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                          std::vector<Object>& objects, int rotate_type)
 {
@@ -265,7 +471,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
     objects.clear();
     if (!model_loaded) return -1;
     if (!ahb) return -2;
-    if (!use_vulkan_compute || !vkdev) return -3;
+    if (compute_mode != YOLO_COMPUTE_VULKAN_AHB || !use_vulkan_compute || !vkdev) return -3;
 
     const auto frame_start = std::chrono::steady_clock::now();
 
@@ -522,7 +728,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
         std::chrono::steady_clock::now() - post_start).count();
 
     const double preprocess_total_ms = preprocess_record_ms + preprocess_wait_ms;
-    const double infer_total_ms = infer_extract_ms;
+    const double infer_total_ms = infer_extract_ms; // Extractor wall time includes GPU execution, sync and output readback.
     const double cache_setup_ms = allocator_create_ms + image_import_ms + pipeline_create_ms;
     const double frame_total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - frame_start).count();
@@ -540,7 +746,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
              image_import_ms, pipeline_create_ms);
 
         LOGI("Pipeline frame=%d preprocess_record=%.3fms preprocess_wait=%.3fms preprocess_total=%.3fms "
-             "infer_extract_total=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
+             "infer_extract_wall=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
              s_frame_log, preprocess_record_ms, preprocess_wait_ms, preprocess_total_ms,
              infer_total_ms, postprocess_ms, cache_setup_ms, frame_total_ms);
 
