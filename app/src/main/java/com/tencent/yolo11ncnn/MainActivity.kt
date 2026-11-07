@@ -71,12 +71,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        installComputeModeSelector()
-
         backgroundInitExecutor = Executors.newSingleThreadExecutor()
 
-        // KROK 1: Start serwera WebSocket natychmiast
+        // Start telemetry before installing the selector, so an early spinner
+        // callback can safely report a mode change.
         startTelemetryServer()
+        installComputeModeSelector()
 
         // KROK 2 & 3: Weryfikacja uprawnień i asynchroniczny start potoku
         if (allPermissionsGranted()) {
