@@ -31,9 +31,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * MainActivity - Camera2 / AHardwareBuffer YOLO test harness
  * Platform: Samsung Galaxy S9+ (Mali-G72 MP18 + Exynos 9810)
  *
- * Camera2 -> ImageReader AHardwareBuffer -> Vulkan import -> NCNN.
- * The input buffer is imported without an application-side YUV-to-RGB CPU copy.
- * Model output is read back to CPU for DFL decode, NMS and dashboard telemetry.
+ * CPU / Vulkan baseline: AHardwareBuffer YUV planes are mapped and converted on CPU.
+ * Vulkan + AHB: Camera2 buffer is imported directly into Vulkan.
+ * All modes return output to CPU for DFL decode, NMS and dashboard telemetry.
  * ============================================================================
  */
 class MainActivity : AppCompatActivity() {
