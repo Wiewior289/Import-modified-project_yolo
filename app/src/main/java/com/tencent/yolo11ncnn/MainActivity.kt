@@ -153,8 +153,6 @@ class MainActivity : AppCompatActivity() {
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
-            imageReader?.close()
-            imageReader = null
         } catch (e: Exception) {
             Log.e(TAG, "Błąd zatrzymywania kamery przy zmianie backendu", e)
         }
@@ -176,6 +174,9 @@ class MainActivity : AppCompatActivity() {
 
         // The same single-thread executor serializes mode changes after any in-flight frame.
         backgroundInitExecutor.execute {
+            fpsWindowStartMs = 0L
+            fpsWindowFrames = 0
+            currentFps = 0f
             yoloEngine.Destroy()
             val startedAt = SystemClock.elapsedRealtime()
             val initialized = try {
@@ -188,6 +189,11 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread {
                 if (generation != modeGeneration) return@runOnUiThread
+                // The executor has drained the prior frame. Detach the old reader
+                // callback before closing the reader and opening the next session.
+                imageReader?.setOnImageAvailableListener(null, null)
+                imageReader?.close()
+                imageReader = null
                 if (initialized) {
                     isYoloReady.set(true)
                     Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
