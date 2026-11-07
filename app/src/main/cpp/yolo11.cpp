@@ -448,33 +448,36 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
 
                     // Stage 1: AHB import + preprocessing. This command still waits
                     // before inference because this diagnostic build isolates phases.
-                    ncnn::VkCompute preprocess_cmd(vkdev);
                     auto t = std::chrono::steady_clock::now();
-
-                    preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
-                    execute_ret = scale_layer
-                        ? scale_layer->forward(dst, dst_normalized, preprocess_cmd, opt)
-                        : -9;
-
-                    if (execute_ret == 0) {
-                        const int pack = 1;
-                        const int cast = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
-                        vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, preprocess_cmd, opt);
-                    }
-
-                    preprocess_record_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t).count();
-
-                    if (execute_ret == 0) {
+                    {
+                        ncnn::VkCompute preprocess_cmd(vkdev);
                         t = std::chrono::steady_clock::now();
-                        execute_ret = preprocess_cmd.submit_and_wait();
-                        preprocess_wait_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t).count();
-                        if (execute_ret != 0) {
-                            LOGE("Preprocess submit_and_wait failed: %d", execute_ret);
-                            execute_ret = -10;
+
+                        preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
+                        execute_ret = scale_layer
+                            ? scale_layer->forward(dst, dst_normalized, preprocess_cmd, opt)
+                            : -9;
+
+                        if (execute_ret == 0) {
+                            const int pack = 1;
+                            const int cast = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
+                            vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, preprocess_cmd, opt);
                         }
-                    }
+
+                        preprocess_record_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t).count();
+
+                        if (execute_ret == 0) {
+                            t = std::chrono::steady_clock::now();
+                            execute_ret = preprocess_cmd.submit_and_wait();
+                            preprocess_wait_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t).count();
+                            if (execute_ret != 0) {
+                                LOGE("Preprocess submit_and_wait failed: %d", execute_ret);
+                                execute_ret = -10;
+                            }
+                        }
+                    } // Release the completed preprocessing command before inference.
 
                     // Stage 2: GPU inference only. Extract to VkMat so the model
                     // execution can complete without downloading the tensor to CPU.
