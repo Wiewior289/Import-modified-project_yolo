@@ -157,7 +157,7 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     AHardwareBuffer_release(ahb);                                               
                                                                                 
     if (ret != 0) {
-        LOGE("detect_ahb failed with code %d", ret);
+        LOGE("detect_frame failed with code %d", ret);
         g_flat_buffer[0] = 0.0f;
         return ret;
     }
