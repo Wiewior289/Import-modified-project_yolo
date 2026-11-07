@@ -475,7 +475,7 @@ class MainActivity : AppCompatActivity() {
                         session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler)
                         isCameraRunning.set(true)
                         Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
-                        telemetryServer.broadcastStatus("STREAMING", "Camera2 AHB → Vulkan import aktywny; wyniki modelu są odczytywane do CPU")
+                        telemetryServer.broadcastStatus("STREAMING", "Camera2 → " + computeModeLabel(selectedComputeMode) + "; wyniki modelu są odczytywane do CPU")
                     } catch (e: CameraAccessException) {
                         Log.e(TAG, "Błąd setRepeatingRequest", e)
                     }
