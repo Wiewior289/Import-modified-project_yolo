@@ -298,10 +298,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
     double pipeline_create_ms = 0.0;
     double preprocess_record_ms = 0.0;
     double preprocess_wait_ms = 0.0;
-    double infer_encode_ms = 0.0;
-    double infer_wait_ms = 0.0;
-    double readback_record_ms = 0.0;
-    double readback_wait_ms = 0.0;
+    double infer_extract_ms = 0.0;
     double postprocess_ms = 0.0;
     bool cache_hit = false;
 
@@ -479,9 +476,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         }
                     } // Release the completed preprocessing command before inference.
 
-                    // Stage 2: GPU inference only. Extract to VkMat so the model
-                    // execution can complete without downloading the tensor to CPU.
-                    ncnn::VkMat out_gpu;
+                    // Stage 2: use NCNN's high-level CPU extraction path.
+                    // This is the last known-good path used before the diagnostic
+                    // VkMat/manual-download change. Extractor handles GPU output
+                    // conversion, packing and readback for ncnn::Mat.
                     if (execute_ret == 0) {
                         ncnn::Extractor ex = net.create_extractor();
                         ex.set_blob_vkallocator(blob_allocator);
@@ -489,57 +487,16 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         ex.set_staging_vkallocator(staging_allocator);
                         ex.input("in0", in_gpu);
 
-                        ncnn::VkCompute infer_cmd(vkdev);
                         t = std::chrono::steady_clock::now();
-                        execute_ret = ex.extract("out0", out_gpu, infer_cmd);
-                        infer_encode_ms = std::chrono::duration<double, std::milli>(
+                        execute_ret = ex.extract("out0", out);
+                        infer_extract_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t).count();
 
-                        if (execute_ret == 0) {
-                            t = std::chrono::steady_clock::now();
-                            execute_ret = infer_cmd.submit_and_wait();
-                            infer_wait_ms = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - t).count();
-                            if (execute_ret != 0) {
-                                LOGE("Inference submit_and_wait failed: %d", execute_ret);
-                                execute_ret = -11;
-                            }
-                        }
-                    }
-
-                    // Stage 3: explicit GPU -> CPU download. The timings below
-                    // distinguish CPU-side download recording from submit/wait.
-                    if (execute_ret == 0) {
-                        // Extract(VkMat) preserves the network's GPU dtype/packing.
-                        // The CPU DFL decoder expects float32, unpacked values.
-                        // Convert explicitly before downloading; record_download alone
-                        // is a byte transfer and must not be treated as Extractor::extract(Mat).
-                        ncnn::VkMat out_download;
-                        ncnn::VkCompute download_cmd(vkdev);
-
-                        t = std::chrono::steady_clock::now();
-                        vkdev->convert_packing(out_gpu, out_download, 1, 1, download_cmd, opt);
-                        download_cmd.record_download(out_download, out, opt);
-                        readback_record_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t).count();
-
-                        t = std::chrono::steady_clock::now();
-                        execute_ret = download_cmd.submit_and_wait();
-                        readback_wait_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t).count();
                         if (execute_ret != 0) {
-                            LOGE("Readback/FP32 conversion submit_and_wait failed: %d", execute_ret);
-                            execute_ret = -12;
-                        }
-
-                        if (execute_ret == 0) {
-                            LOGD("Tensor GPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d; "
-                                 "download GPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d; "
-                                 "CPU dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
-                                 out_gpu.dims, out_gpu.w, out_gpu.h, out_gpu.c,
-                                 out_gpu.elemsize, out_gpu.elempack,
-                                 out_download.dims, out_download.w, out_download.h, out_download.c,
-                                 out_download.elemsize, out_download.elempack,
+                            LOGE("Extractor::extract(out0, Mat) failed: %d", execute_ret);
+                            execute_ret = -11;
+                        } else {
+                            LOGD("Tensor CPU extracted dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
                                  out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
                         }
                     }
@@ -565,8 +522,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
         std::chrono::steady_clock::now() - post_start).count();
 
     const double preprocess_total_ms = preprocess_record_ms + preprocess_wait_ms;
-    const double infer_total_ms = infer_encode_ms + infer_wait_ms;
-    const double readback_total_ms = readback_record_ms + readback_wait_ms;
+    const double infer_total_ms = infer_extract_ms;
     const double cache_setup_ms = allocator_create_ms + image_import_ms + pipeline_create_ms;
     const double frame_total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - frame_start).count();
@@ -584,13 +540,9 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
              image_import_ms, pipeline_create_ms);
 
         LOGI("Pipeline frame=%d preprocess_record=%.3fms preprocess_wait=%.3fms preprocess_total=%.3fms "
-             "infer_encode=%.3fms infer_wait=%.3fms infer_total=%.3fms "
-             "readback_record=%.3fms readback_wait=%.3fms readback_total=%.3fms "
-             "post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
+             "infer_extract_total=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
              s_frame_log, preprocess_record_ms, preprocess_wait_ms, preprocess_total_ms,
-             infer_encode_ms, infer_wait_ms, infer_total_ms,
-             readback_record_ms, readback_wait_ms, readback_total_ms,
-             postprocess_ms, cache_setup_ms, frame_total_ms);
+             infer_total_ms, postprocess_ms, cache_setup_ms, frame_total_ms);
 
         LOGI("Tensor out(dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d) "
              "proposals=%zu detections=%zu top=%.3f cls=%d",
