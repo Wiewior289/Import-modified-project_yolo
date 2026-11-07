@@ -50,7 +50,9 @@ class Yolo11Ncnn {
         outBuffer: FloatArray,
         confThresh: Float,
         nmsThresh: Float,
-        rotateType: Int = 1
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
     ): Int
 
     /**

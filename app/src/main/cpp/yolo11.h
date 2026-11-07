@@ -75,7 +75,8 @@ public:
      * retain their own AHardwareBuffer reference beyond the call.
      */
     int detect_frame(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                     std::vector<Object>& objects, int rotate_type = 1);
+                     std::vector<Object>& objects, int rotate_type,
+                     int64_t frame_id, int64_t image_timestamp_ns);
 
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
@@ -103,9 +104,11 @@ public:
 
 private:
     int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                   std::vector<Object>& objects, int rotate_type);
+                   std::vector<Object>& objects, int rotate_type,
+                   int64_t frame_id, int64_t image_timestamp_ns);
     int detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                             std::vector<Object>& objects, int rotate_type);
+                             std::vector<Object>& objects, int rotate_type,
+                             int64_t frame_id, int64_t image_timestamp_ns);
     void generate_grids_and_stride(int target_w, int target_h);
     void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
     void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);

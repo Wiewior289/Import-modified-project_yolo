@@ -112,7 +112,9 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     jfloatArray out_buffer_obj,
     jfloat conf_thresh,
     jfloat nms_thresh,
-    jint rotate_type)
+    jint rotate_type,
+    jlong frame_id,
+    jlong image_timestamp_ns)
 {
     if (!hardware_buffer_obj || !out_buffer_obj) {
         return -1;
@@ -153,7 +155,8 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     AHardwareBuffer_acquire(ahb);                                               
                                                                                 
     g_objects_scratchpad.clear();                                               
-    int ret = g_yolo->detect_frame(ahb, conf_thresh, nms_thresh, g_objects_scratchpad, rotate_type);                                         
+    int ret = g_yolo->detect_frame(ahb,conf_thresh,nms_thresh,g_objects_scratchpad,rotate_type,
+                                    (int64_t)frame_id,(int64_t)image_timestamp_ns);                                         
     AHardwareBuffer_release(ahb);                                               
                                                                                 
     if (ret != 0) {

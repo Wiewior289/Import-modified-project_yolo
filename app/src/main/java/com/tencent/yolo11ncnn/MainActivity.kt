@@ -362,6 +362,7 @@ class MainActivity : AppCompatActivity() {
                 isProcessingFrame.set(true)
                 val frameId = ++frameSequence
                 val imageTimestampNs = image.timestamp
+                if(frameId%30L==0L)Log.i(TAG,"CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs size=${image.width}x${image.height} crop=${image.cropRect}")
 
                 backgroundInitExecutor.execute {
                     try {
@@ -383,7 +384,8 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             try {
                                 rawCount = yoloEngine.DetectFrame(
-                                    hwBuffer, detectionBuffer, confThreshold, nmsThreshold, rotateType
+                                    hwBuffer, detectionBuffer, confThreshold, nmsThreshold,
+                                    rotateType, frameId, imageTimestampNs
                                 )
                             } catch (e: Exception) {
                                 Log.e(TAG, "Błąd DetectFrame frame=$frameId", e)
@@ -472,7 +474,17 @@ class MainActivity : AppCompatActivity() {
                     if (cameraDevice == null) return
                     captureSession = session
                     try {
-                        session.setRepeatingRequest(captureRequestBuilder.build(), null, cameraHandler)
+                        val sensorTraceCallback=object:CameraCaptureSession.CaptureCallback(){
+                            override fun onCaptureCompleted(session:CameraCaptureSession,request:CaptureRequest,result:TotalCaptureResult){
+                                if(result.frameNumber%30L!=0L)return
+                                val fpsRange=result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)
+                                Log.i(TAG,"CAMERA_SENSOR frame=${result.frameNumber} sensorTsNs=${result.get(CaptureResult.SENSOR_TIMESTAMP)} "+
+                                    "exposureNs=${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} frameDurationNs=${result.get(CaptureResult.SENSOR_FRAME_DURATION)} "+
+                                    "iso=${result.get(CaptureResult.SENSOR_SENSITIVITY)} aeFpsRange=${fpsRange?.lower}-${fpsRange?.upper} "+
+                                    "aeState=${result.get(CaptureResult.CONTROL_AE_STATE)}")
+                            }
+                        }
+                        session.setRepeatingRequest(captureRequestBuilder.build(),sensorTraceCallback,cameraHandler)
                         isCameraRunning.set(true)
                         Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
                         telemetryServer.broadcastStatus("STREAMING", "Camera2 → " + computeModeLabel(selectedComputeMode) + "; wyniki modelu są odczytywane do CPU")

@@ -15,12 +15,53 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
+#include <limits>
+#include <sstream>
+#include <sys/system_properties.h>
+#include "blob.h"
 
 #define TAG "Yolo11_AHB_MaliG72"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+namespace {
+static int tensor_tap_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.tensor_tap",v)>0?std::atoi(v):0;}
+static float half_to_float(uint16_t h){
+ const uint32_t sign=(uint32_t)(h&0x8000u)<<16;uint32_t exp=(h>>10)&31u,m=h&1023u,bits=0;
+ if(exp==0){if(!m)bits=sign;else{int sh=0;while((m&1024u)==0){m<<=1;++sh;}m&=1023u;bits=sign|((uint32_t)(127-15-sh+1)<<23)|(m<<13);}}
+ else if(exp==31)bits=sign|0x7f800000u|(m<<13);else bits=sign|((exp+112u)<<23)|(m<<13);
+ float x;std::memcpy(&x,&bits,4);return x;
+}
+static float tensor_value(const unsigned char*p,size_t n){
+ if(n==4){float x;std::memcpy(&x,p,4);return x;}
+ if(n==2){uint16_t x;std::memcpy(&x,p,2);return half_to_float(x);}
+ int8_t x;std::memcpy(&x,p,1);return (float)x;
+}
+static void log_tensor_stats(const char*name,const ncnn::Mat&m,int64_t frame,int64_t ts){
+ if(m.empty()||!m.data||m.elempack<=0||!m.elemsize){LOGW("TENSOR_CPU frame=%lld ts=%lld name=%s EMPTY",(long long)frame,(long long)ts,name);return;}
+ size_t n=m.total()*(size_t)m.elempack,bytes=m.elemsize/(size_t)m.elempack;
+ if(!n||(bytes!=1&&bytes!=2&&bytes!=4)){LOGI("TENSOR_CPU frame=%lld ts=%lld name=%s shape=%d,%d,%d,%d elemsize=%zu pack=%d UNSUPPORTED",(long long)frame,(long long)ts,name,m.w,m.h,m.d,m.c,m.elemsize,m.elempack);return;}
+ const unsigned char*p=(const unsigned char*)m.data;float mn=std::numeric_limits<float>::infinity(),mx=-mn,s[4]={};double sum=0;size_t nf=0;
+ for(size_t i=0;i<n;i++){float x=tensor_value(p+i*bytes,bytes);if(!std::isfinite(x)){nf++;continue;}mn=std::min(mn,x);mx=std::max(mx,x);sum+=x;}
+ size_t ix[4]={0,n>1?1:0,n/2,n-1};for(int i=0;i<4;i++)s[i]=tensor_value(p+ix[i]*bytes,bytes);
+ size_t finite=n-nf;LOGI("TENSOR_CPU frame=%lld ts=%lld name=%s dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d count=%zu min=%.7g max=%.7g mean=%.7g nonfinite=%zu samples=[%.7g,%.7g,%.7g,%.7g]",
+ (long long)frame,(long long)ts,name,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,n,mn,mx,finite?sum/finite:0.0,nf,s[0],s[1],s[2],s[3]);
+}
+static void log_vkmat(const char*name,const ncnn::VkMat&m,int64_t frame,int64_t ts){
+ LOGI("TENSOR_VK frame=%lld ts=%lld name=%s empty=%d dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d total=%zu data=%p allocator=%p offset=%zu capacity=%zu",
+ (long long)frame,(long long)ts,name,m.empty()?1:0,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,m.total(),
+ (const void*)m.data,(const void*)m.allocator,m.buffer_offset(),m.buffer_capacity());
+}
+static std::string blob_edges(const std::vector<int>&ids,const std::vector<ncnn::Blob>&blobs){
+ std::ostringstream o;o<<"[";for(size_t i=0;i<ids.size();i++){if(i)o<<";";int id=ids[i];if(id<0||(size_t)id>=blobs.size()){o<<id<<":INVALID";continue;}
+ const ncnn::Blob&b=blobs[(size_t)id];o<<id<<":"<<b.name<<"{p="<<b.producer<<",c="<<b.consumer<<",shape="<<b.shape.w<<"x"<<b.shape.h<<"x"<<b.shape.d<<"x"<<b.shape.c<<",es="<<b.shape.elemsize<<",pack="<<b.shape.elempack<<"}";}
+ o<<"]";return o.str();
+}
+}
 
 Yolo11::Yolo11()
     : vkdev(nullptr), scale_layer(nullptr), ahb_cache_clock(0),
@@ -119,6 +160,10 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             }
             LOGI("AHB import extension available (spec version %d)", ahb_ext);
         }
+        const char* dn=vkdev->info.device_name();const char* dr=vkdev->info.driver_name();
+        LOGI("VULKAN_DEVICE name=%s driver=%s api=0x%08x driver_version=0x%08x vendor=0x%04x device=0x%04x heap_budget_mb=%u",
+             dn?dn:"(null)",dr?dr:"(null)",vkdev->info.api_version(),vkdev->info.driver_version(),
+             vkdev->info.vendor_id(),vkdev->info.device_id(),vkdev->get_heap_budget());
         net.set_vulkan_device(vkdev);
     }
 
@@ -234,20 +279,18 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
 
 
 
-    // Inventory model layers and their Vulkan capabilities. This tells us where
-    // a Vulkan network may still use CPU fallback; it is not a timing profiler.
-    const auto& model_layers = net.layers();
-    LOGI("NCNN_LAYER_INVENTORY count=%zu compute_mode=%d", model_layers.size(), compute_mode);
-    for (size_t i = 0; i < model_layers.size(); ++i) {
-        const ncnn::Layer* layer = model_layers[i];
-        if (!layer) continue;
-        LOGI("NCNN_LAYER idx=%zu type=%s name=%s support_vulkan=%d support_packing=%d support_vulkan_packing=%d",
-             i, layer->type.c_str(), layer->name.c_str(),
-             layer->support_vulkan ? 1 : 0,
-             layer->support_packing ? 1 : 0,
-             layer->support_vulkan_packing ? 1 : 0);
+    // Static graph/capabilities only; does not claim runtime backend placement.
+    const auto& model_layers=net.layers();const auto& model_blobs=net.blobs();
+    LOGI("NCNN_GRAPH_INVENTORY layers=%zu blobs=%zu mode=%d",model_layers.size(),model_blobs.size(),compute_mode);
+    for(size_t i=0;i<model_layers.size();i++){const ncnn::Layer*l=model_layers[i];if(!l)continue;
+        const std::string b=blob_edges(l->bottoms,model_blobs),t=blob_edges(l->tops,model_blobs);
+        LOGI("NCNN_GRAPH_LAYER idx=%zu type=%s name=%s hint=%s vulkan=%d pack=%d vkpack=%d fp16=%d int8=%d tensor=%d anypack=%d vkanypack=%d bottoms=%s tops=%s",
+             i,l->type.c_str(),l->name.c_str(),l->support_vulkan?"VULKAN_CAPABLE_RUNTIME_UNVERIFIED":"CPU_ONLY_CANDIDATE",
+             l->support_vulkan?1:0,l->support_packing?1:0,l->support_vulkan_packing?1:0,
+             l->support_fp16_storage?1:0,l->support_int8_storage?1:0,l->support_tensor_storage?1:0,
+             l->support_any_packing?1:0,l->support_vulkan_any_packing?1:0,b.c_str(),t.c_str());
     }
-    LOGI("NCNN_LAYER_TIMING_NOTE: true per-layer CPU/GPU timings require the linked NCNN library built with NCNN_BENCHMARK=ON; app-only defines are insufficient.");
+    LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
 
     generate_grids_and_stride(target_w, target_h);
 
@@ -289,17 +332,12 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
     }
 }
 
-int Yolo11::detect_frame(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                         std::vector<Object>& objects, int rotate_type)
-{
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
-        return detect_ahb(ahb, conf_thresh, nms_thresh, objects, rotate_type);
-    }
-    return detect_cpu_or_vulkan(ahb, conf_thresh, nms_thresh, objects, rotate_type);
+int Yolo11::detect_frame(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns){
+ if(compute_mode==YOLO_COMPUTE_VULKAN_AHB)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
+ return detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
 }
 
-int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                                 std::vector<Object>& objects, int rotate_type)
+int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns)
 {
     last_top_score = 0.0f;
     last_top_class = -1;
@@ -443,6 +481,7 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
         return -10;
     }
 
+    if(frame_id>0&&frame_id%30==0)log_tensor_stats("out0",out,frame_id,image_timestamp_ns);
     const auto post_start = std::chrono::steady_clock::now();
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
@@ -455,20 +494,15 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float 
 
     static int s_cpu_vk_frame_log = 0;
     if (++s_cpu_vk_frame_log % 30 == 0) {
-        LOGI("Pipeline mode=%s frame=%d input=AHB_CPU_LOCK format=YUV420_888 "
-             "colorspace=BT601_LIMITED preprocess_cpu=%.3fms infer_extract_wall=%.3fms "
-             "post=%.3fms frame_total=%.3fms out(w=%d h=%d elemsize=%zu elempack=%d) "
-             "proposals=%zu detections=%zu top=%.3f cls=%d",
-             compute_mode == YOLO_COMPUTE_CPU ? "CPU" : "VULKAN",
-             s_cpu_vk_frame_log, preprocess_ms, infer_extract_ms, post_ms, frame_ms,
-             out.w, out.h, out.elemsize, out.elempack,
-             proposal_scratchpad.size(), objects.size(), last_top_score, last_top_class);
+        LOGI("Pipeline mode=%s frame=%lld imageTs=%lld input=AHB_CPU_LOCK format=YUV420_888 preprocess_cpu=%.3fms infer_extract_wall=%.3fms post=%.3fms frame_total=%.3fms out(w=%d h=%d elemsize=%zu pack=%d) proposals=%zu detections=%zu top=%.3f cls=%d",
+             compute_mode==YOLO_COMPUTE_CPU?"CPU":"VULKAN",(long long)frame_id,(long long)image_timestamp_ns,
+             preprocess_ms,infer_extract_ms,post_ms,frame_ms,out.w,out.h,out.elemsize,out.elempack,
+             proposal_scratchpad.size(),objects.size(),last_top_score,last_top_class);
     }
     return 0;
 }
 
-int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
-                         std::vector<Object>& objects, int rotate_type)
+int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns)
 {
     last_top_score = 0.0f;
     last_top_class = -1;
@@ -506,9 +540,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
     double allocator_create_ms = 0.0;
     double image_import_ms = 0.0;
     double pipeline_create_ms = 0.0;
-    double preprocess_record_ms = 0.0;
-    double preprocess_wait_ms = 0.0;
-    double infer_extract_ms = 0.0;
+    double preprocess_record_ms=0.0,preprocess_import_record_ms=0.0,preprocess_scale_record_ms=0.0,preprocess_cast_record_ms=0.0;
+    double preprocess_wait_ms=0.0;uint64_t preprocess_dispatches=0;double infer_extract_ms=0.0;
     double postprocess_ms = 0.0;
     bool cache_hit = false;
 
@@ -569,6 +602,14 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         destroy_ahb_cache_entry(entry);
                         execute_ret = -6;
                     } else {
+                        const auto& fp=entry->allocator->bufferFormatProperties;
+                        const auto& bp=entry->allocator->bufferProperties;
+                        LOGI("AHB_YCBCR_PROPERTIES ptr=%p format=%d externalFormat=0x%llx features=0x%08x model=%d range=%d chromaX=%d chromaY=%d components=%d,%d,%d,%d allocationSize=%llu memoryTypeBits=0x%08x",
+                             (void*)ahb,(int)fp.format,(unsigned long long)fp.externalFormat,(unsigned int)fp.formatFeatures,
+                             (int)fp.suggestedYcbcrModel,(int)fp.suggestedYcbcrRange,(int)fp.suggestedXChromaOffset,(int)fp.suggestedYChromaOffset,
+                             (int)fp.samplerYcbcrConversionComponents.r,(int)fp.samplerYcbcrConversionComponents.g,
+                             (int)fp.samplerYcbcrConversionComponents.b,(int)fp.samplerYcbcrConversionComponents.a,
+                             (unsigned long long)bp.allocationSize,(unsigned int)bp.memoryTypeBits);
                         entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
                         if (!entry->pipeline) {
                             destroy_ahb_cache_entry(entry);
@@ -660,19 +701,20 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         ncnn::VkCompute preprocess_cmd(vkdev);
                         t = std::chrono::steady_clock::now();
 
-                        preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
-                        execute_ret = scale_layer
-                            ? scale_layer->forward(dst, dst_normalized, preprocess_cmd, opt)
-                            : -9;
-
-                        if (execute_ret == 0) {
-                            const int pack = 1;
-                            const int cast = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
-                            vkdev->convert_packing(dst_normalized, in_gpu, pack, cast, preprocess_cmd, opt);
+                        auto st=std::chrono::steady_clock::now();
+                        preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline,entry->src,dst);
+                        preprocess_import_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
+                        st=std::chrono::steady_clock::now();
+                        execute_ret=scale_layer?scale_layer->forward(dst,dst_normalized,preprocess_cmd,opt):-9;
+                        preprocess_scale_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
+                        if(execute_ret==0){
+                            const int pack=1,cast=(opt.use_fp16_storage||opt.use_fp16_packed)?2:0;
+                            st=std::chrono::steady_clock::now();
+                            vkdev->convert_packing(dst_normalized,in_gpu,pack,cast,preprocess_cmd,opt);
+                            preprocess_cast_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                         }
-
-                        preprocess_record_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t).count();
+                        preprocess_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
+                        preprocess_dispatches=preprocess_cmd.pending_dispatch_total();
 
                         if (execute_ret == 0) {
                             t = std::chrono::steady_clock::now();
@@ -684,7 +726,31 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                                 execute_ret = -10;
                             }
                         }
-                    } // Release the completed preprocessing command before inference.
+                    } // Preprocess queue is complete; descriptors below do not read tensor memory.
+                    if(frame_id>0&&frame_id%30==0){
+                        log_vkmat("ahb_rgb_0_255",dst,frame_id,image_timestamp_ns);
+                        log_vkmat("ahb_scaled_0_1",dst_normalized,frame_id,image_timestamp_ns);
+                        log_vkmat("ncnn_input_after_cast",in_gpu,frame_id,image_timestamp_ns);
+                    }
+                    // Opt-in diagnostic VkMat->Mat clones. This adds GPU->CPU copies and a wait.
+                    const int tap_mode=tensor_tap_property();
+                    static int prev_tap_mode=-1;static bool one_shot_latched=false;
+                    if(tap_mode!=prev_tap_mode){if(tap_mode==1)one_shot_latched=false;prev_tap_mode=tap_mode;}
+                    if(tap_mode==0)one_shot_latched=false;
+                    const bool do_tap=(tap_mode==1&&!one_shot_latched)||(tap_mode==2&&frame_id>0&&frame_id%30==0);
+                    if(tap_mode==1&&do_tap)one_shot_latched=true;
+                    if(do_tap){
+                        ncnn::Mat tap_rgb,tap_scaled,tap_input;ncnn::VkCompute tap_cmd(vkdev);
+                        const auto ts0=std::chrono::steady_clock::now();
+                        tap_cmd.record_clone(dst,tap_rgb,opt);tap_cmd.record_clone(dst_normalized,tap_scaled,opt);tap_cmd.record_clone(in_gpu,tap_input,opt);
+                        uint64_t d=tap_cmd.pending_dispatch_total();int rc=tap_cmd.submit_and_wait();
+                        double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-ts0).count();
+                        LOGI("TENSOR_TAP frame=%lld imageTs=%lld mode=%d ret=%d dispatches=%llu wall=%.3fms PERTURBS_PIPELINE=1",
+                             (long long)frame_id,(long long)image_timestamp_ns,tap_mode,rc,(unsigned long long)d,ms);
+                        if(rc==0){log_tensor_stats("ahb_rgb_0_255_snapshot",tap_rgb,frame_id,image_timestamp_ns);
+                            log_tensor_stats("ahb_scaled_0_1_snapshot",tap_scaled,frame_id,image_timestamp_ns);
+                            log_tensor_stats("ncnn_input_snapshot",tap_input,frame_id,image_timestamp_ns);}
+                    }
 
                     // Stage 2: use NCNN's high-level CPU extraction path.
                     // This is the last known-good path used before the diagnostic
@@ -695,17 +761,12 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
                         ex.set_blob_vkallocator(blob_allocator);
                         ex.set_workspace_vkallocator(blob_allocator);
                         ex.set_staging_vkallocator(staging_allocator);
-                        ex.input("in0", in_gpu);
-
-                        t = std::chrono::steady_clock::now();
-                        execute_ret = ex.extract("out0", out);
-                        infer_extract_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - t).count();
-
-                        if (execute_ret != 0) {
-                            LOGE("Extractor::extract(out0, Mat) failed: %d", execute_ret);
-                            execute_ret = -11;
-                        } else {
+                        const int in_ret=ex.input("in0",in_gpu);
+                        if(in_ret!=0){LOGE("Extractor::input(in0,VkMat) failed frame=%lld ret=%d",(long long)frame_id,in_ret);execute_ret=-12;}
+                        else{t=std::chrono::steady_clock::now();execute_ret=ex.extract("out0",out);
+                            infer_extract_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();}
+                        if(execute_ret!=0){LOGE("Extractor input/extract failed frame=%lld ret=%d",(long long)frame_id,execute_ret);execute_ret=-11;}
+                        else {
                             LOGD("Tensor CPU extracted dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
                                  out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
                         }
@@ -723,6 +784,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
         return -11;
     }
 
+    if(frame_id>0&&frame_id%30==0)log_tensor_stats("out0",out,frame_id,image_timestamp_ns);
     const auto post_start = std::chrono::steady_clock::now();
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
@@ -749,15 +811,13 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh
              ahb_import_cache.size(), cache_lookup_ms, allocator_create_ms,
              image_import_ms, pipeline_create_ms);
 
-        LOGI("Pipeline frame=%d preprocess_record=%.3fms preprocess_wait=%.3fms preprocess_total=%.3fms "
-             "infer_extract_wall=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
-             s_frame_log, preprocess_record_ms, preprocess_wait_ms, preprocess_total_ms,
-             infer_total_ms, postprocess_ms, cache_setup_ms, frame_total_ms);
+        LOGI("Pipeline frame=%lld imageTs=%lld record_total=%.3fms import_record=%.3fms scale_record=%.3fms cast_record=%.3fms dispatches=%llu wait=%.3fms preprocess_total=%.3fms infer_extract_wall=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
+             (long long)frame_id,(long long)image_timestamp_ns,preprocess_record_ms,preprocess_import_record_ms,preprocess_scale_record_ms,preprocess_cast_record_ms,
+             (unsigned long long)preprocess_dispatches,preprocess_wait_ms,preprocess_total_ms,infer_total_ms,postprocess_ms,cache_setup_ms,frame_total_ms);
 
-        LOGI("Tensor out(dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d) "
-             "proposals=%zu detections=%zu top=%.3f cls=%d",
-             out.dims, out.w, out.h, out.c, out.elemsize, out.elempack,
-             proposal_scratchpad.size(), objects.size(), last_top_score, last_top_class);
+        LOGI("Tensor out0 frame=%lld imageTs=%lld dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d proposals=%zu detections=%zu top=%.3f cls=%d",
+             (long long)frame_id,(long long)image_timestamp_ns,out.dims,out.w,out.h,out.d,out.c,out.elemsize,out.elempack,
+             proposal_scratchpad.size(),objects.size(),last_top_score,last_top_class);
 
         const size_t detail_count = std::min<size_t>(objects.size(), 8);
         for (size_t i = 0; i < detail_count; i++) {
