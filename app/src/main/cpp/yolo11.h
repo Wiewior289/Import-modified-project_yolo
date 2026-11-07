@@ -142,6 +142,7 @@ private:
 
     // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
     std::vector<GridAndStride> grid_strides;
+    std::vector<unsigned char> cpu_rgb_scratchpad;
     std::vector<Object> proposal_scratchpad;
     std::vector<Object> candidates_scratchpad;
     std::vector<int> nms_indices_scratchpad;
