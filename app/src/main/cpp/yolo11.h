@@ -15,7 +15,11 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <array>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
+#include "allocator.h"
 
 // NCNN includes
 #include "net.h"
@@ -78,6 +82,14 @@ public:
                      std::vector<Object>& objects, int rotate_type,
                      int64_t frame_id, int64_t image_timestamp_ns);
 
+    // Split AHB inference into a completed GPU prefix and a CPU suffix.
+    // begin_async_frame() returns only after the GPU fence has completed, so
+    // the caller may then close the originating Camera2 Image.
+    int begin_async_frame(AHardwareBuffer* ahb, int rotate_type,
+                          int64_t frame_id, int64_t image_timestamp_ns);
+    int finish_async_frame(int64_t frame_id, float conf_thresh, float nms_thresh,
+                           std::vector<Object>& objects);
+
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
      * Layout: [count, zone_id0, class0, score0, norm_x0, norm_y0, norm_w0, norm_h0, zone_id1, ...]
@@ -113,8 +125,18 @@ private:
     void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
     void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);
 
-    // NCNN network & Vulkan device
+    struct AsyncFrameContext {
+        // Declared before boundary_mats so Mats release their allocations first.
+        ncnn::PoolAllocator host_allocator;
+        std::array<ncnn::Mat, 10> boundary_mats;
+        int64_t frame_id = 0;
+        int64_t image_timestamp_ns = 0;
+    };
+
+    // NCNN networks: full Vulkan graph for the prefix, full CPU graph for suffix.
     ncnn::Net net;
+    ncnn::Net cpu_suffix_net;
+    bool cpu_suffix_loaded = false;
     ncnn::VulkanDevice* vkdev;
     ncnn::Layer* scale_layer;
 
@@ -136,12 +158,19 @@ private:
 
     static constexpr size_t AHB_CACHE_LIMIT = 12;
     std::unordered_map<AHardwareBuffer*, AHBImportCacheEntry*> ahb_import_cache;
+    std::mutex ahb_cache_mutex;
     uint64_t ahb_cache_clock;
     uint64_t ahb_cache_hits;
     uint64_t ahb_cache_misses;
     uint64_t ahb_cache_evictions;
     uint64_t ahb_cache_rotate_rebuilds;
     void destroy_ahb_cache_entry(AHBImportCacheEntry* entry);
+
+    // Frame contexts are keyed by the monotonically increasing camera frame ID.
+    std::unordered_map<int64_t, std::unique_ptr<AsyncFrameContext>> async_frames;
+    std::mutex async_frames_mutex;
+    // Current decode/NMS scratchpads are member-owned, so serialize CPU suffixes.
+    std::mutex cpu_suffix_mutex;
 
     // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
     std::vector<GridAndStride> grid_strides;
