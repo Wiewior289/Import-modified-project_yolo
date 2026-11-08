@@ -182,52 +182,55 @@ class MainActivity : AppCompatActivity() {
             isCameraRunning.set(false)
             closeCameraForModeSwitch()
         }
+
         telemetryServer.broadcastStatus(
             "COMPUTE_MODE_SWITCH",
             "Przełączanie backendu na " + computeModeLabel(newMode)
         )
 
-        // GPU barrier runs after every admitted prefix. It then enqueues a CPU
-        // barrier after all suffix jobs those prefixes produced. Only then may
-        // the model and AHB cache be destroyed/reloaded.
+        // Drain every admitted GPU prefix first. Each prefix enqueues its CPU
+        // suffix before returning, so the following CPU barrier drains all of them.
         gpuPrefixExecutor.execute {
             cpuSuffixExecutor.execute {
                 backgroundInitExecutor.execute {
                     fpsWindowStartMs = 0L
-            fpsWindowFrames = 0
-            currentFps = 0f
-            yoloEngine.Destroy()
-            val startedAt = SystemClock.elapsedRealtime()
-            val initialized = try {
-                yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
-            } catch (e: Exception) {
-                Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
-                false
-            }
-            val durationMs = SystemClock.elapsedRealtime() - startedAt
+                    fpsWindowFrames = 0
+                    currentFps = 0f
 
-            runOnUiThread {
-                if (generation != modeGeneration) return@runOnUiThread
-                // The executor has drained the prior frame. Detach the old reader
-                // callback before closing the reader and opening the next session.
-                imageReader?.setOnImageAvailableListener(null, null)
-                imageReader?.close()
-                imageReader = null
-                if (initialized) {
-                    isYoloReady.set(true)
-                    Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
-                    telemetryServer.broadcastStatus(
-                        "COMPUTE_MODE_READY",
-                        computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
-                    )
-                    startCamera2()
-                } else {
-                    isYoloReady.set(false)
-                    telemetryServer.broadcastStatus(
-                        "ERROR_COMPUTE_MODE",
-                        "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
-                    )
-                }
+                    yoloEngine.Destroy()
+                    val startedAt = SystemClock.elapsedRealtime()
+                    val initialized = try {
+                        yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
+                        false
+                    }
+                    val durationMs = SystemClock.elapsedRealtime() - startedAt
+
+                    runOnUiThread {
+                        if (generation != modeGeneration) return@runOnUiThread
+
+                        imageReader?.setOnImageAvailableListener(null, null)
+                        imageReader?.close()
+                        imageReader = null
+
+                        if (initialized) {
+                            isYoloReady.set(true)
+                            Log.i(TAG, "Backend " + computeModeLabel(newMode) +
+                                " gotowy w " + durationMs + "ms")
+                            telemetryServer.broadcastStatus(
+                                "COMPUTE_MODE_READY",
+                                computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
+                            )
+                            startCamera2()
+                        } else {
+                            isYoloReady.set(false)
+                            telemetryServer.broadcastStatus(
+                                "ERROR_COMPUTE_MODE",
+                                "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
+                            )
+                        }
+                    }
                 }
             }
         }
