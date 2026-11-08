@@ -1,8 +1,5 @@
 /**
- * ============================================================================
- * JNI Interface for YOLO11 AHardwareBuffer Vulkan Import Test Harness
- * Target: Samsung Galaxy S9+ (Mali-G72 MP18)
- * ============================================================================
+ * JNI Interface for YOLO11: synchronous baseline plus split AHB frame stages.
  */
 
 #include <jni.h>
@@ -10,8 +7,14 @@
 #include <android/hardware_buffer.h>
 #include <android/hardware_buffer_jni.h>
 #include <android/log.h>
+
+#include <array>
+#include <memory>
 #include <mutex>
-#include <atomic>
+#include <new>
+#include <unordered_map>
+#include <vector>
+
 #include "yolo11.h"
 
 #define TAG "Yolo11Ncnn_JNI"
@@ -19,31 +22,29 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static Yolo11* g_yolo = nullptr;
-static std::mutex g_lock;
+static constexpr int MAX_DETECTION_FLOATS = 1 + 64 * 7;
 
-static const int MAX_DETECTION_FLOATS = 1 + 64 * 7;
-static float g_flat_buffer[MAX_DETECTION_FLOATS];
-static std::vector<Object> g_objects_scratchpad;
-static std::atomic<bool> g_first_ahb_logged(false);
+static std::shared_ptr<Yolo11> g_yolo;
+static std::mutex g_lock;               // Protects only the engine handle/lifecycle.
+static std::mutex g_sync_detect_lock;   // Legacy full-frame path uses engine scratchpads.
+static std::mutex g_pending_lock;
+static std::unordered_map<jlong, std::shared_ptr<Yolo11>> g_pending_engines;
 static bool g_ncnn_gpu_instance_ready = false;
 
 extern "C" {
 
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
-    LOGI("JNI_OnLoad called for YOLO11 AHB Import Mali-G72 Native Module");
+    LOGI("JNI_OnLoad called for YOLO11 AHB frame-overlap engine");
 
     const int vk_ret = ncnn::create_gpu_instance();
     if (vk_ret != 0) {
-        // Keep the Java diagnostics server usable; Init() will report Vulkan unavailable.
         LOGE("ncnn::create_gpu_instance failed: %d", vk_ret);
         return JNI_VERSION_1_6;
     }
 
     g_ncnn_gpu_instance_ready = true;
-    const int gpu_count = ncnn::get_gpu_count();
-    LOGI("NCNN Vulkan instance ready; detected GPU count=%d", gpu_count);
+    LOGI("NCNN Vulkan instance ready; detected GPU count=%d", ncnn::get_gpu_count());
     return JNI_VERSION_1_6;
 }
 
@@ -51,12 +52,16 @@ JNIEXPORT void JNICALL
 JNI_OnUnload(JavaVM* vm, void* reserved)
 {
     {
-        std::lock_guard<std::mutex> lock(g_lock);
-        if (g_yolo) {
-            delete g_yolo;
-            g_yolo = nullptr;
-        }
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        g_pending_engines.clear();
     }
+
+    std::shared_ptr<Yolo11> old_engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        old_engine = std::move(g_yolo);
+    }
+    old_engine.reset();
 
     if (g_ncnn_gpu_instance_ready) {
         ncnn::destroy_gpu_instance();
@@ -73,33 +78,44 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
     jint target_size,
     jint compute_mode)
 {
-    std::lock_guard<std::mutex> lock(g_lock);
-
-    if (g_yolo) {
-        delete g_yolo;
-        g_yolo = nullptr;
+    {
+        std::lock_guard<std::mutex> pending_lock(g_pending_lock);
+        if (!g_pending_engines.empty()) {
+            LOGE("Init rejected: %zu async frame(s) are still pending",
+                 g_pending_engines.size());
+            return JNI_FALSE;
+        }
     }
 
-    g_yolo = new Yolo11();
+    std::lock_guard<std::mutex> lifecycle_lock(g_lock);
+
     AAssetManager* mgr = AAssetManager_fromJava(env, asset_manager);
-
-    const char* modeltype = "n";
-    if (model_type_index == 1) {
-        modeltype = "s";
-    } else if (model_type_index == 2) {
-        modeltype = "m";
-    }
-
-    int ret = g_yolo->load(mgr, modeltype, target_size, static_cast<int>(compute_mode));
-    if (ret != 0) {
-        LOGE("YOLO11 init failed with error code: %d", ret);
-        delete g_yolo;
-        g_yolo = nullptr;
+    if (!mgr) {
+        LOGE("AAssetManager_fromJava returned null");
         return JNI_FALSE;
     }
 
-    g_objects_scratchpad.reserve(64);
-    LOGI("YOLO11 initialized successfully (Model: yolo11%s, Size: %d, compute_mode=%d)",
+    const char* modeltype = "n";
+    if (model_type_index == 1) modeltype = "s";
+    else if (model_type_index == 2) modeltype = "m";
+
+    std::shared_ptr<Yolo11> next_engine;
+    try {
+        next_engine = std::make_shared<Yolo11>();
+    } catch (const std::bad_alloc&) {
+        LOGE("Unable to allocate Yolo11 engine");
+        return JNI_FALSE;
+    }
+
+    const int ret = next_engine->load(
+        mgr, modeltype, target_size, static_cast<int>(compute_mode));
+    if (ret != 0) {
+        LOGE("YOLO11 init failed with error code: %d", ret);
+        return JNI_FALSE;
+    }
+
+    g_yolo = std::move(next_engine);
+    LOGI("YOLO11 initialized (model=yolo11%s size=%d compute_mode=%d)",
          modeltype, target_size, static_cast<int>(compute_mode));
     return JNI_TRUE;
 }
@@ -116,87 +132,197 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     jlong frame_id,
     jlong image_timestamp_ns)
 {
-    if (!hardware_buffer_obj || !out_buffer_obj) {
-        return -1;
+    if (!hardware_buffer_obj || !out_buffer_obj) return -1;
+
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        engine = g_yolo;
     }
+    if (!engine || !engine->is_ready()) return -2;
 
-    std::lock_guard<std::mutex> lock(g_lock);
+    std::lock_guard<std::mutex> inference_lock(g_sync_detect_lock);
 
-    if (!g_yolo || !g_yolo->is_ready()) {
-        return -2;
-    }
-
-    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);                                                           
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);
     if (!ahb) {
-        LOGE("Failed to get AHardwareBuffer from Java object");
+        LOGE("DetectFrame: failed to get AHardwareBuffer from Java object");
         return -3;
-    }                                                                           
-                                                                                
-    // Pierwszy Log Diagnostyczny
-    if (!g_first_ahb_logged.exchange(true)) {                                   
-        AHardwareBuffer_Desc desc;                                              
-        AHardwareBuffer_describe(ahb, &desc);                                   
-                                                                                
-        __android_log_print(ANDROID_LOG_INFO, "NCNN_BARE_METAL",                
-            "=== ANALIZA PIERWSZEGO AHB COUPLING ===\n"                         
-            "Format sprzetowy (HEX): 0x%X\n"                                    
-            "Wymiary krzemu: %ux%u | Warstwy: %u\n"                             
-            "Stride (Wyrownanie pamieci w bajtach): %u\n"                       
-            "Usage Flags: 0x%llX\n"                                             
-            "Czy CPU ma dostep do odczytu?: %s\n"                               
-            "Czy GPU ma dostep bezposredni?: %s",                               
-            desc.format, desc.width, desc.height, desc.layers, desc.stride,     
-            (unsigned long long)desc.usage,                                                 
-            (desc.usage & AHARDWAREBUFFER_USAGE_CPU_READ_MASK) ? "CPU_READ usage enabled" : "CPU_READ usage absent",
-            (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) ? "GPU_SAMPLED_IMAGE enabled" : "GPU_SAMPLED_IMAGE absent"                                                             
-        );                                                                      
-    }                                                                           
-                                                                                
-    AHardwareBuffer_acquire(ahb);                                               
-                                                                                
-    g_objects_scratchpad.clear();                                               
-    int ret = g_yolo->detect_frame(ahb,conf_thresh,nms_thresh,g_objects_scratchpad,rotate_type,
-                                    (int64_t)frame_id,(int64_t)image_timestamp_ns);                                         
-    AHardwareBuffer_release(ahb);                                               
-                                                                                
+    }
+
+    AHardwareBuffer_acquire(ahb);
+    std::vector<Object> objects;
+    objects.reserve(64);
+    const int ret = engine->detect_frame(
+        ahb, conf_thresh, nms_thresh, objects, rotate_type,
+        static_cast<int64_t>(frame_id), static_cast<int64_t>(image_timestamp_ns));
+    AHardwareBuffer_release(ahb);
+
     if (ret != 0) {
-        LOGE("detect_frame failed with code %d", ret);
-        g_flat_buffer[0] = 0.0f;
+        LOGE("DetectFrame failed frame=%lld code=%d", (long long)frame_id, ret);
         return ret;
     }
 
-    int count = g_yolo->pack_detections_flat(g_objects_scratchpad, g_flat_buffer, MAX_DETECTION_FLOATS);
+    const jsize output_capacity = env->GetArrayLength(out_buffer_obj);
+    if (output_capacity < 1) return -4;
 
+    std::array<float, MAX_DETECTION_FLOATS> flat{};
+    const int count = engine->pack_detections_flat(
+        objects, flat.data(), std::min<int>(MAX_DETECTION_FLOATS, output_capacity));
     const int floats_to_copy = 1 + count * 7;
-    env->SetFloatArrayRegion(out_buffer_obj, 0, floats_to_copy, g_flat_buffer);
+    env->SetFloatArrayRegion(out_buffer_obj, 0, floats_to_copy, flat.data());
+    return count;
+}
 
+JNIEXPORT jlong JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_BeginFrame(
+    JNIEnv* env,
+    jobject thiz,
+    jobject hardware_buffer_obj,
+    jint rotate_type,
+    jlong frame_id,
+    jlong image_timestamp_ns)
+{
+    if (!hardware_buffer_obj || frame_id <= 0) return -1;
+
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        engine = g_yolo;
+    }
+    if (!engine || !engine->is_ready()) return -2;
+
+    {
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        if (g_pending_engines.find(frame_id) != g_pending_engines.end()) {
+            LOGE("BeginFrame rejected duplicate frame id=%lld", (long long)frame_id);
+            return -3;
+        }
+    }
+
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);
+    if (!ahb) return -4;
+
+    AHardwareBuffer_acquire(ahb);
+    const int ret = engine->begin_async_frame(
+        ahb, rotate_type, static_cast<int64_t>(frame_id),
+        static_cast<int64_t>(image_timestamp_ns));
+    AHardwareBuffer_release(ahb);
+
+    if (ret != 0) {
+        LOGE("BeginFrame GPU prefix failed frame=%lld code=%d",
+             (long long)frame_id, ret);
+        return static_cast<jlong>(ret);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        const auto inserted = g_pending_engines.emplace(frame_id, engine);
+        if (!inserted.second) {
+            LOGE("BeginFrame pending registry collision frame=%lld", (long long)frame_id);
+            // The Yolo11 context is intentionally retained for explicit engine
+            // teardown; this collision should be impossible with monotonic IDs.
+            return -5;
+        }
+    }
+
+    return frame_id;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_FinishFrame(
+    JNIEnv* env,
+    jobject thiz,
+    jlong frame_id,
+    jfloatArray out_buffer_obj,
+    jfloat conf_thresh,
+    jfloat nms_thresh)
+{
+    if (!out_buffer_obj || frame_id <= 0) return -1;
+
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        auto it = g_pending_engines.find(frame_id);
+        if (it == g_pending_engines.end()) {
+            LOGE("FinishFrame has no pending engine for frame=%lld", (long long)frame_id);
+            return -2;
+        }
+        engine = std::move(it->second);
+        g_pending_engines.erase(it);
+    }
+
+    std::vector<Object> objects;
+    objects.reserve(64);
+    const int ret = engine->finish_async_frame(
+        static_cast<int64_t>(frame_id), conf_thresh, nms_thresh, objects);
+    if (ret != 0) {
+        LOGE("FinishFrame CPU suffix failed frame=%lld code=%d",
+             (long long)frame_id, ret);
+        return ret;
+    }
+
+    const jsize output_capacity = env->GetArrayLength(out_buffer_obj);
+    if (output_capacity < 1) return -3;
+
+    std::array<float, MAX_DETECTION_FLOATS> flat{};
+    const int count = engine->pack_detections_flat(
+        objects, flat.data(), std::min<int>(MAX_DETECTION_FLOATS, output_capacity));
+    const int floats_to_copy = 1 + count * 7;
+    env->SetFloatArrayRegion(out_buffer_obj, 0, floats_to_copy, flat.data());
     return count;
 }
 
 JNIEXPORT jfloat JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopScore(JNIEnv* env, jobject thiz)
 {
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (!g_yolo) return 0.0f;
-    return g_yolo->get_top_candidate_score();
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        engine = g_yolo;
+    }
+    return engine ? engine->get_top_candidate_score() : 0.0f;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopClass(JNIEnv* env, jobject thiz)
 {
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (!g_yolo) return -1;
-    return g_yolo->get_top_candidate_class();
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        engine = g_yolo;
+    }
+    return engine ? engine->get_top_candidate_class() : -1;
+}
+
+JNIEXPORT void JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ClearCache(JNIEnv* env, jobject thiz)
+{
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        engine = g_yolo;
+    }
+    if (engine) engine->clear_ahb_cache();
 }
 
 JNIEXPORT void JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Destroy(JNIEnv* env, jobject thiz)
 {
-    std::lock_guard<std::mutex> lock(g_lock);
-    if (g_yolo) {
-        delete g_yolo;
-        g_yolo = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        if (!g_pending_engines.empty()) {
+            LOGE("Destroy deferred: %zu async frame(s) are still pending",
+                 g_pending_engines.size());
+            return;
+        }
     }
+
+    std::shared_ptr<Yolo11> old_engine;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        old_engine = std::move(g_yolo);
+    }
+    old_engine.reset();
     LOGI("YOLO11 native instance destroyed");
 }
 
