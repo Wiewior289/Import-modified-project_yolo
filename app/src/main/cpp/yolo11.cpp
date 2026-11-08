@@ -301,7 +301,6 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     }
 
     if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
