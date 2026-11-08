@@ -8,6 +8,7 @@
 #include <android/hardware_buffer_jni.h>
 #include <android/log.h>
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -270,6 +271,23 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_FinishFrame(
     const int floats_to_copy = 1 + count * 7;
     env->SetFloatArrayRegion(out_buffer_obj, 0, floats_to_copy, flat.data());
     return count;
+}
+
+JNIEXPORT void JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_CancelFrame(
+    JNIEnv* env,
+    jobject thiz,
+    jlong frame_id)
+{
+    std::shared_ptr<Yolo11> engine;
+    {
+        std::lock_guard<std::mutex> lock(g_pending_lock);
+        auto it = g_pending_engines.find(frame_id);
+        if (it == g_pending_engines.end()) return;
+        engine = std::move(it->second);
+        g_pending_engines.erase(it);
+    }
+    engine->cancel_async_frame(static_cast<int64_t>(frame_id));
 }
 
 JNIEXPORT jfloat JNICALL
