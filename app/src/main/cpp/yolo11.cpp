@@ -1180,6 +1180,12 @@ int Yolo11::begin_async_frame(AHardwareBuffer* ahb, int rotate_type,
     return 0;
 }
 
+void Yolo11::cancel_async_frame(int64_t frame_id)
+{
+    std::lock_guard<std::mutex> lock(async_frames_mutex);
+    async_frames.erase(frame_id);
+}
+
 int Yolo11::finish_async_frame(int64_t frame_id, float conf_thresh, float nms_thresh,
                                std::vector<Object>& objects)
 {
