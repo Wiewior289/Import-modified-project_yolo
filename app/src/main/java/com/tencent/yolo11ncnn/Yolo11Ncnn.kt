@@ -56,6 +56,32 @@ class Yolo11Ncnn {
     ): Int
 
     /**
+     * Runs the AHB import/preprocess and NCNN GPU prefix. Returns frameId on
+     * success; a negative value is an error code. The Image must stay alive
+     * until this call returns because native waits for the GPU-prefix fence.
+     */
+    external fun BeginFrame(
+        hardwareBuffer: HardwareBuffer,
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ): Long
+
+    /**
+     * Injects the ten frame-owned CPU boundary tensors, executes NCNN layers
+     * 110..256 on CPU, decodes detections and fills [outBuffer].
+     */
+    external fun FinishFrame(
+        frameId: Long,
+        outBuffer: FloatArray,
+        confThresh: Float,
+        nmsThresh: Float
+    ): Int
+
+    /** Drops a completed GPU-prefix frame context if CPU scheduling fails. */
+    external fun CancelFrame(frameId: Long)
+
+    /**
      * Returns the highest raw prediction score found in the previous frame.
      */
     external fun GetTopScore(): Float
