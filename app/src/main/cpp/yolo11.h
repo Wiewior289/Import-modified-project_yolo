@@ -89,6 +89,7 @@ public:
                           int64_t frame_id, int64_t image_timestamp_ns);
     int finish_async_frame(int64_t frame_id, float conf_thresh, float nms_thresh,
                            std::vector<Object>& objects);
+    void cancel_async_frame(int64_t frame_id);
 
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
