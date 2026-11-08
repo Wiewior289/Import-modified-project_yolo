@@ -22,8 +22,10 @@ import android.widget.Spinner
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -44,6 +46,19 @@ class MainActivity : AppCompatActivity() {
     private var modeSelectorInitialized = false
     private lateinit var telemetryServer: TelemetryServer
     private lateinit var backgroundInitExecutor: ExecutorService
+    private lateinit var gpuPrefixExecutor: ExecutorService
+    private lateinit var cpuSuffixExecutor: ExecutorService
+
+    private class FrameSlot {
+        val detectionBuffer = FloatArray(1 + 64 * 7)
+    }
+
+    // Two bounded slots: one may be in CPU suffix while the other is in GPU prefix.
+    private val frameSlots = ArrayBlockingQueue<FrameSlot>(2).apply {
+        add(FrameSlot())
+        add(FrameSlot())
+    }
+    private val frameAdmissionLock = Any()
 
     // Camera2 background thread & components
     private var cameraThread: HandlerThread? = null
@@ -53,16 +68,11 @@ class MainActivity : AppCompatActivity() {
     private var imageReader: ImageReader? = null
     private var sensorOrientation: Int = 90
 
-    // Pre-allocated flat buffer: 1 count float + 64 detections * 7 floats (449 floats)
-    // ZERO HEAP ALLOCATIONS ON THE FRAME LOOP!
-    private val detectionBuffer = FloatArray(1 + 64 * 7)
-
     @Volatile private var confThreshold: Float = 0.25f
     @Volatile private var nmsThreshold: Float = 0.45f
 
     private val isYoloReady = AtomicBoolean(false)
     private val isCameraRunning = AtomicBoolean(false)
-    private val isProcessingFrame = AtomicBoolean(false)
 
     private var frameSequence: Long = 0L
     private var fpsWindowStartMs: Long = 0L
@@ -72,6 +82,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         backgroundInitExecutor = Executors.newSingleThreadExecutor()
+        gpuPrefixExecutor = Executors.newSingleThreadExecutor()
+        cpuSuffixExecutor = Executors.newSingleThreadExecutor()
 
         // Start telemetry before installing the selector, so an early spinner
         // callback can safely report a mode change.
@@ -159,22 +171,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchComputeMode(newMode: Int) {
-        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB ||
-            newMode == selectedComputeMode) return
+        val generation: Long
+        synchronized(frameAdmissionLock) {
+            if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB ||
+                newMode == selectedComputeMode) return
 
-        selectedComputeMode = newMode
-        val generation = ++modeGeneration
-        isYoloReady.set(false)
-        isCameraRunning.set(false)
-        closeCameraForModeSwitch()
+            selectedComputeMode = newMode
+            generation = ++modeGeneration
+            isYoloReady.set(false)
+            isCameraRunning.set(false)
+            closeCameraForModeSwitch()
+        }
         telemetryServer.broadcastStatus(
             "COMPUTE_MODE_SWITCH",
             "Przełączanie backendu na " + computeModeLabel(newMode)
         )
 
-        // The same single-thread executor serializes mode changes after any in-flight frame.
-        backgroundInitExecutor.execute {
-            fpsWindowStartMs = 0L
+        // GPU barrier runs after every admitted prefix. It then enqueues a CPU
+        // barrier after all suffix jobs those prefixes produced. Only then may
+        // the model and AHB cache be destroyed/reloaded.
+        gpuPrefixExecutor.execute {
+            cpuSuffixExecutor.execute {
+                backgroundInitExecutor.execute {
+                    fpsWindowStartMs = 0L
             fpsWindowFrames = 0
             currentFps = 0f
             yoloEngine.Destroy()
@@ -209,7 +228,225 @@ class MainActivity : AppCompatActivity() {
                         "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
                     )
                 }
+                }
             }
+        }
+    }
+
+    private fun onImageAvailable(reader: ImageReader) {
+        synchronized(frameAdmissionLock) {
+            if (!isYoloReady.get()) {
+                reader.acquireLatestImage()?.close()
+                return@synchronized
+            }
+
+            val image = reader.acquireLatestImage() ?: return@synchronized
+            val slot = frameSlots.poll()
+            if (slot == null) {
+                image.close()
+                return@synchronized
+            }
+
+            val frameId = ++frameSequence
+            val imageTimestampNs = image.timestamp
+            val rotateType = when (sensorOrientation) {
+                90 -> 6
+                180 -> 3
+                270 -> 8
+                else -> 1
+            }
+            if (frameId % 30L == 0L) {
+                Log.i(TAG, "CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs " +
+                    "size=${image.width}x${image.height} crop=${image.cropRect}")
+            }
+
+            if (selectedComputeMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB) {
+                launchGpuPrefix(slot, image, rotateType, frameId, imageTimestampNs)
+            } else {
+                launchSynchronousFrame(slot, image, rotateType, frameId, imageTimestampNs)
+            }
+        }
+    }
+
+    private fun launchGpuPrefix(
+        slot: FrameSlot,
+        image: android.media.Image,
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ) {
+        try {
+            gpuPrefixExecutor.execute {
+                var imageClosed = false
+                var token = -5L
+                try {
+                    val hardwareBuffer = image.hardwareBuffer
+                    if (hardwareBuffer == null) {
+                        token = -4L
+                    } else {
+                        try {
+                            // Native returns only after the GPU-prefix fence. The
+                            // camera Image therefore stays alive throughout import,
+                            // preprocessing, prefix execution and boundary readback.
+                            token = yoloEngine.BeginFrame(
+                                hardwareBuffer, rotateType, frameId, imageTimestampNs
+                            )
+                        } finally {
+                            hardwareBuffer.close()
+                        }
+                    }
+
+                    image.close()
+                    imageClosed = true
+                    enqueueCpuCompletion(slot, token, frameId, imageTimestampNs)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd GPU prefix frame=$frameId", e)
+                    if (token > 0L) {
+                        try { yoloEngine.CancelFrame(token) } catch (_: Exception) {}
+                    }
+                    if (!imageClosed) {
+                        try { image.close() } catch (_: Exception) {}
+                    }
+                    enqueueCpuCompletion(slot, -5L, frameId, imageTimestampNs)
+                } finally {
+                    if (!imageClosed) {
+                        try { image.close() } catch (_: Exception) {}
+                    }
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.e(TAG, "GPU prefix executor rejected frame=$frameId", e)
+            try { image.close() } catch (_: Exception) {}
+            releaseFrameSlot(slot)
+        }
+    }
+
+    private fun enqueueCpuCompletion(
+        slot: FrameSlot,
+        prefixToken: Long,
+        frameId: Long,
+        imageTimestampNs: Long
+    ) {
+        try {
+            cpuSuffixExecutor.execute {
+                slot.detectionBuffer.fill(0f)
+                val rawCount = if (prefixToken > 0L) {
+                    try {
+                        yoloEngine.FinishFrame(
+                            prefixToken, slot.detectionBuffer, confThreshold, nmsThreshold
+                        )
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Błąd CPU suffix frame=$frameId", e)
+                        try { yoloEngine.CancelFrame(prefixToken) } catch (_: Exception) {}
+                        -5
+                    }
+                } else {
+                    prefixToken.toInt()
+                }
+
+                try {
+                    publishFrameResult(slot, rawCount, frameId, imageTimestampNs)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd publikacji wyniku frame=$frameId", e)
+                } finally {
+                    releaseFrameSlot(slot)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.e(TAG, "CPU suffix executor rejected frame=$frameId", e)
+            if (prefixToken > 0L) {
+                try { yoloEngine.CancelFrame(prefixToken) } catch (_: Exception) {}
+            }
+            releaseFrameSlot(slot)
+        }
+    }
+
+    private fun launchSynchronousFrame(
+        slot: FrameSlot,
+        image: android.media.Image,
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ) {
+        try {
+            cpuSuffixExecutor.execute {
+                slot.detectionBuffer.fill(0f)
+                var rawCount = -5
+                try {
+                    val hardwareBuffer = image.hardwareBuffer
+                    if (hardwareBuffer == null) {
+                        rawCount = -4
+                    } else {
+                        try {
+                            rawCount = yoloEngine.DetectFrame(
+                                hardwareBuffer, slot.detectionBuffer, confThreshold, nmsThreshold,
+                                rotateType, frameId, imageTimestampNs
+                            )
+                        } finally {
+                            hardwareBuffer.close()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd DetectFrame frame=$frameId", e)
+                } finally {
+                    try { image.close() } catch (_: Exception) {}
+                }
+
+                try {
+                    publishFrameResult(slot, rawCount, frameId, imageTimestampNs)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd publikacji wyniku frame=$frameId", e)
+                } finally {
+                    releaseFrameSlot(slot)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.e(TAG, "CPU executor rejected frame=$frameId", e)
+            try { image.close() } catch (_: Exception) {}
+            releaseFrameSlot(slot)
+        }
+    }
+
+    private fun publishFrameResult(
+        slot: FrameSlot,
+        rawCount: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ) {
+        val buffer = slot.detectionBuffer
+        updateProcessingFps()
+        val count = rawCount.coerceAtLeast(0)
+        if (rawCount < 0) {
+            Log.e(TAG, "Detekcja nie powiodła się: code=$rawCount frame=$frameId")
+        }
+
+        val topScore = if (rawCount >= 0) yoloEngine.GetTopScore() else 0f
+        val topClass = if (rawCount >= 0) yoloEngine.GetTopClass() else -1
+
+        if (frameId % 30L == 0L) {
+            Log.i(TAG, "Frame=$frameId imageTs=$imageTimestampNs FPS=" +
+                String.format(java.util.Locale.US, "%.1f", currentFps) +
+                " objects=$count top=" +
+                String.format(java.util.Locale.US, "%.3f", topScore) +
+                " class=$topClass")
+        }
+
+        val jsonPayload = buildJson(
+            count, buffer, currentFps, topScore, topClass, frameId, imageTimestampNs
+        )
+        try {
+            telemetryServer.sendDetections(jsonPayload)
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd wysyłania telemetrii", e)
+        }
+
+        // Vision test only: no actuator command is issued.
+        sendToSTM32(count, buffer, false)
+    }
+
+    private fun releaseFrameSlot(slot: FrameSlot) {
+        if (!frameSlots.offer(slot)) {
+            Log.e(TAG, "Frame slot double-release detected")
         }
     }
 
@@ -353,78 +590,7 @@ class MainActivity : AppCompatActivity() {
             )
 
             imageReader?.setOnImageAvailableListener({ reader ->
-                if (!isYoloReady.get() || isProcessingFrame.get()) {
-                    reader.acquireLatestImage()?.close()
-                    return@setOnImageAvailableListener
-                }
-
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                isProcessingFrame.set(true)
-                val frameId = ++frameSequence
-                val imageTimestampNs = image.timestamp
-                if(frameId%30L==0L)Log.i(TAG,"CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs size=${image.width}x${image.height} crop=${image.cropRect}")
-
-                backgroundInitExecutor.execute {
-                    try {
-                        val rotateType = when (sensorOrientation) {
-                            90 -> 6
-                            180 -> 3
-                            270 -> 8
-                            else -> 1
-                        }
-
-                        detectionBuffer.fill(0f)
-                        var rawCount = -1
-                        val hwBuffer = image.hardwareBuffer
-                        if (hwBuffer == null) {
-                            // Image.hardwareBuffer is nullable in the Android API.
-                            // Keep the frame invalid rather than passing null through JNI.
-                            Log.e(TAG, "Image.hardwareBuffer == null for frame=$frameId")
-                            rawCount = -4
-                        } else {
-                            try {
-                                rawCount = yoloEngine.DetectFrame(
-                                    hwBuffer, detectionBuffer, confThreshold, nmsThreshold,
-                                    rotateType, frameId, imageTimestampNs
-                                )
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Błąd DetectFrame frame=$frameId", e)
-                            } finally {
-                                hwBuffer.close()
-                            }
-                        }
-
-                        updateProcessingFps()
-                        val count = rawCount.coerceAtLeast(0)
-                        if (rawCount < 0) Log.e(TAG, "Detekcja nie powiodła się: code=$rawCount frame=$frameId")
-
-                        val topScore = if (rawCount >= 0) yoloEngine.GetTopScore() else 0f
-                        val topClass = if (rawCount >= 0) yoloEngine.GetTopClass() else -1
-
-                        if (frameId % 30L == 0L) {
-                            Log.i(TAG, "Frame=$frameId imageTs=$imageTimestampNs FPS=" +
-                                String.format(java.util.Locale.US, "%.1f", currentFps) +
-                                " objects=$count top=" +
-                                String.format(java.util.Locale.US, "%.3f", topScore) +
-                                " class=$topClass")
-                        }
-
-                        val jsonPayload = buildJson(
-                            count, detectionBuffer, currentFps, topScore, topClass, frameId, imageTimestampNs
-                        )
-                        try {
-                            telemetryServer.sendDetections(jsonPayload)
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Błąd wysyłania telemetrii", e)
-                        }
-
-                        // Vision test only: no actuator command is issued.
-                        sendToSTM32(count, detectionBuffer, false)
-                    } finally {
-                        image.close()
-                        isProcessingFrame.set(false)
-                    }
-                }
+                onImageAvailable(reader)
             }, cameraHandler)
 
 
@@ -606,22 +772,23 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        isYoloReady.set(false)
-        isCameraRunning.set(false)
+        synchronized(frameAdmissionLock) {
+            modeGeneration++
+            isYoloReady.set(false)
+            isCameraRunning.set(false)
+            imageReader?.setOnImageAvailableListener(null, null)
+        }
 
         try {
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
-            imageReader?.close()
-            imageReader = null
         } catch (e: Exception) {
             Log.e(TAG, "Błąd zamykania zasobów Camera2", e)
         }
 
         stopCameraThread()
-        backgroundInitExecutor.shutdown()
 
         if (::telemetryServer.isInitialized) {
             try {
@@ -630,8 +797,31 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Błąd zamykania TelemetryServer", e)
             }
         }
-        yoloEngine.ClearCache()
-        yoloEngine.Destroy()
+
+        // Drain order matters: GPU tasks may still enqueue CPU suffix tasks.
+        // The final CPU barrier is therefore placed only after the GPU barrier.
+        try {
+            gpuPrefixExecutor.execute {
+                cpuSuffixExecutor.execute {
+                    backgroundInitExecutor.execute {
+                        try {
+                            yoloEngine.ClearCache()
+                            yoloEngine.Destroy()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Błąd kończenia silnika YOLO", e)
+                        } finally {
+                            try { imageReader?.close() } catch (_: Exception) {}
+                            imageReader = null
+                            gpuPrefixExecutor.shutdown()
+                            cpuSuffixExecutor.shutdown()
+                            backgroundInitExecutor.shutdown()
+                        }
+                    }
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.e(TAG, "Nie udało się zlecić bezpiecznego zamknięcia potoku", e)
+        }
     }
 
     companion object {
