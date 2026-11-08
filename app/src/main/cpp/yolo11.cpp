@@ -47,7 +47,7 @@ static void log_tensor_stats(const char*name,const ncnn::Mat&m,int64_t frame,int
  if(!n||(bytes!=1&&bytes!=2&&bytes!=4)){LOGI("TENSOR_CPU frame=%lld ts=%lld name=%s shape=%d,%d,%d,%d elemsize=%zu pack=%d UNSUPPORTED",(long long)frame,(long long)ts,name,m.w,m.h,m.d,m.c,m.elemsize,m.elempack);return;}
  const unsigned char*p=(const unsigned char*)m.data;float mn=std::numeric_limits<float>::infinity(),mx=-mn,s[4]={};double sum=0;size_t nf=0;
  for(size_t i=0;i<n;i++){float x=tensor_value(p+i*bytes,bytes);if(!std::isfinite(x)){nf++;continue;}mn=std::min(mn,x);mx=std::max(mx,x);sum+=x;}
- size_t ix[4]={0,n>1?1:0,n/2,n-1};for(int i=0;i<4;i++)s[i]=tensor_value(p+ix[i]*bytes,bytes);
+ size_t ix[4]={0,static_cast<size_t>(n>1?1:0),n/2,n-1};for(int i=0;i<4;i++)s[i]=tensor_value(p+ix[i]*bytes,bytes);
  size_t finite=n-nf;LOGI("TENSOR_CPU frame=%lld ts=%lld name=%s dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d count=%zu min=%.7g max=%.7g mean=%.7g nonfinite=%zu samples=[%.7g,%.7g,%.7g,%.7g]",
  (long long)frame,(long long)ts,name,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,n,mn,mx,finite?sum/finite:0.0,nf,s[0],s[1],s[2],s[3]);
 }
