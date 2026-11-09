@@ -208,7 +208,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         cpu_net.opt.use_fp16_packed = false;
         cpu_net.opt.use_fp16_storage = false;
         cpu_net.opt.use_fp16_arithmetic = false;
-        cpu_net.opt.use_packing_layout = false;
+        cpu_net.opt.use_packing_layout = true;
         cpu_net.opt.lightmode = true;
         cpu_net.opt.num_threads = 4;
 
@@ -1064,8 +1064,15 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
                             execute_ret = cmd.submit_and_wait();
                             if (execute_ret == 0) {
                                 for (int i = 0; i < 10; ++i) {
-                                    if (slot.boundary[static_cast<size_t>(i)].empty()) {
+                                    const ncnn::Mat& boundary = slot.boundary[static_cast<size_t>(i)];
+                                    if (boundary.empty()) {
                                         execute_ret = -34;
+                                        break;
+                                    }
+                                    if (boundary.elemsize != 4u || boundary.elempack != 1) {
+                                        LOGE("Async boundary format mismatch blob_index=%d elemsize=%zu elempack=%d; expected FP32 pack1",
+                                             boundary_blob_ids[i], boundary.elemsize, boundary.elempack);
+                                        execute_ret = -36;
                                         break;
                                     }
                                 }
