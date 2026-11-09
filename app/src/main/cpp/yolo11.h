@@ -16,6 +16,8 @@
 #include <string>
 #include <cstdint>
 #include <unordered_map>
+#include <array>
+#include <mutex>
 
 // NCNN includes
 #include "net.h"
@@ -32,7 +34,8 @@
 enum YoloComputeMode {
     YOLO_COMPUTE_CPU = 0,
     YOLO_COMPUTE_VULKAN = 1,
-    YOLO_COMPUTE_VULKAN_AHB = 2
+    YOLO_COMPUTE_VULKAN_AHB = 2,
+    YOLO_COMPUTE_VULKAN_AHB_ASYNC = 3
 };
 
 enum ObstacleZone {
@@ -78,6 +81,15 @@ public:
                      std::vector<Object>& objects, int rotate_type,
                      int64_t frame_id, int64_t image_timestamp_ns);
 
+    // Stage 1: synchronous GPU prefix and boundary readback. The camera buffer
+    // may be released after this method returns successfully.
+    int gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
+                         int64_t frame_id, int64_t image_timestamp_ns);
+
+    // Stage 2: CPU-only suffix and postprocess from the slot's ten boundary Mats.
+    int cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh,
+                         std::vector<Object>& objects);
+
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
      * Layout: [count, zone_id0, class0, score0, norm_x0, norm_y0, norm_w0, norm_h0, zone_id1, ...]
@@ -115,8 +127,20 @@ private:
 
     // NCNN network & Vulkan device
     ncnn::Net net;
+    ncnn::Net cpu_net;
     ncnn::VulkanDevice* vkdev;
     ncnn::Layer* scale_layer;
+
+    struct AsyncFrameSlot {
+        enum State { FREE = 0, GPU_RUNNING = 1, CPU_READY = 2, CPU_RUNNING = 3 };
+        std::mutex mutex;
+        State state;
+        std::array<ncnn::Mat, 10> boundary;
+        int64_t frame_id;
+        int64_t image_timestamp_ns;
+        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
+    };
+    std::array<AsyncFrameSlot, 2> async_slots;
 
     // Cache entries are keyed by the actual AHardwareBuffer pointer. Each entry
     // owns an AHB reference and keeps allocator, imported VkImageMat and pipeline
