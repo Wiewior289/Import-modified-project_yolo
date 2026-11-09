@@ -67,7 +67,7 @@
      ret = vkdev->vkCreateSamplerYcbcrConversionKHR(vkdev->vkdevice(), &samplerYcbcrConversionCreateInfo, 0, &samplerYcbcrConversion);
 --- a/src/convert_ycbcr.comp
 +++ b/src/convert_ycbcr.comp
-@@ -70,17 +70,21 @@
+@@ -70,16 +70,20 @@
      {
          if (rotate_from < 5) // 1 2 3 4
          {
