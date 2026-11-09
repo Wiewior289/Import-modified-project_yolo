@@ -23,6 +23,7 @@ class Yolo11Ncnn {
         const val COMPUTE_CPU = 0
         const val COMPUTE_VULKAN = 1
         const val COMPUTE_VULKAN_AHB = 2
+        const val COMPUTE_VULKAN_AHB_ASYNC = 3
 
         const val ZONE_NEAR = 0
         const val ZONE_MID = 1
@@ -53,6 +54,28 @@ class Yolo11Ncnn {
         rotateType: Int,
         frameId: Long,
         imageTimestampNs: Long
+    ): Int
+
+    /**
+     * Runs AHB import, preprocessing, GPU graph prefix (layers 1..109), and
+     * boundary readback. The camera Image may be closed after this returns.
+     */
+    external fun PrefixFrame(
+        hardwareBuffer: HardwareBuffer,
+        slotIndex: Int,
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ): Int
+
+    /**
+     * Runs the CPU-only suffix (layers 110..256) from the selected frame slot.
+     */
+    external fun SuffixFrame(
+        slotIndex: Int,
+        outBuffer: FloatArray,
+        confThresh: Float,
+        nmsThresh: Float
     ): Int
 
     /**
