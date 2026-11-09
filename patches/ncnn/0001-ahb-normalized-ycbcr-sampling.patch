@@ -14,8 +14,9 @@
 +    const bool supports_linear_sampler = (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
 +
 +    const VkFilter chroma_filter = supports_linear_chroma ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-+    const VkFilter sampler_filter = supports_separate_filter && need_resize && supports_linear_sampler
-+        ? VK_FILTER_LINEAR : chroma_filter;
++    const VkFilter sampler_filter = supports_separate_filter
++        ? ((need_resize && supports_linear_sampler) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST)
++        : chroma_filter;
  
      VkSamplerYcbcrConversionInfoKHR samplerYcbcrConversionInfo;
      samplerYcbcrConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR;
