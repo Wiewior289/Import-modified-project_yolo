@@ -60,6 +60,8 @@ Valid values are:
 
 The resolution selector applies only after the user releases the slider. It does not repeatedly destroy/reinitialize NCNN while the thumb is moving.
 
+Nihui's original UI combines model and size in one model index and exposes the presets 320, 480 and 640. This branch separates model choice from input size and deliberately stops at 480. The additional intermediate values (352, 384, 416 and 448) are this branch's extension, based on the detector's stride-32 grid and the dynamic-shape graph. They still require device-side numerical and performance validation.
+
 The native loader validates the same range and 32-pixel step. NCNN grid/stride generation and the AHB import/preprocess target use the configured dimensions.
 
 ## Reinitialization and async safety

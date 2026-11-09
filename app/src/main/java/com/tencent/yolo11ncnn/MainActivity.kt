@@ -167,10 +167,6 @@ class MainActivity : AppCompatActivity() {
             modelLabels.add("YOLO11s (Small)")
         } else {
             Log.w(TAG, "YOLO11s selector disabled: both yolo11s.param and yolo11s.bin must exist in app/src/main/assets")
-            telemetryServer.broadcastStatus(
-                "MODEL_ASSET_MISSING",
-                "YOLO11s ukryty: wymagane yolo11s.param oraz yolo11s.bin w assets"
-            )
         }
         selectableModelTypes = modelTypes
 
