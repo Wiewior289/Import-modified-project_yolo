@@ -86,9 +86,9 @@ patches/ncnn/0001-ahb-normalized-ycbcr-sampling.patch targets only the pinned NC
 
 Apply only to the exact NCNN checkout with:
 
-    ./scripts/apply_ncnn_ahb_normalized_sampling.sh /path/to/ncnn
+    bash scripts/apply_ncnn_ahb_normalized_sampling.sh /path/to/ncnn
 
-The script refuses any other NCNN HEAD. It is separate from apply_ncnn_runtime_trace.sh; apply it to the same checkout after the runtime trace script if that diagnostic patch is present.
+The script refuses any other NCNN HEAD. It is separate from apply_ncnn_runtime_trace.sh; apply it to the same checkout after the runtime trace script if that diagnostic patch is present. The patch file does not modify the prebuilt ncnn package used by CMake: rebuild that package from the patched checkout and replace the app's local package before testing.
 
 ## Validation gates before enabling async mode by default
 
