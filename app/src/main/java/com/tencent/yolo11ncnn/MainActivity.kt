@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun installComputeModeSelector() {
-        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB", "GPU AHB + CPU suffix (N/N+1)")
+        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB", "GPU AHB prefix + CPU suffix (Point B)", "GPU AHB + CPU suffix (N/N+1)")
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 16, 20, 8)
@@ -152,6 +152,7 @@ class MainActivity : AppCompatActivity() {
         Yolo11Ncnn.COMPUTE_CPU -> "CPU"
         Yolo11Ncnn.COMPUTE_VULKAN -> "GPU Vulkan"
         Yolo11Ncnn.COMPUTE_VULKAN_AHB -> "GPU Vulkan + AHB"
+        Yolo11Ncnn.COMPUTE_VULKAN_AHB_SPLIT -> "GPU AHB prefix + CPU suffix (Point B)"
         Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC -> "GPU AHB + CPU suffix (N/N+1)"
         else -> "UNKNOWN($mode)"
     }
@@ -320,6 +321,71 @@ class MainActivity : AppCompatActivity() {
             if (asyncSlotBusy.compareAndSet(slot, 0, 1)) return slot
         }
         return -1
+    }
+
+    private fun queueSplitFrameSync(
+        image: android.media.Image,
+        frameId: Long,
+        imageTimestampNs: Long,
+        rotateType: Int
+    ) {
+        backgroundInitExecutor.execute {
+            try {
+                var prefixRet = -1
+                var hwBuffer: HardwareBuffer? = null
+                try {
+                    val acquiredBuffer = image.hardwareBuffer
+                    hwBuffer = acquiredBuffer
+                    prefixRet = if (acquiredBuffer == null) {
+                        -70
+                    } else {
+                        yoloEngine.PrefixFrame(acquiredBuffer, 0, rotateType, frameId, imageTimestampNs)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Point B GPU prefix exception frame=$frameId", e)
+                    prefixRet = -71
+                } finally {
+                    hwBuffer?.close()
+                    image.close()
+                }
+
+                if (prefixRet != 0) {
+                    Log.e(TAG, "Point B GPU prefix failed frame=$frameId ret=$prefixRet")
+                    return@execute
+                }
+
+                detectionBuffer.fill(0f)
+                val suffixRet = yoloEngine.SuffixFrame(0, detectionBuffer, confThreshold, nmsThreshold)
+                updateProcessingFps()
+                val count = suffixRet.coerceAtLeast(0)
+                val topScore = if (suffixRet >= 0) yoloEngine.GetTopScore() else 0f
+                val topClass = if (suffixRet >= 0) yoloEngine.GetTopClass() else -1
+
+                if (frameId % 30L == 0L) {
+                    Log.i(TAG, "POINT_B_FRAME frame=$frameId imageTs=$imageTimestampNs " +
+                        "FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
+                        " detections=$count top=" +
+                        String.format(java.util.Locale.US, "%.3f", topScore) +
+                        " class=$topClass")
+                }
+                if (suffixRet < 0) {
+                    Log.e(TAG, "Point B CPU suffix failed frame=$frameId ret=$suffixRet")
+                }
+                val jsonPayload = buildJson(
+                    count, detectionBuffer, currentFps, topScore, topClass, frameId, imageTimestampNs
+                )
+                try {
+                    telemetryServer.sendDetections(jsonPayload)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd wysyłania telemetrii Point B", e)
+                }
+                sendToSTM32(count, detectionBuffer, false)
+            } catch (e: Exception) {
+                Log.e(TAG, "Point B frame exception frame=$frameId", e)
+            } finally {
+                isProcessingFrame.set(false)
+            }
+        }
     }
 
     private fun queueAsyncFrame(image: android.media.Image, frameId: Long, imageTimestampNs: Long, rotateType: Int) {
@@ -497,6 +563,11 @@ class MainActivity : AppCompatActivity() {
 
                 if (!isProcessingFrame.compareAndSet(false, true)) {
                     image.close()
+                    return@setOnImageAvailableListener
+                }
+
+                if (selectedComputeMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_SPLIT) {
+                    queueSplitFrameSync(image, frameId, imageTimestampNs, rotateType)
                     return@setOnImageAvailableListener
                 }
 
