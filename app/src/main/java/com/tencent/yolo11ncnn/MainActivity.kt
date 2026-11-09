@@ -732,10 +732,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        modeGeneration++
         isYoloReady.set(false)
         isCameraRunning.set(false)
 
         try {
+            imageReader?.setOnImageAvailableListener(null, null)
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
@@ -747,7 +749,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         stopCameraThread()
-        backgroundInitExecutor.shutdown()
 
         if (::telemetryServer.isInitialized) {
             try {
@@ -756,8 +757,49 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "Błąd zamykania TelemetryServer", e)
             }
         }
-        yoloEngine.ClearCache()
-        yoloEngine.Destroy()
+
+        // Drain in producer -> consumer order. A GPU task may enqueue a CPU
+        // suffix until the GPU executor terminates, so CPU shutdown comes second.
+        gpuFrameExecutor.shutdown()
+        Thread {
+            val gpuDrained = try {
+                gpuFrameExecutor.awaitTermination(30, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!gpuDrained) {
+                Log.e(TAG, "GPU frame executor did not drain; keeping native engine alive until process teardown")
+                return@Thread
+            }
+
+            cpuFrameExecutor.shutdown()
+            val cpuDrained = try {
+                cpuFrameExecutor.awaitTermination(30, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!cpuDrained) {
+                Log.e(TAG, "CPU frame executor did not drain; keeping native engine alive until process teardown")
+                return@Thread
+            }
+
+            backgroundInitExecutor.shutdown()
+            val initDrained = try {
+                backgroundInitExecutor.awaitTermination(30, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!initDrained) {
+                Log.e(TAG, "Initialization executor did not drain; keeping native engine alive until process teardown")
+                return@Thread
+            }
+
+            yoloEngine.ClearCache()
+            yoloEngine.Destroy()
+        }.start()
     }
 
     companion object {
