@@ -392,6 +392,7 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
 }
 
 int Yolo11::detect_frame(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns){
+ if(compute_mode==YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode==YOLO_COMPUTE_VULKAN_AHB_ASYNC)return -13;
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  return detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
 }
