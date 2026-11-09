@@ -160,7 +160,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             return -4;
         }
 
-        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
             LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
@@ -203,7 +203,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -3;                                                              
     }                                                                           
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
         cpu_net.opt.use_vulkan_compute = false;
         cpu_net.opt.use_fp16_packed = false;
         cpu_net.opt.use_fp16_storage = false;
@@ -258,7 +258,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -5;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
@@ -899,7 +899,7 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
     AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
     std::lock_guard<std::mutex> slot_lock(slot.mutex);
 
-    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC || !vkdev || !scale_layer) return -21;
+    if (!model_loaded || (compute_mode != YOLO_COMPUTE_VULKAN_AHB_SPLIT && compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC) || !vkdev || !scale_layer) return -21;
     if (!ahb) return -22;
     if (slot.state != AsyncFrameSlot::FREE) return -23;
 
@@ -1108,7 +1108,7 @@ int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh
     AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
     std::lock_guard<std::mutex> slot_lock(slot.mutex);
 
-    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC) return -41;
+    if (!model_loaded || (compute_mode != YOLO_COMPUTE_VULKAN_AHB_SPLIT && compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC)) return -41;
     if (slot.state != AsyncFrameSlot::CPU_READY) return -42;
 
     slot.state = AsyncFrameSlot::CPU_RUNNING;
