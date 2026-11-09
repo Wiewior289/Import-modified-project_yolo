@@ -55,13 +55,14 @@ The overlap is between separate stage workers. NCNN's public VkCompute::submit_a
 
 ## Implementation status in this branch
 
-The opt-in compute mode 3 now has a first implementation pass:
+The opt-in compute modes 3 and 4 now have a first implementation pass:
 
-- Native Yolo11 owns a Vulkan Net for the prefix and a CPU-only Net for the suffix. The async mode refuses any model other than the pinned YOLO11n graph signature and checks the ten boundary producers plus Vulkan capability for layers 1-109.
-- gpu_prefix_frame() imports/preprocesses AHB, evaluates the prefix, records ten downloads in one VkCompute context, waits for completion, and transitions the frame slot to CPU_READY.
+- Native Yolo11 owns a Vulkan Net for the prefix and a CPU-only Net for the suffix. Both split modes refuse any model other than the pinned YOLO11n graph signature and check the ten boundary producers plus Vulkan capability for layers 1-109.
+- Mode 3 is the synchronous Point B diagnostic: one worker calls gpu_prefix_frame() and then cpu_suffix_frame() for the same frame, with no frame overlap.
+- Mode 4 is N/N+1: gpu_prefix_frame() imports/preprocesses AHB, evaluates the prefix, records ten downloads in one VkCompute context, waits for completion, and transitions the frame slot to CPU_READY.
 - cpu_suffix_frame() injects those ten host Mats into the CPU Net, extracts out0, then performs DFL decode and NMS.
 - JNI now snapshots a shared_ptr under g_lock and releases the lock before inference. Detection vectors and output arrays are per-thread/per-call rather than global shared buffers.
-- Kotlin now has one serial GPU executor, one serial CPU executor, two reserved frame slots, per-slot output arrays, and an explicit producer-before-consumer drain on mode changes and teardown.
+- Kotlin mode 3 serializes prefix and suffix on the existing frame executor for Point B validation. Mode 4 has one serial GPU executor, one serial CPU executor, two reserved frame slots, per-slot output arrays, and an explicit producer-before-consumer drain on mode changes and teardown.
 - Camera Image/HardwareBuffer lifetime ends after the GPU prefix returns. ImageReader teardown is delayed until the GPU worker has released all acquired Images.
 
 Ownership assumptions that remain deliberate:
@@ -71,7 +72,7 @@ Ownership assumptions that remain deliberate:
 - The same Net is never shared between the GPU and CPU workers.
 - This is stage-level asynchronous overlap, not a nonblocking NCNN Vulkan submit API. The GPU prefix call waits for its boundary fence before the CPU suffix is queued.
 
-The mode is opt-in and is not the default. The code has not been built or run on the target Android device yet. The validation gates below are still mandatory before treating the implementation as correct.
+Modes 3 and 4 are opt-in and are not the default. The code has not been built or run on the target Android device yet. The validation gates below are still mandatory before treating the implementation as correct.
 
 ## AHB correctness patch
 
