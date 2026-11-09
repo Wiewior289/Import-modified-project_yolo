@@ -345,8 +345,16 @@ class MainActivity : AppCompatActivity() {
                     Log.e(TAG, "Point B GPU prefix exception frame=$frameId", e)
                     prefixRet = -71
                 } finally {
-                    hwBuffer?.close()
-                    image.close()
+                    try {
+                        hwBuffer?.close()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId", e)
+                    }
+                    try {
+                        image.close()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Camera Image close failed frame=$frameId", e)
+                    }
                 }
 
                 if (prefixRet != 0) {
@@ -413,8 +421,16 @@ class MainActivity : AppCompatActivity() {
                     Log.e(TAG, "GPU prefix exception frame=$frameId slot=$slot", e)
                     prefixRet = -71
                 } finally {
-                    hwBuffer?.close()
-                    image.close()
+                    try {
+                        hwBuffer?.close()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId", e)
+                    }
+                    try {
+                        image.close()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Camera Image close failed frame=$frameId", e)
+                    }
                 }
 
                 if (prefixRet != 0) {
