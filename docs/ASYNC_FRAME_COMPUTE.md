@@ -53,15 +53,25 @@ FREE -> GPU_RUNNING -> CPU_READY -> CPU_RUNNING -> FREE.
 
 The overlap is between separate stage workers. NCNN's public VkCompute::submit_and_wait() is synchronous; this design does not pretend it is an asynchronous submit API.
 
-## Current serialization blockers in the application
+## Implementation status in this branch
 
-- JNI DetectFrame() currently holds g_lock for the entire inference call.
-- Kotlin currently uses one backgroundInitExecutor for frame inference and drops frames with isProcessingFrame.
-- JNI uses one global output float array and one global std::vector<Object>.
-- Yolo11 currently owns shared CPU postprocess scratchpads and shared last-score fields.
-- ahb_import_cache is an unsynchronized map and its entries own AHB/Vulkan objects.
+The opt-in compute mode 3 now has a first implementation pass:
 
-The async path must not reuse these globals as concurrent frame state. The engine lifetime lock must be separated from per-frame work. Destroy/mode-switch must drain GPU work and then CPU work before destroying either Net or the Vulkan instance.
+- Native Yolo11 owns a Vulkan Net for the prefix and a CPU-only Net for the suffix. The async mode refuses any model other than the pinned YOLO11n graph signature and checks the ten boundary producers plus Vulkan capability for layers 1-109.
+- gpu_prefix_frame() imports/preprocesses AHB, evaluates the prefix, records ten downloads in one VkCompute context, waits for completion, and transitions the frame slot to CPU_READY.
+- cpu_suffix_frame() injects those ten host Mats into the CPU Net, extracts out0, then performs DFL decode and NMS.
+- JNI now snapshots a shared_ptr under g_lock and releases the lock before inference. Detection vectors and output arrays are per-thread/per-call rather than global shared buffers.
+- Kotlin now has one serial GPU executor, one serial CPU executor, two reserved frame slots, per-slot output arrays, and an explicit producer-before-consumer drain on mode changes and teardown.
+- Camera Image/HardwareBuffer lifetime ends after the GPU prefix returns. ImageReader teardown is delayed until the GPU worker has released all acquired Images.
+
+Ownership assumptions that remain deliberate:
+
+- The AHB cache is owned by the single serial GPU worker. ClearCache/Destroy must only run after that worker has drained.
+- CPU postprocess scratchpads and last-score fields are shared members, but only the single serial CPU worker touches them in async mode.
+- The same Net is never shared between the GPU and CPU workers.
+- This is stage-level asynchronous overlap, not a nonblocking NCNN Vulkan submit API. The GPU prefix call waits for its boundary fence before the CPU suffix is queued.
+
+The mode is opt-in and is not the default. The code has not been built or run on the target Android device yet. The validation gates below are still mandatory before treating the implementation as correct.
 
 ## AHB correctness patch
 
