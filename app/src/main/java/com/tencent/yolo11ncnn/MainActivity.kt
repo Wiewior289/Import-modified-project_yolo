@@ -190,6 +190,8 @@ class MainActivity : AppCompatActivity() {
                 fpsWindowStartMs = 0L
                 fpsWindowFrames = 0
                 currentFps = 0f
+                asyncSlotBusy.set(0, 0)
+                asyncSlotBusy.set(1, 0)
                 yoloEngine.Destroy()
                 val startedAt = SystemClock.elapsedRealtime()
                 val initialized = try {
@@ -235,7 +237,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val handler = cameraHandler
-            if (handler != null) handler.post { detachAndDrain() } else detachAndDrain()
+            val posted = handler?.post { detachAndDrain() } ?: false
+            if (!posted) detachAndDrain()
         } else {
             enqueueReinitialization()
         }
