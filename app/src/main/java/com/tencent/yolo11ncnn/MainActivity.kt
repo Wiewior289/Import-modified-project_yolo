@@ -332,8 +332,9 @@ class MainActivity : AppCompatActivity() {
         try {
             gpuFrameExecutor.execute {
                 var prefixRet = -1
-                val hwBuffer = image.hardwareBuffer
+                var hwBuffer: HardwareBuffer? = null
                 try {
+                    hwBuffer = image.hardwareBuffer
                     if (hwBuffer == null) {
                         prefixRet = -70
                     } else {
