@@ -23,7 +23,8 @@ class Yolo11Ncnn {
         const val COMPUTE_CPU = 0
         const val COMPUTE_VULKAN = 1
         const val COMPUTE_VULKAN_AHB = 2
-        const val COMPUTE_VULKAN_AHB_ASYNC = 3
+        const val COMPUTE_VULKAN_AHB_SPLIT = 3
+        const val COMPUTE_VULKAN_AHB_ASYNC = 4
 
         const val ZONE_NEAR = 0
         const val ZONE_MID = 1
@@ -31,7 +32,7 @@ class Yolo11Ncnn {
     }
 
     /**
-     * Initializes NCNN with CPU, Vulkan, or direct Vulkan+AHB input mode.
+     * Initializes NCNN with CPU, Vulkan, direct Vulkan+AHB, synchronous Point B split, or async N/N+1 mode.
      */
     external fun Init(
         mgr: AssetManager,
