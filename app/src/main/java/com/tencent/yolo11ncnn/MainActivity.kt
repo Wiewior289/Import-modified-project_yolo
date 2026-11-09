@@ -777,7 +777,11 @@ class MainActivity : AppCompatActivity() {
             }
 
             // Prefix workers have released their Camera2 Images at this point.
-            readerToClose?.close()
+            try {
+                readerToClose?.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd zamykania ImageReader po drenażu GPU", e)
+            }
 
             cpuFrameExecutor.shutdown()
             val cpuDrained = try {
