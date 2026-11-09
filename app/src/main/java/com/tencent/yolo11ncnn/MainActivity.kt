@@ -334,12 +334,13 @@ class MainActivity : AppCompatActivity() {
                 var prefixRet = -1
                 var hwBuffer: HardwareBuffer? = null
                 try {
-                    hwBuffer = image.hardwareBuffer
-                    if (hwBuffer == null) {
+                    val acquiredBuffer = image.hardwareBuffer
+                    hwBuffer = acquiredBuffer
+                    if (acquiredBuffer == null) {
                         prefixRet = -70
                     } else {
                         prefixRet = yoloEngine.PrefixFrame(
-                            hwBuffer, slot, rotateType, frameId, imageTimestampNs
+                            acquiredBuffer, slot, rotateType, frameId, imageTimestampNs
                         )
                     }
                 } catch (e: Exception) {
