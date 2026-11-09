@@ -224,6 +224,33 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         }
         LOGI("ASYNC_GRAPH_READY gpu_layers=%zu cpu_layers=%zu boundary_blobs=10",
              net.layers().size(), cpu_net.layers().size());
+
+        static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
+        static const int boundary_producers[10] = {31, 60, 102, 103, 105, 105, 107, 108, 108, 109};
+        if (std::strcmp(modeltype, "n") != 0 ||
+            net.layers().size() != 257 || cpu_net.layers().size() != 257 ||
+            net.blobs().size() != 307 || cpu_net.blobs().size() != 307) {
+            LOGE("Async split is pinned to YOLO11n graph signature (257 layers / 307 blobs)");
+            return -16;
+        }
+        for (int i = 0; i < 10; ++i) {
+            const int blob_id = boundary_blob_ids[i];
+            if (net.blobs()[static_cast<size_t>(blob_id)].producer != boundary_producers[i] ||
+                cpu_net.blobs()[static_cast<size_t>(blob_id)].producer != boundary_producers[i]) {
+                LOGE("Async graph cut mismatch blob=%d expected_producer=%d gpu=%d cpu=%d",
+                     blob_id, boundary_producers[i],
+                     net.blobs()[static_cast<size_t>(blob_id)].producer,
+                     cpu_net.blobs()[static_cast<size_t>(blob_id)].producer);
+                return -17;
+            }
+        }
+        for (size_t i = 1; i <= 109; ++i) {
+            const ncnn::Layer* layer = net.layers()[i];
+            if (!layer || !layer->support_vulkan) {
+                LOGE("Async GPU prefix contains a non-Vulkan layer at idx=%zu", i);
+                return -18;
+            }
+        }
     }
                                                                                 
     if (use_vulkan_compute && !vkdev) {
