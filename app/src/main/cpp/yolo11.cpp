@@ -86,6 +86,7 @@ Yolo11::~Yolo11()
         scale_layer = nullptr;
     }
     net.clear();
+    cpu_net.clear();
 }
 
 void Yolo11::destroy_ahb_cache_entry(AHBImportCacheEntry* entry)
@@ -123,11 +124,19 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
 
     clear_ahb_cache();
     net.clear();
+    cpu_net.clear();
+    for (auto& slot : async_slots) {
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        for (auto& boundary : slot.boundary) boundary.release();
+        slot.state = AsyncFrameSlot::FREE;
+        slot.frame_id = 0;
+        slot.image_timestamp_ns = 0;
+    }
 
     target_w = target_size;
     target_h = target_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
-        requested_compute_mode > YOLO_COMPUTE_VULKAN_AHB) {
+        requested_compute_mode > YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
         return -4;
     }
@@ -151,7 +160,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             return -4;
         }
 
-        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
             LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
@@ -193,13 +202,36 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         LOGE("Failed to load model: %s (code %d)", binpath, ret_bin);           
         return -3;                                                              
     }                                                                           
+
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+        cpu_net.opt.use_vulkan_compute = false;
+        cpu_net.opt.use_fp16_packed = false;
+        cpu_net.opt.use_fp16_storage = false;
+        cpu_net.opt.use_fp16_arithmetic = false;
+        cpu_net.opt.use_packing_layout = false;
+        cpu_net.opt.lightmode = true;
+        cpu_net.opt.num_threads = 4;
+
+        const int cpu_param_ret = cpu_net.load_param(mgr, parampath);
+        if (cpu_param_ret != 0) {
+            LOGE("CPU suffix Net failed to load param: %s (code %d)", parampath, cpu_param_ret);
+            return -14;
+        }
+        const int cpu_model_ret = cpu_net.load_model(mgr, binpath);
+        if (cpu_model_ret != 0) {
+            LOGE("CPU suffix Net failed to load model: %s (code %d)", binpath, cpu_model_ret);
+            return -15;
+        }
+        LOGI("ASYNC_GRAPH_READY gpu_layers=%zu cpu_layers=%zu boundary_blobs=10",
+             net.layers().size(), cpu_net.layers().size());
+    }
                                                                                 
     if (use_vulkan_compute && !vkdev) {
         LOGE("Vulkan initialization did not complete");
         return -5;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
@@ -829,6 +861,266 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         }
     }
 
+    return 0;
+}
+
+
+int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
+                             int64_t frame_id, int64_t image_timestamp_ns)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -20;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC || !vkdev || !scale_layer) return -21;
+    if (!ahb) return -22;
+    if (slot.state != AsyncFrameSlot::FREE) return -23;
+
+    slot.state = AsyncFrameSlot::GPU_RUNNING;
+    slot.frame_id = frame_id;
+    slot.image_timestamp_ns = image_timestamp_ns;
+    for (auto& boundary : slot.boundary) boundary.release();
+
+    auto fail_slot = [&](int code) {
+        for (auto& boundary : slot.boundary) boundary.release();
+        slot.state = AsyncFrameSlot::FREE;
+        return code;
+    };
+
+    AHardwareBuffer_Desc desc{};
+    AHardwareBuffer_describe(ahb, &desc);
+    if (desc.width == 0 || desc.height == 0 ||
+        (desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) == 0) {
+        LOGE("Async prefix: AHB not importable %ux%u usage=0x%llx",
+             desc.width, desc.height, static_cast<unsigned long long>(desc.usage));
+        return fail_slot(-24);
+    }
+
+    ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
+    ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
+    if (!blob_allocator || !staging_allocator) {
+        if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
+        if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
+        return fail_slot(-25);
+    }
+
+    int execute_ret = 0;
+    {
+        ncnn::Option opt = net.opt;
+        opt.use_vulkan_compute = true;
+        opt.blob_vkallocator = blob_allocator;
+        opt.workspace_vkallocator = blob_allocator;
+        opt.staging_vkallocator = staging_allocator;
+
+        // The cache is single-owner: only the serial GPU worker calls this path.
+        AHBImportCacheEntry* entry = nullptr;
+        auto cache_it = ahb_import_cache.find(ahb);
+        if (cache_it == ahb_import_cache.end()) {
+            if (ahb_import_cache.size() >= AHB_CACHE_LIMIT) {
+                auto oldest = ahb_import_cache.begin();
+                for (auto it = ahb_import_cache.begin(); it != ahb_import_cache.end(); ++it) {
+                    if (it->second->last_used < oldest->second->last_used) oldest = it;
+                }
+                destroy_ahb_cache_entry(oldest->second);
+                ahb_import_cache.erase(oldest);
+                ++ahb_cache_evictions;
+            }
+
+            entry = new (std::nothrow) AHBImportCacheEntry();
+            if (!entry) {
+                execute_ret = -26;
+            } else {
+                AHardwareBuffer_acquire(ahb);
+                entry->ahb = ahb;
+                entry->allocator = new (std::nothrow) ncnn::VkAndroidHardwareBufferImageAllocator(vkdev, ahb);
+                if (!entry->allocator) {
+                    destroy_ahb_cache_entry(entry);
+                    entry = nullptr;
+                    execute_ret = -26;
+                } else {
+                    entry->src = ncnn::VkImageMat::from_android_hardware_buffer(entry->allocator);
+                    if (entry->src.empty()) {
+                        destroy_ahb_cache_entry(entry);
+                        entry = nullptr;
+                        execute_ret = -27;
+                    } else {
+                        entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
+                        if (!entry->pipeline) {
+                            destroy_ahb_cache_entry(entry);
+                            entry = nullptr;
+                            execute_ret = -28;
+                        } else {
+                            ncnn::Option pipeline_opt = opt;
+                            pipeline_opt.use_fp16_storage = false;
+                            pipeline_opt.use_fp16_packed = false;
+                            const int pipeline_ret = entry->pipeline->create(
+                                entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt);
+                            if (pipeline_ret != 0) {
+                                destroy_ahb_cache_entry(entry);
+                                entry = nullptr;
+                                execute_ret = -29;
+                            } else {
+                                entry->rotate_type = rotate_type;
+                                entry->last_used = ++ahb_cache_clock;
+                                ahb_import_cache.emplace(ahb, entry);
+                                ++ahb_cache_misses;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            entry = cache_it->second;
+            ++ahb_cache_hits;
+            entry->last_used = ++ahb_cache_clock;
+        }
+
+        if (execute_ret == 0 && entry && entry->rotate_type != rotate_type) {
+            delete entry->pipeline;
+            entry->pipeline = nullptr;
+            ncnn::Option pipeline_opt = opt;
+            pipeline_opt.use_fp16_storage = false;
+            pipeline_opt.use_fp16_packed = false;
+            entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
+            const int pipeline_ret = entry->pipeline
+                ? entry->pipeline->create(entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt)
+                : -1;
+            if (pipeline_ret != 0) {
+                delete entry->pipeline;
+                entry->pipeline = nullptr;
+                execute_ret = -30;
+            } else {
+                entry->rotate_type = rotate_type;
+                ++ahb_cache_rotate_rebuilds;
+            }
+        }
+
+        if (execute_ret == 0 && entry && entry->pipeline) {
+            ncnn::VkMat dst;
+            dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);
+            if (dst.empty()) {
+                execute_ret = -31;
+            } else {
+                ncnn::VkMat dst_normalized;
+                ncnn::VkMat input_gpu;
+                ncnn::VkCompute cmd(vkdev);
+
+                cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
+                execute_ret = scale_layer->forward(dst, dst_normalized, cmd, opt);
+                if (execute_ret == 0) {
+                    const int cast_type = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
+                    vkdev->convert_packing(dst_normalized, input_gpu, 1, cast_type, cmd, opt);
+                    if (input_gpu.empty()) execute_ret = -32;
+                }
+
+                if (execute_ret == 0) {
+                    ncnn::Extractor gpu_ex = net.create_extractor();
+                    gpu_ex.set_light_mode(false);
+                    gpu_ex.set_blob_vkallocator(blob_allocator);
+                    gpu_ex.set_workspace_vkallocator(blob_allocator);
+                    gpu_ex.set_staging_vkallocator(staging_allocator);
+                    execute_ret = gpu_ex.input("in0", input_gpu);
+                    if (execute_ret == 0) {
+                        static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
+                        ncnn::VkMat boundary_gpu[10];
+                        for (int i = 0; i < 10 && execute_ret == 0; ++i) {
+                            execute_ret = gpu_ex.extract(boundary_blob_ids[i], boundary_gpu[i], cmd);
+                            if (execute_ret == 0 && boundary_gpu[i].empty()) execute_ret = -33;
+                        }
+
+                        if (execute_ret == 0) {
+                            ncnn::Option download_opt = opt;
+                            download_opt.use_packing_layout = false;
+                            for (int i = 0; i < 10; ++i) {
+                                cmd.record_download(boundary_gpu[i], slot.boundary[static_cast<size_t>(i)], download_opt);
+                            }
+                            execute_ret = cmd.submit_and_wait();
+                            if (execute_ret == 0) {
+                                for (int i = 0; i < 10; ++i) {
+                                    if (slot.boundary[static_cast<size_t>(i)].empty()) {
+                                        execute_ret = -34;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (execute_ret == 0) {
+            execute_ret = -35;
+        }
+    }
+
+    vkdev->reclaim_blob_allocator(blob_allocator);
+    vkdev->reclaim_staging_allocator(staging_allocator);
+
+    if (execute_ret != 0) {
+        LOGE("Async GPU prefix failed frame=%lld slot=%d ret=%d",
+             static_cast<long long>(frame_id), slot_index, execute_ret);
+        return fail_slot(execute_ret);
+    }
+
+    slot.state = AsyncFrameSlot::CPU_READY;
+    LOGD("ASYNC_PREFIX_READY frame=%lld slot=%d boundary_count=10",
+         static_cast<long long>(frame_id), slot_index);
+    return 0;
+}
+
+int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh,
+                             std::vector<Object>& objects)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -40;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC) return -41;
+    if (slot.state != AsyncFrameSlot::CPU_READY) return -42;
+
+    slot.state = AsyncFrameSlot::CPU_RUNNING;
+    const int64_t frame_id = slot.frame_id;
+    const int64_t image_timestamp_ns = slot.image_timestamp_ns;
+    last_top_score = 0.0f;
+    last_top_class = -1;
+    objects.clear();
+
+    int execute_ret = 0;
+    ncnn::Mat out;
+    {
+        ncnn::Extractor cpu_ex = cpu_net.create_extractor();
+        cpu_ex.set_light_mode(true);
+        static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
+        for (int i = 0; i < 10 && execute_ret == 0; ++i) {
+            const ncnn::Mat& boundary = slot.boundary[static_cast<size_t>(i)];
+            if (boundary.empty()) {
+                execute_ret = -43;
+                break;
+            }
+            execute_ret = cpu_ex.input(boundary_blob_ids[i], boundary);
+        }
+        if (execute_ret == 0) execute_ret = cpu_ex.extract("out0", out);
+    }
+
+    for (auto& boundary : slot.boundary) boundary.release();
+    slot.state = AsyncFrameSlot::FREE;
+
+    if (execute_ret != 0 || out.empty()) {
+        LOGE("Async CPU suffix failed frame=%lld slot=%d ret=%d",
+             static_cast<long long>(frame_id), slot_index, execute_ret);
+        return execute_ret != 0 ? execute_ret : -44;
+    }
+
+    proposal_scratchpad.clear();
+    decode_dfl_and_filter(out, conf_thresh);
+    objects.clear();
+    nms_sorted_bboxes(nms_thresh, objects);
+
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        log_tensor_stats("async_out0", out, frame_id, image_timestamp_ns);
+        LOGI("ASYNC_SUFFIX_DONE frame=%lld slot=%d detections=%zu top=%.4f class=%d",
+             static_cast<long long>(frame_id), slot_index, objects.size(),
+             last_top_score, last_top_class);
+    }
     return 0;
 }
 
