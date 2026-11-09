@@ -847,13 +847,6 @@ class MainActivity : AppCompatActivity() {
                 return@Thread
             }
 
-            // Prefix workers have released their Camera2 Images at this point.
-            try {
-                readerToClose?.close()
-            } catch (e: Exception) {
-                Log.e(TAG, "Błąd zamykania ImageReader po drenażu GPU", e)
-            }
-
             cpuFrameExecutor.shutdown()
             val cpuDrained = try {
                 cpuFrameExecutor.awaitTermination(30, TimeUnit.SECONDS)
@@ -876,6 +869,13 @@ class MainActivity : AppCompatActivity() {
             if (!initDrained) {
                 Log.e(TAG, "Initialization executor did not drain; keeping native engine alive until process teardown")
                 return@Thread
+            }
+
+            // All three workers have released their acquired Camera2 Images.
+            try {
+                readerToClose?.close()
+            } catch (e: Exception) {
+                Log.e(TAG, "Błąd zamykania ImageReader po drenażu", e)
             }
 
             yoloEngine.ClearCache()
