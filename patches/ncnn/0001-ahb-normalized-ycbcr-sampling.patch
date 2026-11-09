@@ -1,6 +1,6 @@
 --- a/src/pipeline.cpp
 +++ b/src/pipeline.cpp
-@@ -471,21 +471,25 @@
+@@ -471,21 +471,26 @@
  {
      VkResult ret;
  
