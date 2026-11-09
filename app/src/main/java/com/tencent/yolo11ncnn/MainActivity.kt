@@ -185,6 +185,7 @@ class MainActivity : AppCompatActivity() {
 
         val enqueueReinitialization = {
             backgroundInitExecutor.execute {
+                if (generation != modeGeneration) return@execute
                 fpsWindowStartMs = 0L
                 fpsWindowFrames = 0
                 currentFps = 0f
