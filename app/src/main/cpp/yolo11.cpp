@@ -121,6 +121,10 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         LOGE("Invalid AssetManager or modeltype pointer");
         return -1;
     }
+    if (target_size < 320 || target_size > 480 || (target_size % 32) != 0) {
+        LOGE("Unsupported target size %d; expected 320..480 in steps of 32", target_size);
+        return -4;
+    }
 
     clear_ahb_cache();
     net.clear();
@@ -227,10 +231,10 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
 
         static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
         static const int boundary_producers[10] = {31, 60, 102, 103, 105, 105, 107, 108, 108, 109};
-        if (std::strcmp(modeltype, "n") != 0 ||
+        if ((std::strcmp(modeltype, "n") != 0 && std::strcmp(modeltype, "s") != 0) ||
             net.layers().size() != 257 || cpu_net.layers().size() != 257 ||
             net.blobs().size() != 307 || cpu_net.blobs().size() != 307) {
-            LOGE("Async split is pinned to YOLO11n graph signature (257 layers / 307 blobs)");
+            LOGE("Async split supports only YOLO11n/YOLO11s graph signature (257 layers / 307 blobs)");
             return -16;
         }
         for (int i = 0; i < 10; ++i) {

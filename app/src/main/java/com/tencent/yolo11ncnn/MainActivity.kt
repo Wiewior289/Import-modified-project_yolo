@@ -19,6 +19,7 @@ import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.LinearLayout
 import android.widget.Spinner
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -44,6 +45,11 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var selectedComputeMode: Int = Yolo11Ncnn.COMPUTE_VULKAN_AHB
     @Volatile private var modeGeneration: Long = 0L
     private var modeSelectorInitialized = false
+    private var modelSelectorInitialized = false
+    @Volatile private var selectedModelType: Int = Yolo11Ncnn.MODEL_YOLO11N
+    @Volatile private var selectedTargetSize: Int = TARGET_SIZE_MIN
+    @Volatile private var asyncDrainPending: Boolean = false
+    private var selectableModelTypes: List<Int> = listOf(Yolo11Ncnn.MODEL_YOLO11N)
     private lateinit var telemetryServer: TelemetryServer
     private lateinit var backgroundInitExecutor: ExecutorService
     private lateinit var gpuFrameExecutor: ExecutorService
@@ -113,21 +119,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun installComputeModeSelector() {
-        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB", "GPU AHB prefix + CPU suffix (Point B)", "GPU AHB + CPU suffix (N/N+1)")
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 16, 20, 8)
         }
-        val label = TextView(this).apply {
+
+        val computeLabel = TextView(this).apply {
             text = "Tryb obliczeniowy NCNN"
             textSize = 16f
         }
-        val spinner = Spinner(this)
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, labels)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        spinner.adapter = adapter
-        spinner.setSelection(selectedComputeMode)
-        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+        val computeSpinner = Spinner(this)
+        val computeLabels = listOf(
+            "CPU",
+            "GPU Vulkan",
+            "GPU Vulkan + AHB",
+            "GPU AHB prefix + CPU suffix (Point B)",
+            "GPU AHB + CPU suffix (N/N+1)"
+        )
+        val computeAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, computeLabels)
+        computeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        computeSpinner.adapter = computeAdapter
+        computeSpinner.setSelection(selectedComputeMode)
+        computeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 if (!modeSelectorInitialized) {
                     modeSelectorInitialized = true
@@ -139,10 +152,95 @@ class MainActivity : AppCompatActivity() {
 
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
-        root.addView(label, LinearLayout.LayoutParams(
+
+        val modelLabelView = TextView(this).apply {
+            text = "Model detekcji"
+            textSize = 16f
+            setPadding(0, 12, 0, 0)
+        }
+
+        val assetNames = assets.list("")?.toSet() ?: emptySet()
+        val modelTypes = mutableListOf(Yolo11Ncnn.MODEL_YOLO11N)
+        val modelLabels = mutableListOf("YOLO11n (Nano)")
+        if (assetNames.contains("yolo11s.param") && assetNames.contains("yolo11s.bin")) {
+            modelTypes.add(Yolo11Ncnn.MODEL_YOLO11S)
+            modelLabels.add("YOLO11s (Small)")
+        } else {
+            Log.w(TAG, "YOLO11s selector disabled: both yolo11s.param and yolo11s.bin must exist in app/src/main/assets")
+            telemetryServer.broadcastStatus(
+                "MODEL_ASSET_MISSING",
+                "YOLO11s ukryty: wymagane yolo11s.param oraz yolo11s.bin w assets"
+            )
+        }
+        selectableModelTypes = modelTypes
+
+        val modelSpinner = Spinner(this)
+        val modelAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, modelLabels)
+        modelAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        modelSpinner.adapter = modelAdapter
+        val initialModelPosition = selectableModelTypes.indexOf(selectedModelType).coerceAtLeast(0)
+        modelSpinner.setSelection(initialModelPosition)
+        modelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val modelType = selectableModelTypes.getOrElse(position) { Yolo11Ncnn.MODEL_YOLO11N }
+                if (!modelSelectorInitialized) {
+                    modelSelectorInitialized = true
+                    if (modelType != selectedModelType) switchModelType(modelType)
+                    return
+                }
+                switchModelType(modelType)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        val resolutionLabel = TextView(this).apply {
+            text = "Rozdzielczość wejściowa modelu"
+            textSize = 16f
+            setPadding(0, 12, 0, 0)
+        }
+        val resolutionValue = TextView(this).apply {
+            text = selectedTargetSize.toString() + " x " + selectedTargetSize
+            textSize = 14f
+        }
+        val resolutionSeekBar = SeekBar(this).apply {
+            max = (TARGET_SIZE_MAX - TARGET_SIZE_MIN) / TARGET_SIZE_STEP
+            progress = (selectedTargetSize - TARGET_SIZE_MIN) / TARGET_SIZE_STEP
+        }
+        resolutionSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                val previewSize = TARGET_SIZE_MIN + progress * TARGET_SIZE_STEP
+                resolutionValue.text = previewSize.toString() + " x " + previewSize
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                val progress = seekBar?.progress ?: return
+                val newSize = TARGET_SIZE_MIN + progress * TARGET_SIZE_STEP
+                switchTargetSize(newSize)
+            }
+        })
+
+        root.addView(computeLabel, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
-        root.addView(spinner, LinearLayout.LayoutParams(
+        root.addView(computeSpinner, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(modelLabelView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(modelSpinner, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(resolutionLabel, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(resolutionValue, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(resolutionSeekBar, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
         setContentView(root)
@@ -157,32 +255,44 @@ class MainActivity : AppCompatActivity() {
         else -> "UNKNOWN($mode)"
     }
 
-    private fun closeCameraForModeSwitch() {
-        try {
-            imageReader?.setOnImageAvailableListener(null, null)
-            captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Błąd zatrzymywania kamery przy zmianie backendu", e)
-        }
+    private fun modelLabel(modelType: Int): String = when (modelType) {
+        Yolo11Ncnn.MODEL_YOLO11N -> "YOLO11n"
+        Yolo11Ncnn.MODEL_YOLO11S -> "YOLO11s"
+        Yolo11Ncnn.MODEL_YOLO11M -> "YOLO11m"
+        else -> "UNKNOWN_MODEL(" + modelType + ")"
     }
 
-    private fun switchComputeMode(newMode: Int) {
+    private fun switchModelType(newModelType: Int) {
+        if (!selectableModelTypes.contains(newModelType) || newModelType == selectedModelType) return
         val previousMode = selectedComputeMode
-        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC ||
-            newMode == previousMode) return
+        selectedModelType = newModelType
+        reinitializePipeline("MODEL_SWITCH", previousMode)
+    }
 
-        selectedComputeMode = newMode
+    private fun switchTargetSize(newSize: Int) {
+        if (newSize < TARGET_SIZE_MIN || newSize > TARGET_SIZE_MAX ||
+            (newSize - TARGET_SIZE_MIN) % TARGET_SIZE_STEP != 0 ||
+            newSize == selectedTargetSize) return
+        val previousMode = selectedComputeMode
+        selectedTargetSize = newSize
+        reinitializePipeline("INPUT_SIZE_SWITCH", previousMode)
+    }
+
+    private fun reinitializePipeline(reason: String, previousMode: Int) {
         val generation = ++modeGeneration
+        val modelAtRequest = selectedModelType
+        val targetAtRequest = selectedTargetSize
+        val computeModeAtRequest = selectedComputeMode
+        val mustDrainAsync = previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC || asyncDrainPending
+        if (mustDrainAsync) asyncDrainPending = true
+
         isYoloReady.set(false)
         isCameraRunning.set(false)
         closeCameraForModeSwitch()
-        telemetryServer.broadcastStatus(
-            "COMPUTE_MODE_SWITCH",
-            "Przełączanie backendu na " + computeModeLabel(newMode)
-        )
+
+        val configLabel = modelLabel(modelAtRequest) + " / " +
+            targetAtRequest + "x" + targetAtRequest + " / " + computeModeLabel(computeModeAtRequest)
+        telemetryServer.broadcastStatus("COMPUTE_MODE_SWITCH", reason + ": " + configLabel)
 
         val enqueueReinitialization = {
             backgroundInitExecutor.execute {
@@ -193,14 +303,16 @@ class MainActivity : AppCompatActivity() {
                 asyncSlotBusy.set(0, 0)
                 asyncSlotBusy.set(1, 0)
                 yoloEngine.Destroy()
+
                 val startedAt = SystemClock.elapsedRealtime()
                 val initialized = try {
-                    yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
+                    yoloEngine.Init(assets, modelAtRequest, targetAtRequest, computeModeAtRequest)
                 } catch (e: Exception) {
-                    Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
+                    Log.e(TAG, "Błąd inicjalizacji " + configLabel, e)
                     false
                 }
                 val durationMs = SystemClock.elapsedRealtime() - startedAt
+                if (generation == modeGeneration) asyncDrainPending = false
 
                 runOnUiThread {
                     if (generation != modeGeneration) return@runOnUiThread
@@ -209,27 +321,24 @@ class MainActivity : AppCompatActivity() {
                     imageReader = null
                     if (initialized) {
                         isYoloReady.set(true)
-                        Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
+                        Log.i(TAG, configLabel + " gotowy w " + durationMs + "ms")
                         telemetryServer.broadcastStatus(
                             "COMPUTE_MODE_READY",
-                            computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
+                            configLabel + " gotowy (" + durationMs + "ms)"
                         )
                         startCamera2()
                     } else {
                         isYoloReady.set(false)
                         telemetryServer.broadcastStatus(
                             "ERROR_COMPUTE_MODE",
-                            "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
+                            "Nie udało się uruchomić " + configLabel
                         )
                     }
                 }
             }
         }
 
-        if (previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC) {
-            // Camera callbacks are serialized on cameraHandler. This barrier runs
-            // after any callback already in progress, then drains GPU prefixes,
-            // then CPU suffixes, before the native engine is destroyed.
+        if (mustDrainAsync) {
             val detachAndDrain = {
                 imageReader?.setOnImageAvailableListener(null, null)
                 gpuFrameExecutor.execute {
@@ -241,6 +350,26 @@ class MainActivity : AppCompatActivity() {
             if (!posted) detachAndDrain()
         } else {
             enqueueReinitialization()
+        }
+    }
+
+    private fun switchComputeMode(newMode: Int) {
+        val previousMode = selectedComputeMode
+        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC ||
+            newMode == previousMode) return
+        selectedComputeMode = newMode
+        reinitializePipeline("COMPUTE_MODE_SWITCH", previousMode)
+    }
+
+    private fun closeCameraForModeSwitch() {
+        try {
+            imageReader?.setOnImageAvailableListener(null, null)
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Błąd zatrzymywania kamery przy zmianie backendu", e)
         }
     }
 
@@ -262,9 +391,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun launchAsyncPipeline() {
         val modeAtStart = selectedComputeMode
+        val modelAtStart = selectedModelType
+        val targetSizeAtStart = selectedTargetSize
         val generationAtStart = modeGeneration
         backgroundInitExecutor.execute {
-            Log.i(TAG, "Ładowanie YOLO11 backend=" + computeModeLabel(modeAtStart) + " w tle...")
+            Log.i(TAG, "Ładowanie " + modelLabel(modelAtStart) + " input=" +
+                targetSizeAtStart + "x" + targetSizeAtStart + " backend=" +
+                computeModeLabel(modeAtStart) + " w tle...")
             telemetryServer.broadcastStatus(
                 "INIT_YOLO",
                 "Inicjalizacja YOLO11: " + computeModeLabel(modeAtStart)
@@ -272,7 +405,7 @@ class MainActivity : AppCompatActivity() {
 
             val startTime = SystemClock.elapsedRealtime()
             val initSuccess = try {
-                yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, modeAtStart)
+                yoloEngine.Init(assets, modelAtStart, targetSizeAtStart, modeAtStart)
             } catch (e: Exception) {
                 Log.e(TAG, "Błąd podczas init backendu " + computeModeLabel(modeAtStart), e)
                 false
@@ -282,11 +415,14 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (generationAtStart != modeGeneration) return@runOnUiThread
                 if (initSuccess) {
-                    Log.i(TAG, "YOLO11 " + computeModeLabel(modeAtStart) + " Init sukces w " + loadDuration + "ms")
+                    Log.i(TAG, modelLabel(modelAtStart) + " input=" + targetSizeAtStart +
+                        " backend=" + computeModeLabel(modeAtStart) + " Init sukces w " + loadDuration + "ms")
                     isYoloReady.set(true)
                     telemetryServer.broadcastStatus(
                         "YOLO_READY",
-                        computeModeLabel(modeAtStart) + " gotowy (" + loadDuration + "ms)"
+                        modelLabel(modelAtStart) + " " + targetSizeAtStart + "x" +
+                            targetSizeAtStart + " / " + computeModeLabel(modeAtStart) +
+                            " gotowy (" + loadDuration + "ms)"
                     )
                     startCamera2()
                 } else {
@@ -904,6 +1040,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "Mower_Vision_Core"
+        private const val TARGET_SIZE_MIN = 320
+        private const val TARGET_SIZE_MAX = 480
+        private const val TARGET_SIZE_STEP = 32
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,
