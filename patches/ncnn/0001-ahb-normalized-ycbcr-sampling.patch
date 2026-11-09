@@ -1,0 +1,94 @@
+--- a/src/pipeline.cpp
++++ b/src/pipeline.cpp
+@@ -471,21 +471,25 @@
+ {
+     VkResult ret;
+ 
+-    VkExternalFormatANDROID externalFormatANDROID;
+-    externalFormatANDROID.sType = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
+-    externalFormatANDROID.pNext = 0;
+-    externalFormatANDROID.externalFormat = ahb_im_allocator->external_format();
++    const VkFormatFeatureFlags format_features = ahb_im_allocator->bufferFormatProperties.formatFeatures;
++    const bool supports_linear_chroma = (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT) != 0;
++    const bool supports_separate_filter = (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT) != 0;
++    const bool supports_linear_sampler = (format_features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
++
++    const VkFilter chroma_filter = supports_linear_chroma ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    const VkFilter sampler_filter = supports_separate_filter && need_resize && supports_linear_sampler
++        ? VK_FILTER_LINEAR : chroma_filter;
+ 
+     VkSamplerYcbcrConversionInfoKHR samplerYcbcrConversionInfo;
+     samplerYcbcrConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR;
+-    samplerYcbcrConversionInfo.pNext = &externalFormatANDROID;
++    samplerYcbcrConversionInfo.pNext = 0;
+     samplerYcbcrConversionInfo.conversion = ahb_im_allocator->samplerYcbcrConversion;
+ 
+     VkSamplerCreateInfo samplerCreateInfo;
+     samplerCreateInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+     samplerCreateInfo.pNext = &samplerYcbcrConversionInfo;
+-    samplerCreateInfo.magFilter = need_resize ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+-    samplerCreateInfo.minFilter = need_resize ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    samplerCreateInfo.magFilter = sampler_filter;
++    samplerCreateInfo.minFilter = sampler_filter;
+     samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+     samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+     samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+@@ -498,7 +502,7 @@
+     samplerCreateInfo.minLod = 0.0f;
+     samplerCreateInfo.maxLod = 0.0f;
+     samplerCreateInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK; //VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE; FIXME
+-    samplerCreateInfo.unnormalizedCoordinates = VK_TRUE;                     //VK_FALSE; FIXME ?
++    samplerCreateInfo.unnormalizedCoordinates = VK_FALSE;
+ 
+     ret = vkCreateSampler(vkdev->vkdevice(), &samplerCreateInfo, 0, &sampler);
+     if (ret != VK_SUCCESS)
+--- a/src/allocator.cpp
++++ b/src/allocator.cpp
+@@ -2404,7 +2404,7 @@
+ 
+     VkSamplerYcbcrConversionInfoKHR samplerYcbcrConversionInfo;
+     samplerYcbcrConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR;
+-    samplerYcbcrConversionInfo.pNext = &externalFormat;
++    samplerYcbcrConversionInfo.pNext = 0;
+     samplerYcbcrConversionInfo.conversion = samplerYcbcrConversion;
+ 
+     VkImageViewCreateInfo imageViewCreateInfo;
+@@ -2491,7 +2491,9 @@
+     samplerYcbcrConversionCreateInfo.components = bufferFormatProperties.samplerYcbcrConversionComponents;
+     samplerYcbcrConversionCreateInfo.xChromaOffset = bufferFormatProperties.suggestedXChromaOffset;
+     samplerYcbcrConversionCreateInfo.yChromaOffset = bufferFormatProperties.suggestedYChromaOffset;
+-    samplerYcbcrConversionCreateInfo.chromaFilter = VK_FILTER_NEAREST;
++    samplerYcbcrConversionCreateInfo.chromaFilter =
++        (bufferFormatProperties.formatFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT)
++            ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+     samplerYcbcrConversionCreateInfo.forceExplicitReconstruction = VK_FALSE;
+ 
+     ret = vkdev->vkCreateSamplerYcbcrConversionKHR(vkdev->vkdevice(), &samplerYcbcrConversionCreateInfo, 0, &samplerYcbcrConversion);
+--- a/src/convert_ycbcr.comp
++++ b/src/convert_ycbcr.comp
+@@ -70,17 +70,21 @@
+     {
+         if (rotate_from < 5) // 1 2 3 4
+         {
+-            pos.x = pos.x * (float(w) / outw);
+-            pos.y = pos.y * (float(h) / outh);
++            pos.x = (pos.x + 0.5f) * (float(w) / outw) - 0.5f;
++            pos.y = (pos.y + 0.5f) * (float(h) / outh) - 0.5f;
+         }
+         else // 5 6 7 8
+         {
+-            pos.x = pos.x * (float(w) / outh);
+-            pos.y = pos.y * (float(h) / outw);
++            pos.x = (pos.x + 0.5f) * (float(w) / outh) - 0.5f;
++            pos.y = (pos.y + 0.5f) * (float(h) / outw) - 0.5f;
+         }
+     }
+ 
+-    vec3 rgb = texture(android_hardware_buffer_image, pos).rgb * 255.f;
++    // YCbCr conversion samplers require normalized coordinates. The +0.5
++    // maps integer pixel coordinates to texel centers. Resize uses the same
++    // half-pixel convention as ncnn::resize_bilinear_c3().
++    const vec2 uv = (pos + vec2(0.5f)) / vec2(float(w), float(h));
++    vec3 rgb = texture(android_hardware_buffer_image, uv).rgb * 255.f;
+ 
+     const int outcstep = outw * outh / 4 * 4;
