@@ -251,6 +251,52 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
                 return -18;
             }
         }
+
+        // Prove that the selected ten blobs are the complete graph cut:
+        // no suffix layer may consume a prefix-produced blob outside this set.
+        for (size_t layer_index = 110; layer_index < net.layers().size(); ++layer_index) {
+            const ncnn::Layer* layer = net.layers()[layer_index];
+            if (!layer) return -19;
+            for (size_t bottom_index = 0; bottom_index < layer->bottoms.size(); ++bottom_index) {
+                const int blob_id = layer->bottoms[bottom_index];
+                if (blob_id < 0 || static_cast<size_t>(blob_id) >= net.blobs().size()) return -19;
+                const int producer = net.blobs()[static_cast<size_t>(blob_id)].producer;
+                if (producer >= 0 && producer <= 109) {
+                    bool is_boundary = false;
+                    for (int boundary_id : boundary_blob_ids) {
+                        if (boundary_id == blob_id) {
+                            is_boundary = true;
+                            break;
+                        }
+                    }
+                    if (!is_boundary) {
+                        LOGE("Async graph cut is incomplete: suffix layer=%zu consumes prefix blob=%d produced_by=%d",
+                             layer_index, blob_id, producer);
+                        return -20;
+                    }
+                }
+            }
+        }
+
+        for (int boundary_id : boundary_blob_ids) {
+            bool consumed_in_prefix = false;
+            bool consumed_in_suffix = false;
+            for (size_t layer_index = 1; layer_index < net.layers().size(); ++layer_index) {
+                const ncnn::Layer* layer = net.layers()[layer_index];
+                if (!layer) return -21;
+                for (int bottom_id : layer->bottoms) {
+                    if (bottom_id == boundary_id) {
+                        if (layer_index <= 109) consumed_in_prefix = true;
+                        else consumed_in_suffix = true;
+                    }
+                }
+            }
+            if (consumed_in_prefix || !consumed_in_suffix) {
+                LOGE("Async boundary blob=%d has invalid consumer placement prefix=%d suffix=%d",
+                     boundary_id, consumed_in_prefix ? 1 : 0, consumed_in_suffix ? 1 : 0);
+                return -22;
+            }
+        }
     }
                                                                                 
     if (use_vulkan_compute && !vkdev) {
