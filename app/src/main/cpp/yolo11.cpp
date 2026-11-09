@@ -261,7 +261,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
                 const int blob_id = layer->bottoms[bottom_index];
                 if (blob_id < 0 || static_cast<size_t>(blob_id) >= net.blobs().size()) return -19;
                 const int producer = net.blobs()[static_cast<size_t>(blob_id)].producer;
-                if (producer >= 0 && producer <= 109) {
+                if (producer <= 109) {
                     bool is_boundary = false;
                     for (int boundary_id : boundary_blob_ids) {
                         if (boundary_id == blob_id) {
