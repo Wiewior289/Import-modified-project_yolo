@@ -739,13 +739,13 @@ class MainActivity : AppCompatActivity() {
         isYoloReady.set(false)
         isCameraRunning.set(false)
 
+        val readerToClose = imageReader
         try {
-            imageReader?.setOnImageAvailableListener(null, null)
+            readerToClose?.setOnImageAvailableListener(null, null)
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
-            imageReader?.close()
             imageReader = null
         } catch (e: Exception) {
             Log.e(TAG, "Błąd zamykania zasobów Camera2", e)
@@ -775,6 +775,9 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "GPU frame executor did not drain; keeping native engine alive until process teardown")
                 return@Thread
             }
+
+            // Prefix workers have released their Camera2 Images at this point.
+            readerToClose?.close()
 
             cpuFrameExecutor.shutdown()
             val cpuDrained = try {
