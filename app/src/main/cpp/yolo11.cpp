@@ -188,7 +188,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     snprintf(parampath, sizeof(parampath), "yolo11%s.param", modeltype);
     snprintf(binpath, sizeof(binpath), "yolo11%s.bin", modeltype);
 
-    LOGI("Loading YOLO11: %s, %s (target_size: %dx%d, compute_mode=%d)", 
+    LOGI("Loading YOLO11: %s, %s (target_size: %dx%d, compute_mode=%d)",
          parampath, binpath, target_w, target_h, compute_mode);
 
     int ret_param = net.load_param(mgr, parampath);
@@ -197,11 +197,11 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -2;
     }
 
-    int ret_bin = net.load_model(mgr, binpath);                                 
-    if (ret_bin != 0) {                                                         
-        LOGE("Failed to load model: %s (code %d)", binpath, ret_bin);           
-        return -3;                                                              
-    }                                                                           
+    int ret_bin = net.load_model(mgr, binpath);
+    if (ret_bin != 0) {
+        LOGE("Failed to load model: %s (code %d)", binpath, ret_bin);
+        return -3;
+    }
 
     if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
         cpu_net.opt.use_vulkan_compute = false;
@@ -298,7 +298,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             }
         }
     }
-                                                                                
+
     if (use_vulkan_compute && !vkdev) {
         LOGE("Vulkan initialization did not complete");
         return -5;
