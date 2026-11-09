@@ -24,7 +24,9 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicIntegerArray
 
 /**
  * ============================================================================
@@ -44,6 +46,8 @@ class MainActivity : AppCompatActivity() {
     private var modeSelectorInitialized = false
     private lateinit var telemetryServer: TelemetryServer
     private lateinit var backgroundInitExecutor: ExecutorService
+    private lateinit var gpuFrameExecutor: ExecutorService
+    private lateinit var cpuFrameExecutor: ExecutorService
 
     // Camera2 background thread & components
     private var cameraThread: HandlerThread? = null
@@ -56,6 +60,8 @@ class MainActivity : AppCompatActivity() {
     // Pre-allocated flat buffer: 1 count float + 64 detections * 7 floats (449 floats)
     // ZERO HEAP ALLOCATIONS ON THE FRAME LOOP!
     private val detectionBuffer = FloatArray(1 + 64 * 7)
+    private val asyncDetectionBuffers = Array(2) { FloatArray(1 + 64 * 7) }
+    private val asyncSlotBusy = AtomicIntegerArray(2)
 
     @Volatile private var confThreshold: Float = 0.25f
     @Volatile private var nmsThreshold: Float = 0.45f
@@ -72,6 +78,8 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         backgroundInitExecutor = Executors.newSingleThreadExecutor()
+        gpuFrameExecutor = Executors.newSingleThreadExecutor()
+        cpuFrameExecutor = Executors.newSingleThreadExecutor()
 
         // Start telemetry before installing the selector, so an early spinner
         // callback can safely report a mode change.
@@ -105,7 +113,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun installComputeModeSelector() {
-        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB")
+        val labels = listOf("CPU", "GPU Vulkan", "GPU Vulkan + AHB", "GPU AHB + CPU suffix (N/N+1)")
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 16, 20, 8)
@@ -144,11 +152,13 @@ class MainActivity : AppCompatActivity() {
         Yolo11Ncnn.COMPUTE_CPU -> "CPU"
         Yolo11Ncnn.COMPUTE_VULKAN -> "GPU Vulkan"
         Yolo11Ncnn.COMPUTE_VULKAN_AHB -> "GPU Vulkan + AHB"
+        Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC -> "GPU AHB + CPU suffix (N/N+1)"
         else -> "UNKNOWN($mode)"
     }
 
     private fun closeCameraForModeSwitch() {
         try {
+            imageReader?.setOnImageAvailableListener(null, null)
             captureSession?.close()
             captureSession = null
             cameraDevice?.close()
@@ -159,8 +169,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchComputeMode(newMode: Int) {
-        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB ||
-            newMode == selectedComputeMode) return
+        val previousMode = selectedComputeMode
+        if (newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC ||
+            newMode == previousMode) return
 
         selectedComputeMode = newMode
         val generation = ++modeGeneration
@@ -172,44 +183,59 @@ class MainActivity : AppCompatActivity() {
             "Przełączanie backendu na " + computeModeLabel(newMode)
         )
 
-        // The same single-thread executor serializes mode changes after any in-flight frame.
-        backgroundInitExecutor.execute {
-            fpsWindowStartMs = 0L
-            fpsWindowFrames = 0
-            currentFps = 0f
-            yoloEngine.Destroy()
-            val startedAt = SystemClock.elapsedRealtime()
-            val initialized = try {
-                yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
-            } catch (e: Exception) {
-                Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
-                false
-            }
-            val durationMs = SystemClock.elapsedRealtime() - startedAt
+        val enqueueReinitialization = {
+            backgroundInitExecutor.execute {
+                fpsWindowStartMs = 0L
+                fpsWindowFrames = 0
+                currentFps = 0f
+                yoloEngine.Destroy()
+                val startedAt = SystemClock.elapsedRealtime()
+                val initialized = try {
+                    yoloEngine.Init(assets, Yolo11Ncnn.MODEL_YOLO11N, 320, newMode)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd inicjalizacji backendu " + computeModeLabel(newMode), e)
+                    false
+                }
+                val durationMs = SystemClock.elapsedRealtime() - startedAt
 
-            runOnUiThread {
-                if (generation != modeGeneration) return@runOnUiThread
-                // The executor has drained the prior frame. Detach the old reader
-                // callback before closing the reader and opening the next session.
-                imageReader?.setOnImageAvailableListener(null, null)
-                imageReader?.close()
-                imageReader = null
-                if (initialized) {
-                    isYoloReady.set(true)
-                    Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
-                    telemetryServer.broadcastStatus(
-                        "COMPUTE_MODE_READY",
-                        computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
-                    )
-                    startCamera2()
-                } else {
-                    isYoloReady.set(false)
-                    telemetryServer.broadcastStatus(
-                        "ERROR_COMPUTE_MODE",
-                        "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
-                    )
+                runOnUiThread {
+                    if (generation != modeGeneration) return@runOnUiThread
+                    imageReader?.setOnImageAvailableListener(null, null)
+                    imageReader?.close()
+                    imageReader = null
+                    if (initialized) {
+                        isYoloReady.set(true)
+                        Log.i(TAG, "Backend " + computeModeLabel(newMode) + " gotowy w " + durationMs + "ms")
+                        telemetryServer.broadcastStatus(
+                            "COMPUTE_MODE_READY",
+                            computeModeLabel(newMode) + " gotowy (" + durationMs + "ms)"
+                        )
+                        startCamera2()
+                    } else {
+                        isYoloReady.set(false)
+                        telemetryServer.broadcastStatus(
+                            "ERROR_COMPUTE_MODE",
+                            "Nie udało się uruchomić backendu " + computeModeLabel(newMode)
+                        )
+                    }
                 }
             }
+        }
+
+        if (previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC) {
+            // Camera callbacks are serialized on cameraHandler. This barrier runs
+            // after any callback already in progress, then drains GPU prefixes,
+            // then CPU suffixes, before the native engine is destroyed.
+            val detachAndDrain = {
+                imageReader?.setOnImageAvailableListener(null, null)
+                gpuFrameExecutor.execute {
+                    cpuFrameExecutor.execute { enqueueReinitialization() }
+                }
+            }
+            val handler = cameraHandler
+            if (handler != null) handler.post { detachAndDrain() } else detachAndDrain()
+        } else {
+            enqueueReinitialization()
         }
     }
 
@@ -288,6 +314,97 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun reserveAsyncSlot(): Int {
+        for (slot in 0..1) {
+            if (asyncSlotBusy.compareAndSet(slot, 0, 1)) return slot
+        }
+        return -1
+    }
+
+    private fun queueAsyncFrame(image: android.media.Image, frameId: Long, imageTimestampNs: Long, rotateType: Int) {
+        val slot = reserveAsyncSlot()
+        if (slot < 0) {
+            image.close()
+            return
+        }
+
+        try {
+            gpuFrameExecutor.execute {
+                var prefixRet = -1
+                val hwBuffer = image.hardwareBuffer
+                try {
+                    if (hwBuffer == null) {
+                        prefixRet = -70
+                    } else {
+                        prefixRet = yoloEngine.PrefixFrame(
+                            hwBuffer, slot, rotateType, frameId, imageTimestampNs
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "GPU prefix exception frame=$frameId slot=$slot", e)
+                    prefixRet = -71
+                } finally {
+                    hwBuffer?.close()
+                    image.close()
+                }
+
+                if (prefixRet != 0) {
+                    Log.e(TAG, "GPU prefix failed frame=$frameId slot=$slot ret=$prefixRet")
+                    asyncSlotBusy.set(slot, 0)
+                    return@execute
+                }
+
+                try {
+                    cpuFrameExecutor.execute {
+                        val output = asyncDetectionBuffers[slot]
+                        output.fill(0f)
+                        var suffixRet = -1
+                        try {
+                            suffixRet = yoloEngine.SuffixFrame(
+                                slot, output, confThreshold, nmsThreshold
+                            )
+                            updateProcessingFps()
+                            val count = suffixRet.coerceAtLeast(0)
+                            val topScore = if (suffixRet >= 0) yoloEngine.GetTopScore() else 0f
+                            val topClass = if (suffixRet >= 0) yoloEngine.GetTopClass() else -1
+
+                            if (frameId % 30L == 0L) {
+                                Log.i(TAG, "ASYNC_FRAME frame=$frameId slot=$slot imageTs=$imageTimestampNs " +
+                                    "FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
+                                    " detections=$count top=" +
+                                    String.format(java.util.Locale.US, "%.3f", topScore) +
+                                    " class=$topClass")
+                            }
+                            if (suffixRet < 0) {
+                                Log.e(TAG, "CPU suffix failed frame=$frameId slot=$slot ret=$suffixRet")
+                            }
+                            val jsonPayload = buildJson(
+                                count, output, currentFps, topScore, topClass, frameId, imageTimestampNs
+                            )
+                            try {
+                                telemetryServer.sendDetections(jsonPayload)
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Błąd wysyłania telemetrii async", e)
+                            }
+                            sendToSTM32(count, output, false)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "CPU suffix exception frame=$frameId slot=$slot", e)
+                        } finally {
+                            asyncSlotBusy.set(slot, 0)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Nie udało się zakolejkować CPU suffix frame=$frameId", e)
+                    asyncSlotBusy.set(slot, 0)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Nie udało się zakolejkować GPU prefix frame=$frameId", e)
+            image.close()
+            asyncSlotBusy.set(slot, 0)
+        }
+    }
+
     private fun startCamera2() {
         startCameraThread()
         val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -353,26 +470,35 @@ class MainActivity : AppCompatActivity() {
             )
 
             imageReader?.setOnImageAvailableListener({ reader ->
-                if (!isYoloReady.get() || isProcessingFrame.get()) {
+                if (!isYoloReady.get() ||
+                    (selectedComputeMode != Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC && isProcessingFrame.get())) {
                     reader.acquireLatestImage()?.close()
                     return@setOnImageAvailableListener
                 }
 
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
-                isProcessingFrame.set(true)
                 val frameId = ++frameSequence
                 val imageTimestampNs = image.timestamp
-                if(frameId%30L==0L)Log.i(TAG,"CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs size=${image.width}x${image.height} crop=${image.cropRect}")
+                if (frameId % 30L == 0L) Log.i(TAG, "CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs size=${image.width}x${image.height} crop=${image.cropRect}")
+                val rotateType = when (sensorOrientation) {
+                    90 -> 6
+                    180 -> 3
+                    270 -> 8
+                    else -> 1
+                }
+
+                if (selectedComputeMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC) {
+                    queueAsyncFrame(image, frameId, imageTimestampNs, rotateType)
+                    return@setOnImageAvailableListener
+                }
+
+                if (!isProcessingFrame.compareAndSet(false, true)) {
+                    image.close()
+                    return@setOnImageAvailableListener
+                }
 
                 backgroundInitExecutor.execute {
                     try {
-                        val rotateType = when (sensorOrientation) {
-                            90 -> 6
-                            180 -> 3
-                            270 -> 8
-                            else -> 1
-                        }
-
                         detectionBuffer.fill(0f)
                         var rawCount = -1
                         val hwBuffer = image.hardwareBuffer
