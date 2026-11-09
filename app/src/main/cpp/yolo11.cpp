@@ -1136,9 +1136,9 @@ int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh
     }
 
     for (auto& boundary : slot.boundary) boundary.release();
-    slot.state = AsyncFrameSlot::FREE;
 
     if (execute_ret != 0 || out.empty()) {
+        slot.state = AsyncFrameSlot::FREE;
         LOGE("Async CPU suffix failed frame=%lld slot=%d ret=%d",
              static_cast<long long>(frame_id), slot_index, execute_ret);
         return execute_ret != 0 ? execute_ret : -44;
@@ -1155,6 +1155,7 @@ int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh
              static_cast<long long>(frame_id), slot_index, objects.size(),
              last_top_score, last_top_class);
     }
+    slot.state = AsyncFrameSlot::FREE;
     return 0;
 }
 
