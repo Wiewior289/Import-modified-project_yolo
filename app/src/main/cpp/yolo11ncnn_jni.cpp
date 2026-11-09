@@ -118,8 +118,9 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
     }
 
     AHardwareBuffer_acquire(ahb);
-    std::vector<Object> objects;
-    objects.reserve(64);
+    static thread_local std::vector<Object> objects;
+    objects.clear();
+    if (objects.capacity() < 64) objects.reserve(64);
     const int ret = engine->detect_frame(ahb, conf_thresh, nms_thresh, objects,
         rotate_type, static_cast<int64_t>(frame_id), static_cast<int64_t>(image_timestamp_ns));
     AHardwareBuffer_release(ahb);
@@ -160,8 +161,9 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_SuffixFrame(
     std::shared_ptr<Yolo11> engine = acquire_engine();
     if (!engine || !engine->is_ready()) return -61;
 
-    std::vector<Object> objects;
-    objects.reserve(64);
+    static thread_local std::vector<Object> objects;
+    objects.clear();
+    if (objects.capacity() < 64) objects.reserve(64);
     const int ret = engine->cpu_suffix_frame(slot_index, conf_thresh, nms_thresh, objects);
     if (ret != 0) return ret;
     return copy_detections(env, out_buffer_obj, *engine, objects);
