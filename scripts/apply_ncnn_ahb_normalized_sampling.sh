@@ -2,9 +2,9 @@
 set -euo pipefail
 
 EXPECTED_SHA="6a1bf000f363714839a36793addc8c879d3d899e"
-SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-PATCH_FILE="\${SCRIPT_DIR}/../patches/ncnn/0001-ahb-normalized-ycbcr-sampling.patch"
-ROOT="\${1:-$PWD}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_FILE="${SCRIPT_DIR}/../patches/ncnn/0001-ahb-normalized-ycbcr-sampling.patch"
+ROOT="${1:-$PWD}"
 ROOT="$(cd "$ROOT" && pwd)"
 
 if [[ ! -f "$ROOT/src/pipeline.cpp" || ! -f "$ROOT/src/allocator.cpp" || ! -f "$ROOT/src/convert_ycbcr.comp" ]]; then
@@ -14,7 +14,7 @@ fi
 
 ACTUAL_SHA="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
 if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-    echo "ERROR: oczekiwany NCNN commit $EXPECTED_SHA, otrzymano \${ACTUAL_SHA:-<brak git>}." >&2
+    echo "ERROR: oczekiwany NCNN commit $EXPECTED_SHA, otrzymano ${ACTUAL_SHA:-<brak git>}." >&2
     echo "Patch nie został zastosowany." >&2
     exit 3
 fi
