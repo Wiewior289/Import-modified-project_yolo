@@ -69,7 +69,7 @@ static size_t tensor_scalar_count(const ncnn::Mat& m)
     const size_t h = m.dims >= 2 ? static_cast<size_t>(m.h) : 1u;
     const size_t d = m.dims >= 3 ? static_cast<size_t>(m.d) : 1u;
     const size_t c = m.dims >= 3 ? static_cast<size_t>(m.c) : 1u;
-    const size_t n = m.dims == 4 ? static_cast<size_t>(m.n) : 1u;
+    const size_t n = static_cast<size_t>(m.n);
     return w * h * d * c * n * static_cast<size_t>(m.elempack);
 }
 
@@ -86,13 +86,12 @@ static const unsigned char* tensor_scalar_ptr(const ncnn::Mat& m, size_t scalar_
     const size_t packed_element = within / pack;
     const size_t lane = within % pack;
 
-    size_t element_offset = packed_element;
-    if (m.dims >= 3) {
-        const size_t channels_per_batch = static_cast<size_t>(m.c);
-        const size_t batch = channel_index / channels_per_batch;
-        const size_t channel = channel_index % channels_per_batch;
-        element_offset = batch * m.nstep + channel * m.cstep + packed_element;
-    }
+    const size_t channels_per_batch = m.dims >= 3 ? static_cast<size_t>(m.c) : 1u;
+    const size_t batch = channel_index / channels_per_batch;
+    const size_t channel = channel_index % channels_per_batch;
+    const size_t element_offset = batch * m.nstep +
+                                  (m.dims >= 3 ? channel * m.cstep : 0u) +
+                                  packed_element;
     return static_cast<const unsigned char*>(m.data) + element_offset * m.elemsize + lane * scalar_bytes;
 }
 
