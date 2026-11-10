@@ -702,7 +702,14 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     const float mean_vals[3] = {0.f, 0.f, 0.f};
     const float norm_vals[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
     input.substract_mean_normalize(mean_vals, norm_vals);
-    if (snapshot) snapshot->input_after_norm = input.clone();
+    if (snapshot) {
+        snapshot->input_after_norm = input.clone();
+        if (net.opt.use_fp16_storage || net.opt.use_fp16_packed) {
+            ncnn::cast_float32_to_float16(input, snapshot->input_after_cast, ncnn::Option());
+        } else {
+            snapshot->input_after_cast = input.clone();
+        }
+    }
     const double preprocess_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - preprocess_start).count();
 
@@ -826,7 +833,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     log_compare_tensor("RGB_0_255",ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
     log_rgb_samples(ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
     log_compare_tensor("INPUT_NORMALIZED_FP32",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
-    log_single_tensor("AHB_INPUT_AFTER_CAST",ahb_snapshot.input_after_cast,frame_id,image_timestamp_ns);
+    log_compare_tensor("INPUT_AFTER_CAST",ahb_snapshot.input_after_cast,cpu_snapshot.input_after_cast,frame_id,image_timestamp_ns);
     log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
     log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
     log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
