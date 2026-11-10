@@ -56,6 +56,124 @@ static void log_vkmat(const char*name,const ncnn::VkMat&m,int64_t frame,int64_t 
  (long long)frame,(long long)ts,name,m.empty()?1:0,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,m.total(),
  (const void*)m.data,(const void*)m.allocator,m.buffer_offset(),m.buffer_capacity());
 }
+
+struct CompareStats {
+    bool valid = false;
+    size_t count = 0, finite = 0, nonfinite = 0;
+    double min_value = 0.0, max_value = 0.0, mean = 0.0, stddev = 0.0;
+};
+
+static const unsigned char* tensor_scalar_ptr(const ncnn::Mat& m, size_t scalar_index)
+{
+    const size_t pack = static_cast<size_t>(m.elempack);
+    const size_t scalar_bytes = m.elemsize / pack;
+    const size_t w = static_cast<size_t>(m.w);
+    const size_t h = m.dims >= 2 ? static_cast<size_t>(m.h) : 1u;
+    const size_t d = m.dims >= 3 ? static_cast<size_t>(m.d) : 1u;
+    const size_t spatial = w * h * d;
+    const size_t channel_scalars = spatial * pack;
+    const size_t channel = scalar_index / channel_scalars;
+    const size_t within = scalar_index % channel_scalars;
+    const size_t packed_element = within / pack;
+    const size_t lane = within % pack;
+    const size_t element_offset = (m.dims >= 3 ? channel * m.cstep : 0u) + packed_element;
+    return static_cast<const unsigned char*>(m.data) + element_offset * m.elemsize + lane * scalar_bytes;
+}
+
+static CompareStats measure_tensor(const ncnn::Mat& m)
+{
+    CompareStats st;
+    if (m.empty() || !m.data || m.elempack <= 0 || m.elemsize == 0 ||
+        (m.elemsize % static_cast<size_t>(m.elempack)) != 0) return st;
+    const size_t scalar_bytes = m.elemsize / static_cast<size_t>(m.elempack);
+    if (scalar_bytes != 1 && scalar_bytes != 2 && scalar_bytes != 4) return st;
+    st.count = m.total() * static_cast<size_t>(m.elempack);
+    if (st.count == 0) return st;
+
+    st.min_value = std::numeric_limits<double>::infinity();
+    st.max_value = -std::numeric_limits<double>::infinity();
+    double sum = 0.0, sum_sq = 0.0;
+    for (size_t i = 0; i < st.count; ++i) {
+        const float v = tensor_value(tensor_scalar_ptr(m, i), scalar_bytes);
+        if (!std::isfinite(v)) { ++st.nonfinite; continue; }
+        ++st.finite;
+        st.min_value = std::min(st.min_value, static_cast<double>(v));
+        st.max_value = std::max(st.max_value, static_cast<double>(v));
+        sum += v;
+        sum_sq += static_cast<double>(v) * v;
+    }
+    if (!st.finite) return st;
+    st.mean = sum / static_cast<double>(st.finite);
+    st.stddev = std::sqrt(std::max(0.0, sum_sq / static_cast<double>(st.finite) - st.mean * st.mean));
+    st.valid = true;
+    return st;
+}
+
+static void log_compare_tensor(const char* name, const ncnn::Mat& a, const ncnn::Mat& b,
+                               int64_t frame_id, int64_t image_timestamp_ns)
+{
+    const CompareStats sa = measure_tensor(a), sb = measure_tensor(b);
+    LOGI("AHBCMP_TENSOR frame=%lld ts=%lld name=%s A(shape=%d:%d,%d,%d,%d es=%zu pack=%d n=%zu min=%.6g max=%.6g mean=%.6g std=%.6g nf=%zu) B(shape=%d:%d,%d,%d,%d es=%zu pack=%d n=%zu min=%.6g max=%.6g mean=%.6g std=%.6g nf=%zu)",
+         (long long)frame_id, (long long)image_timestamp_ns, name,
+         a.dims,a.w,a.h,a.d,a.c,a.elemsize,a.elempack,sa.count,
+         sa.valid?sa.min_value:0.0,sa.valid?sa.max_value:0.0,sa.valid?sa.mean:0.0,sa.valid?sa.stddev:0.0,sa.nonfinite,
+         b.dims,b.w,b.h,b.d,b.c,b.elemsize,b.elempack,sb.count,
+         sb.valid?sb.min_value:0.0,sb.valid?sb.max_value:0.0,sb.valid?sb.mean:0.0,sb.valid?sb.stddev:0.0,sb.nonfinite);
+
+    if (!sa.valid || !sb.valid || sa.count != sb.count) {
+        LOGW("AHBCMP_DIFF frame=%lld ts=%lld name=%s status=INCOMPATIBLE A_valid=%d B_valid=%d A_count=%zu B_count=%zu",
+             (long long)frame_id,(long long)image_timestamp_ns,name,sa.valid?1:0,sb.valid?1:0,sa.count,sb.count);
+        return;
+    }
+    const size_t ba=a.elemsize/static_cast<size_t>(a.elempack);
+    const size_t bb=b.elemsize/static_cast<size_t>(b.elempack);
+    double abs_sum=0.0,sq_sum=0.0,dot=0.0,norm_a=0.0,norm_b=0.0,max_abs=0.0;
+    size_t compared=0,nonfinite=0;
+    for(size_t i=0;i<sa.count;i++){
+        const double va=tensor_value(tensor_scalar_ptr(a,i),ba);
+        const double vb=tensor_value(tensor_scalar_ptr(b,i),bb);
+        if(!std::isfinite(va)||!std::isfinite(vb)){++nonfinite;continue;}
+        const double d=std::fabs(va-vb);
+        abs_sum+=d;sq_sum+=d*d;max_abs=std::max(max_abs,d);
+        dot+=va*vb;norm_a+=va*va;norm_b+=vb*vb;++compared;
+    }
+    const double mae=compared?abs_sum/compared:0.0;
+    const double rmse=compared?std::sqrt(sq_sum/compared):0.0;
+    const double cosine=(norm_a>0.0&&norm_b>0.0)?dot/std::sqrt(norm_a*norm_b):0.0;
+    LOGI("AHBCMP_DIFF frame=%lld ts=%lld name=%s count=%zu compared=%zu nonfinite=%zu mae=%.7g rmse=%.7g max=%.7g cosine=%.9g",
+         (long long)frame_id,(long long)image_timestamp_ns,name,sa.count,compared,nonfinite,mae,rmse,max_abs,cosine);
+}
+
+static void log_rgb_samples(const ncnn::Mat& a, const ncnn::Mat& b,
+                            int64_t frame_id, int64_t image_timestamp_ns)
+{
+    if(a.empty()||b.empty()||a.w!=b.w||a.h!=b.h||a.c<3||b.c<3||a.elempack!=1||b.elempack!=1){
+        LOGW("AHBCMP_RGB_SAMPLES frame=%lld ts=%lld status=UNAVAILABLE",(long long)frame_id,(long long)image_timestamp_ns);return;
+    }
+    const int w=a.w,h=a.h;
+    const int xy[8][2]={{0,0},{w/4,h/4},{w/2,h/2},{3*w/4,h/4},{w/4,3*h/4},{3*w/4,3*h/4},{w-1,h-1},{w/2,h/4}};
+    std::ostringstream line;line<<"AHBCMP_RGB_SAMPLES frame="<<frame_id<<" ts="<<image_timestamp_ns;
+    for(int i=0;i<8;i++){
+        const size_t p=static_cast<size_t>(xy[i][1])*w+xy[i][0];
+        line<<" P"<<i<<"("<<xy[i][0]<<","<<xy[i][1]<<") A=";
+        for(int c=0;c<3;c++){if(c)line<<",";line<<tensor_value(tensor_scalar_ptr(a,static_cast<size_t>(c)*w*h+p),a.elemsize);}
+        line<<" B=";
+        for(int c=0;c<3;c++){if(c)line<<",";line<<tensor_value(tensor_scalar_ptr(b,static_cast<size_t>(c)*w*h+p),b.elemsize);}
+    }
+    LOGI("%s",line.str().c_str());
+}
+
+static void log_compare_detections(const char* name,const std::vector<Object>& objects,
+                                   float top_score,int top_class,int64_t frame_id,int64_t image_timestamp_ns)
+{
+    std::ostringstream line;line<<"AHBCMP_DET frame="<<frame_id<<" ts="<<image_timestamp_ns
+        <<" path="<<name<<" count="<<objects.size()<<" top="<<top_score<<" class="<<top_class<<" first=";
+    const size_t count=std::min<size_t>(objects.size(),5);
+    for(size_t i=0;i<count;i++){const Object&o=objects[i];if(i)line<<";";
+        line<<o.label<<":"<<o.prob<<":"<<o.x<<","<<o.y<<","<<o.w<<","<<o.h;}
+    LOGI("%s",line.str().c_str());
+}
+
 static std::string blob_edges(const std::vector<int>&ids,const std::vector<ncnn::Blob>&blobs){
  std::ostringstream o;o<<"[";for(size_t i=0;i<ids.size();i++){if(i)o<<";";int id=ids[i];if(id<0||(size_t)id>=blobs.size()){o<<id<<":INVALID";continue;}
  const ncnn::Blob&b=blobs[(size_t)id];o<<id<<":"<<b.name<<"{p="<<b.producer<<",c="<<b.consumer<<",shape="<<b.shape.w<<"x"<<b.shape.h<<"x"<<b.shape.d<<"x"<<b.shape.c<<",es="<<b.shape.elemsize<<",pack="<<b.shape.elempack<<"}";}
@@ -66,7 +184,7 @@ static std::string blob_edges(const std::vector<int>&ids,const std::vector<ncnn:
 Yolo11::Yolo11()
     : vkdev(nullptr), scale_layer(nullptr), ahb_cache_clock(0),
       ahb_cache_hits(0), ahb_cache_misses(0), ahb_cache_evictions(0),
-      ahb_cache_rotate_rebuilds(0),
+      ahb_cache_rotate_rebuilds(0), ahb_compare_samples_done(0),
       target_w(320), target_h(320), num_classes(80),
       model_loaded(false), use_vulkan_compute(true), compute_mode(YOLO_COMPUTE_VULKAN_AHB),
       last_top_score(0.0f), last_top_class(-1)
@@ -113,6 +231,7 @@ void Yolo11::clear_ahb_cache()
     ahb_cache_misses = 0;
     ahb_cache_evictions = 0;
     ahb_cache_rotate_rebuilds = 0;
+    ahb_compare_samples_done = 0;
 }
 
 int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int requested_compute_mode)
@@ -140,12 +259,13 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     target_w = target_size;
     target_h = target_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
-        requested_compute_mode > YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+        requested_compute_mode > YOLO_COMPUTE_AHB_COMPARE) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
         return -4;
     }
 
     compute_mode = requested_compute_mode;
+    ahb_compare_samples_done = 0;
     use_vulkan_compute = (compute_mode != YOLO_COMPUTE_CPU);
     model_loaded = false;
     last_top_score = 0.0f;
@@ -164,7 +284,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             return -4;
         }
 
-        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
             LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
@@ -207,7 +327,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -3;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
         cpu_net.opt.use_vulkan_compute = false;
         cpu_net.opt.use_fp16_packed = false;
         cpu_net.opt.use_fp16_storage = false;
@@ -308,7 +428,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -5;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
@@ -443,11 +563,12 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
 
 int Yolo11::detect_frame(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns){
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode==YOLO_COMPUTE_VULKAN_AHB_ASYNC)return -13;
+ if(compute_mode==YOLO_COMPUTE_AHB_COMPARE)return detect_ahb_compare(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  return detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
 }
 
-int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns)
+int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot)
 {
     last_top_score = 0.0f;
     last_top_class = -1;
@@ -487,6 +608,9 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     const auto& yp = planes.planes[0];
     const auto& cbp = planes.planes[1];
     const auto& crp = planes.planes[2];
+    if (snapshot) LOGI("AHBCMP_YUV frame=%lld ts=%lld size=%ux%u Y(rs=%u ps=%u) U(rs=%u ps=%u) V(rs=%u ps=%u) planes=%u",
+        (long long)frame_id,(long long)image_timestamp_ns,desc.width,desc.height,
+        yp.rowStride,yp.pixelStride,cbp.rowStride,cbp.pixelStride,crp.rowStride,crp.pixelStride,planes.planeCount);
     if (!yp.data || !cbp.data || !crp.data ||
         yp.rowStride == 0 || cbp.rowStride == 0 || crp.rowStride == 0 ||
         yp.pixelStride == 0 || cbp.pixelStride == 0 || crp.pixelStride == 0) {
@@ -544,9 +668,11 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
         LOGE("CPU YUV preprocess produced an empty NCNN Mat");
         return -8;
     }
+    if (snapshot) snapshot->rgb_0_255 = input.clone();
     const float mean_vals[3] = {0.f, 0.f, 0.f};
     const float norm_vals[3] = {1.f / 255.f, 1.f / 255.f, 1.f / 255.f};
     input.substract_mean_normalize(mean_vals, norm_vals);
+    if (snapshot) snapshot->input_after_norm = input.clone();
     const double preprocess_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - preprocess_start).count();
 
@@ -609,10 +735,68 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
              preprocess_ms,infer_extract_ms,post_ms,frame_ms,out.w,out.h,out.elemsize,out.elempack,
              proposal_scratchpad.size(),objects.size(),last_top_score,last_top_class);
     }
+    if (snapshot) {
+        snapshot->out0=out; snapshot->detections=objects;
+        snapshot->top_score=last_top_score; snapshot->top_class=last_top_class;
+    }
     return 0;
 }
 
-int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns)
+
+int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,
+                               std::vector<Object>& objects,int rotate_type,
+                               int64_t frame_id,int64_t image_timestamp_ns)
+{
+    static const int64_t sample_interval=30;
+    static const uint32_t max_samples=10;
+    if (frame_id<=0 || frame_id%sample_interval!=0 || ahb_compare_samples_done>=max_samples)
+        return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
+
+    ++ahb_compare_samples_done;
+    const uint32_t sample_number=ahb_compare_samples_done;
+    AhbCompareSnapshot ahb_snapshot,cpu_snapshot;
+    std::vector<Object> ahb_objects,cpu_objects;
+    const int original_mode=compute_mode;
+    struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
+
+    AHardwareBuffer_Desc frame_desc{};
+    AHardwareBuffer_describe(ahb,&frame_desc);
+    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld size=%ux%u stride=%u format=0x%x usage=0x%llx rotate=%d",
+         sample_number,(long long)frame_id,(long long)image_timestamp_ns,
+         frame_desc.width,frame_desc.height,frame_desc.stride,frame_desc.format,
+         (unsigned long long)frame_desc.usage,rotate_type);
+
+    compute_mode=YOLO_COMPUTE_VULKAN_AHB;
+    const int ret_a=detect_ahb(ahb,conf_thresh,nms_thresh,ahb_objects,rotate_type,
+                               frame_id,image_timestamp_ns,&ahb_snapshot);
+    if(ret_a!=0){
+        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_A ret=%d",sample_number,(long long)frame_id,ret_a);
+        return ret_a;
+    }
+
+    compute_mode=YOLO_COMPUTE_VULKAN;
+    const int ret_b=detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,cpu_objects,rotate_type,
+                                         frame_id,image_timestamp_ns,&cpu_snapshot);
+    if(ret_b!=0){
+        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_B ret=%d",sample_number,(long long)frame_id,ret_b);
+        return ret_b;
+    }
+
+    objects=ahb_objects;
+    last_top_score=ahb_snapshot.top_score;
+    last_top_class=ahb_snapshot.top_class;
+    log_compare_tensor("RGB_0_255",ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+    log_rgb_samples(ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+    log_compare_tensor("INPUT_NORMALIZED",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+    log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
+    log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
+    log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
+    LOGI("AHBCMP_END sample=%u frame=%lld ts=%lld status=OK",
+         sample_number,(long long)frame_id,(long long)image_timestamp_ns);
+    return 0;
+}
+
+int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot)
 {
     last_top_score = 0.0f;
     last_top_class = -1;
@@ -822,6 +1006,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             st=std::chrono::steady_clock::now();
                             vkdev->convert_packing(dst_normalized,in_gpu,pack,cast,preprocess_cmd,opt);
                             preprocess_cast_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
+                            if (snapshot) {
+                                preprocess_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
+                                preprocess_cmd.record_clone(in_gpu,snapshot->input_after_norm,opt);
+                            }
                         }
                         preprocess_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
                         preprocess_dispatches=preprocess_cmd.pending_dispatch_total();
@@ -939,6 +1127,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         }
     }
 
+    if (snapshot) {
+        snapshot->out0=out; snapshot->detections=objects;
+        snapshot->top_score=last_top_score; snapshot->top_class=last_top_class;
+    }
     return 0;
 }
 
