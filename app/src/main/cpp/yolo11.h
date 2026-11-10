@@ -200,6 +200,7 @@ private:
     int target_h;
     int num_classes;
     bool model_loaded;
+    bool cpu_net_loaded;
     bool use_vulkan_compute;
     int compute_mode;
 

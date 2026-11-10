@@ -163,6 +163,38 @@ static void log_compare_tensor(const char* name, const ncnn::Mat& a, const ncnn:
 }
 
 
+static void log_tensor_channels(const char* name,const ncnn::Mat& m,
+                                  int64_t frame_id,int64_t image_timestamp_ns)
+{
+    if(m.empty() || m.dims < 3 || m.c < 3 || m.elempack <= 0 || !m.data ||
+       m.elemsize % static_cast<size_t>(m.elempack) != 0) {
+        LOGW("AHBCMP_CHANNELS frame=%lld ts=%lld name=%s status=UNAVAILABLE dims=%d c=%d",
+             (long long)frame_id,(long long)image_timestamp_ns,name,m.dims,m.c);
+        return;
+    }
+    const size_t bytes=m.elemsize/static_cast<size_t>(m.elempack);
+    if(bytes!=1 && bytes!=2 && bytes!=4) return;
+    const size_t spatial=static_cast<size_t>(m.w)*m.h*m.d;
+    const size_t per_channel=spatial*static_cast<size_t>(m.elempack);
+    for(int channel=0;channel<std::min(m.c,4);++channel) {
+        double sum=0.0,sum_sq=0.0;
+        double mn=std::numeric_limits<double>::infinity();
+        double mx=-std::numeric_limits<double>::infinity();
+        size_t finite=0,nonfinite=0;
+        for(size_t i=0;i<per_channel;++i) {
+            const float v=tensor_value(tensor_scalar_ptr(m,static_cast<size_t>(channel)*per_channel+i),bytes);
+            if(!std::isfinite(v)){++nonfinite;continue;}
+            mn=std::min(mn,(double)v);mx=std::max(mx,(double)v);
+            sum+=v;sum_sq+=(double)v*v;++finite;
+        }
+        const double mean=finite?sum/finite:0.0;
+        const double sd=finite?std::sqrt(std::max(0.0,sum_sq/finite-mean*mean)):0.0;
+        LOGI("AHBCMP_CHANNEL frame=%lld ts=%lld name=%s c=%d count=%zu min=%.7g max=%.7g mean=%.7g std=%.7g nonfinite=%zu",
+             (long long)frame_id,(long long)image_timestamp_ns,name,channel,per_channel,
+             finite?mn:0.0,finite?mx:0.0,mean,sd,nonfinite);
+    }
+}
+
 static void log_rgb_samples(const ncnn::Mat& a, const ncnn::Mat& b,
                             int64_t frame_id, int64_t image_timestamp_ns)
 {
@@ -205,7 +237,7 @@ Yolo11::Yolo11()
       ahb_cache_hits(0), ahb_cache_misses(0), ahb_cache_evictions(0),
       ahb_cache_rotate_rebuilds(0), ahb_compare_samples_done(0),
       target_w(320), target_h(320), num_classes(80),
-      model_loaded(false), use_vulkan_compute(true), compute_mode(YOLO_COMPUTE_VULKAN_AHB),
+      model_loaded(false), cpu_net_loaded(false), use_vulkan_compute(true), compute_mode(YOLO_COMPUTE_VULKAN_AHB),
       last_top_score(0.0f), last_top_class(-1)
 {
     std::memset(dfl_distribution_scratchpad, 0, sizeof(dfl_distribution_scratchpad));
@@ -267,6 +299,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     clear_ahb_cache();
     net.clear();
     cpu_net.clear();
+    cpu_net_loaded = false;
     for (auto& slot : async_slots) {
         std::lock_guard<std::mutex> slot_lock(slot.mutex);
         for (auto& boundary : slot.boundary) boundary.release();
@@ -344,6 +377,30 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     if (ret_bin != 0) {
         LOGE("Failed to load model: %s (code %d)", binpath, ret_bin);
         return -3;
+    }
+
+    if (compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
+        cpu_net.opt.use_vulkan_compute = false;
+        cpu_net.opt.use_fp16_packed = false;
+        cpu_net.opt.use_fp16_storage = false;
+        cpu_net.opt.use_fp16_arithmetic = false;
+        cpu_net.opt.use_packing_layout = true;
+        cpu_net.opt.lightmode = true;
+        cpu_net.opt.num_threads = 4;
+
+        const int cpu_param_ret = cpu_net.load_param(mgr, parampath);
+        if (cpu_param_ret != 0) {
+            LOGE("AHBCMP CPU reference failed to load param: %s (code %d)", parampath, cpu_param_ret);
+            return -14;
+        }
+        const int cpu_model_ret = cpu_net.load_model(mgr, binpath);
+        if (cpu_model_ret != 0) {
+            LOGE("AHBCMP CPU reference failed to load model: %s (code %d)", binpath, cpu_model_ret);
+            return -15;
+        }
+        cpu_net_loaded = true;
+        LOGI("AHBCMP_CPU_NET_READY layers=%zu blobs=%zu fp16=0 vulkan=0 threads=%d",
+             cpu_net.layers().size(), cpu_net.blobs().size(), cpu_net.opt.num_threads);
     }
 
     if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
@@ -462,38 +519,41 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     scale_layer->vkdev = vkdev;
 
     ncnn::ParamDict pd;
-pd.set(0, 3); // trzy współczynniki: R, G, B
-pd.set(1, 0); // bez biasu
+    pd.set(0, 3); // RGB: one scale coefficient per channel
+    pd.set(1, 0); // no bias
 
-const int param_ret = scale_layer->load_param(pd);
-if (param_ret != 0) {
-    LOGE("Scale::load_param failed: %d", param_ret);
-    // obsłuż błąd inicjalizacji
-}
+    const int param_ret = scale_layer->load_param(pd);
+    if (param_ret != 0) {
+        LOGE("Scale::load_param failed: %d", param_ret);
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
 
-ncnn::Mat weights[1];
-weights[0].create(3);
-weights[0][0] = 1.0f / 255.0f;
-weights[0][1] = 1.0f / 255.0f;
-weights[0][2] = 1.0f / 255.0f;
-if (weights[0].empty()) {
-    LOGE("Failed to allocate Scale weights");
-    // obsłuż błąd inicjalizacji
-}
+    ncnn::Mat weights[1];
+    weights[0].create(3);
+    if (weights[0].empty()) {
+        LOGE("Failed to allocate Scale weights");
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
 
-const float inv255 = 1.f / 255.f;
-weights[0][0] = inv255;
-weights[0][1] = inv255;
-weights[0][2] = inv255;
+    const float inv255 = 1.f / 255.f;
+    weights[0][0] = inv255;
+    weights[0][1] = inv255;
+    weights[0][2] = inv255;
 
-ncnn::ModelBinFromMatArray mb(weights);
-const int model_ret = scale_layer->load_model(mb);
-if (model_ret != 0) {
-    LOGE("Scale::load_model failed: %d", model_ret);
-    // obsłuż błąd inicjalizacji
-}
+    ncnn::ModelBinFromMatArray mb(weights);
+    const int model_ret = scale_layer->load_model(mb);
+    if (model_ret != 0) {
+        LOGE("Scale::load_model failed: %d", model_ret);
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
 
-
+    ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* scale_staging_allocator = vkdev->acquire_staging_allocator();
     if (!scale_blob_allocator || !scale_staging_allocator) {
@@ -507,7 +567,12 @@ if (model_ret != 0) {
 
     int scale_init_ret = 0;
     {
+        // AHB importer writes FP32 VkMat. Scale must be compiled and upload
+        // its coefficients as FP32. The model itself remains FP16.
         ncnn::Option scale_opt = net.opt;
+        scale_opt.use_fp16_storage = false;
+        scale_opt.use_fp16_packed = false;
+        scale_opt.use_fp16_arithmetic = false;
         scale_opt.blob_vkallocator = scale_blob_allocator;
         scale_opt.staging_vkallocator = scale_staging_allocator;
 
@@ -602,6 +667,9 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     if (!ahb) return -2;
     if (compute_mode != YOLO_COMPUTE_CPU && compute_mode != YOLO_COMPUTE_VULKAN) return -3;
     if (compute_mode == YOLO_COMPUTE_VULKAN && (!use_vulkan_compute || !vkdev)) return -3;
+
+    ncnn::Net& inference_net =
+        (compute_mode == YOLO_COMPUTE_CPU && cpu_net_loaded) ? cpu_net : net;
 
     const auto frame_start = std::chrono::steady_clock::now();
     AHardwareBuffer_Desc desc{};
@@ -699,7 +767,7 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     input.substract_mean_normalize(mean_vals, norm_vals);
     if (snapshot) {
         snapshot->input_after_norm = input.clone();
-        if (net.opt.use_fp16_storage || net.opt.use_fp16_packed) {
+        if (inference_net.opt.use_fp16_storage || inference_net.opt.use_fp16_packed) {
             ncnn::cast_float32_to_float16(input, snapshot->input_after_cast, ncnn::Option());
         } else {
             snapshot->input_after_cast = input.clone();
@@ -725,7 +793,7 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     }
 
     {
-        ncnn::Extractor ex = net.create_extractor();
+        ncnn::Extractor ex = inference_net.create_extractor();
         if (compute_mode == YOLO_COMPUTE_VULKAN) {
             ex.set_blob_vkallocator(blob_allocator);
             ex.set_workspace_vkallocator(blob_allocator);
@@ -784,6 +852,11 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 {
     if (!model_loaded) return -1;
     if (!ahb) return -2;
+    if (!cpu_net_loaded) {
+        LOGE("AHBCMP requires the CPU reference Net, but it was not loaded");
+        return -3;
+    }
+
     const int original_mode=compute_mode;
     struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
 
@@ -796,48 +869,83 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 
     ++ahb_compare_samples_done;
     const uint32_t sample_number=ahb_compare_samples_done;
-    AhbCompareSnapshot ahb_snapshot,cpu_snapshot;
-    std::vector<Object> ahb_objects,cpu_objects;
+    AhbCompareSnapshot ahb_snapshot,cpu_snapshot,gpu_snapshot;
+    std::vector<Object> ahb_objects,cpu_objects,gpu_objects;
 
     AHardwareBuffer_Desc frame_desc{};
     AHardwareBuffer_describe(ahb,&frame_desc);
-    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d",
+    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d paths=CPU_YUV_CPU,CPU_YUV_VULKAN,AHB_VULKAN",
          sample_number,(long long)frame_id,(long long)image_timestamp_ns,
          frame_desc.width,frame_desc.height,target_w,target_h,frame_desc.stride,frame_desc.format,
          (unsigned long long)frame_desc.usage,rotate_type);
 
     compute_mode=YOLO_COMPUTE_VULKAN_AHB;
-    const int ret_a=detect_ahb(ahb,conf_thresh,nms_thresh,ahb_objects,rotate_type,
-                               frame_id,image_timestamp_ns,&ahb_snapshot);
-    if(ret_a!=0){
-        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_A ret=%d",sample_number,(long long)frame_id,ret_a);
-        return ret_a;
+    const int ret_ahb=detect_ahb(ahb,conf_thresh,nms_thresh,ahb_objects,rotate_type,
+                                 frame_id,image_timestamp_ns,&ahb_snapshot);
+    if(ret_ahb!=0){
+        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_AHB ret=%d",sample_number,(long long)frame_id,ret_ahb);
+        return ret_ahb;
     }
 
+    // Both baselines read the same AHardwareBuffer timestamp. CPU_YUV_CPU
+    // isolates CPU inference; CPU_YUV_VULKAN isolates Vulkan inference while
+    // preserving the exact CPU YUV preprocessing path.
+    compute_mode=YOLO_COMPUTE_CPU;
+    const int ret_cpu=detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,cpu_objects,rotate_type,
+                                           frame_id,image_timestamp_ns,&cpu_snapshot);
     compute_mode=YOLO_COMPUTE_VULKAN;
-    const int ret_b=detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,cpu_objects,rotate_type,
-                                         frame_id,image_timestamp_ns,&cpu_snapshot);
-    if(ret_b!=0){
-        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_B ret=%d",sample_number,(long long)frame_id,ret_b);
-        return ret_b;
-    }
+    const int ret_gpu=detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,gpu_objects,rotate_type,
+                                           frame_id,image_timestamp_ns,&gpu_snapshot);
 
+    // A diagnostic baseline failure must not discard the live AHB result.
     objects=ahb_objects;
     last_top_score=ahb_snapshot.top_score;
     last_top_class=ahb_snapshot.top_class;
-    log_compare_tensor("RGB_0_255",ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
-    log_rgb_samples(ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
-    log_compare_tensor("INPUT_NORMALIZED_PRE_CAST",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
-    log_compare_tensor("INPUT_AFTER_CAST",ahb_snapshot.input_after_cast,cpu_snapshot.input_after_cast,frame_id,image_timestamp_ns);
-    log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
-    log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
-    log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
-    LOGI("AHBCMP_TIMING frame=%lld ts=%lld diag_readback=1 AHB(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV(preprocess=%.3fms inference=%.3fms post=%.3fms)",
+
+    LOGI("AHBCMP_PATH_STATUS frame=%lld ts=%lld AHB_VULKAN=OK CPU_YUV_CPU=%s(%d) CPU_YUV_VULKAN=%s(%d)",
+         (long long)frame_id,(long long)image_timestamp_ns,
+         ret_cpu==0?"OK":"FAIL",ret_cpu,ret_gpu==0?"OK":"FAIL",ret_gpu);
+
+    if(ret_cpu==0){
+        log_compare_tensor("RGB_AHB_vs_CPU_YUV",ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_compare_tensor("INPUT_NORM_AHB_vs_CPU_YUV",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+        log_compare_tensor("OUT0_CPU_vs_AHB",cpu_snapshot.out0,ahb_snapshot.out0,frame_id,image_timestamp_ns);
+        log_rgb_samples(ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_tensor_channels("AHB_RGB_0_255",ahb_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_tensor_channels("CPU_YUV_RGB_0_255",cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_tensor_channels("CPU_YUV_INPUT_0_1",cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+        log_compare_detections("CPU_YUV_CPU",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
+    }
+    if(ret_gpu==0){
+        log_compare_tensor("RGB_AHB_vs_GPU_YUV",ahb_snapshot.rgb_0_255,gpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_compare_tensor("INPUT_NORM_AHB_vs_GPU_YUV",ahb_snapshot.input_after_norm,gpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+        log_compare_tensor("INPUT_CAST_AHB_vs_GPU_YUV",ahb_snapshot.input_after_cast,gpu_snapshot.input_after_cast,frame_id,image_timestamp_ns);
+        log_compare_tensor("OUT0_GPU_vs_AHB",gpu_snapshot.out0,ahb_snapshot.out0,frame_id,image_timestamp_ns);
+        log_rgb_samples(gpu_snapshot.rgb_0_255,ahb_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_tensor_channels("GPU_YUV_RGB_0_255",gpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_tensor_channels("GPU_YUV_INPUT_0_1",gpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+        log_tensor_channels("GPU_YUV_INPUT_AFTER_CAST",gpu_snapshot.input_after_cast,frame_id,image_timestamp_ns);
+        log_compare_detections("CPU_YUV_VULKAN",gpu_snapshot.detections,gpu_snapshot.top_score,gpu_snapshot.top_class,frame_id,image_timestamp_ns);
+    }
+    if(ret_cpu==0 && ret_gpu==0){
+        log_compare_tensor("RGB_CPU_vs_GPU_YUV",cpu_snapshot.rgb_0_255,gpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
+        log_compare_tensor("INPUT_NORM_CPU_vs_GPU_YUV",cpu_snapshot.input_after_norm,gpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+        log_compare_tensor("OUT0_CPU_vs_GPU",cpu_snapshot.out0,gpu_snapshot.out0,frame_id,image_timestamp_ns);
+    }
+
+    log_tensor_channels("AHB_INPUT_NORMALIZED_0_1",ahb_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+    log_tensor_channels("AHB_INPUT_AFTER_CAST",ahb_snapshot.input_after_cast,frame_id,image_timestamp_ns);
+    log_tensor_channels("AHB_OUT0",ahb_snapshot.out0,frame_id,image_timestamp_ns);
+    log_compare_detections("AHB_VULKAN",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
+
+    LOGI("AHBCMP_TIMING frame=%lld ts=%lld AHB_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV_CPU(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) CPU_YUV_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) diagnostic_sample_cost_includes_3_full_passes=1",
          (long long)frame_id,(long long)image_timestamp_ns,
          ahb_snapshot.preprocess_ms,ahb_snapshot.infer_ms,ahb_snapshot.post_ms,
-         cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms);
-    LOGI("AHBCMP_END sample=%u frame=%lld ts=%lld status=OK",
-         sample_number,(long long)frame_id,(long long)image_timestamp_ns);
+         cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms,ret_cpu,
+         gpu_snapshot.preprocess_ms,gpu_snapshot.infer_ms,gpu_snapshot.post_ms,ret_gpu);
+    LOGI("AHBCMP_END sample=%u frame=%lld ts=%lld status=%s",
+         sample_number,(long long)frame_id,image_timestamp_ns,
+         (ret_cpu==0&&ret_gpu==0)?"OK":"PARTIAL");
     return 0;
 }
 
@@ -1040,11 +1148,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                 if (dst.empty()) {
                     execute_ret = -8;
                 } else {
-                    ncnn::VkMat dst_normalized;
                     ncnn::VkMat in_gpu;
 
-                    // Stage 1: AHB import + preprocessing. This command still waits
-                    // before inference because this diagnostic build isolates phases.
+                    // AHB import writes FP32. Scale this VkMat in-place to avoid
+                    // an additional full-frame FP32 clone/copy in the hot path.
+                    // Diagnostic raw-RGB snapshot is recorded before Scale mutates dst.
                     auto t = std::chrono::steady_clock::now();
                     {
                         ncnn::VkCompute preprocess_cmd(vkdev);
@@ -1053,17 +1161,19 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                         auto st=std::chrono::steady_clock::now();
                         preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline,entry->src,dst);
                         preprocess_import_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
+                        if (snapshot) {
+                            preprocess_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
+                        }
                         st=std::chrono::steady_clock::now();
-                        execute_ret=scale_layer?scale_layer->forward(dst,dst_normalized,preprocess_cmd,opt):-9;
+                        execute_ret=scale_layer?scale_layer->forward_inplace(dst,preprocess_cmd,opt):-9;
                         preprocess_scale_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                         if(execute_ret==0){
                             const int pack=1,cast=(opt.use_fp16_storage||opt.use_fp16_packed)?2:0;
                             st=std::chrono::steady_clock::now();
-                            vkdev->convert_packing(dst_normalized,in_gpu,pack,cast,preprocess_cmd,opt);
+                            vkdev->convert_packing(dst,in_gpu,pack,cast,preprocess_cmd,opt);
                             preprocess_cast_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                             if (snapshot) {
-                                preprocess_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
-                                preprocess_cmd.record_clone(dst_normalized,snapshot->input_after_norm,opt);
+                                preprocess_cmd.record_clone(dst,snapshot->input_after_norm,opt);
                                 preprocess_cmd.record_clone(in_gpu,snapshot->input_after_cast,opt);
                             }
                         }
@@ -1082,8 +1192,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                         }
                     } // Preprocess queue is complete; descriptors below do not read tensor memory.
                     if(frame_id>0&&frame_id%30==0){
-                        log_vkmat("ahb_rgb_0_255",dst,frame_id,image_timestamp_ns);
-                        log_vkmat("ahb_scaled_0_1",dst_normalized,frame_id,image_timestamp_ns);
+                        log_vkmat("ahb_scaled_0_1_inplace",dst,frame_id,image_timestamp_ns);
                         log_vkmat("ncnn_input_after_cast",in_gpu,frame_id,image_timestamp_ns);
                     }
                     // Opt-in diagnostic VkMat->Mat clones. This adds GPU->CPU copies and a wait.
@@ -1094,15 +1203,14 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     const bool do_tap=(tap_mode==1&&!one_shot_latched)||(tap_mode==2&&frame_id>0&&frame_id%30==0);
                     if(tap_mode==1&&do_tap)one_shot_latched=true;
                     if(do_tap){
-                        ncnn::Mat tap_rgb,tap_scaled,tap_input;ncnn::VkCompute tap_cmd(vkdev);
+                        ncnn::Mat tap_scaled,tap_input;ncnn::VkCompute tap_cmd(vkdev);
                         const auto ts0=std::chrono::steady_clock::now();
-                        tap_cmd.record_clone(dst,tap_rgb,opt);tap_cmd.record_clone(dst_normalized,tap_scaled,opt);tap_cmd.record_clone(in_gpu,tap_input,opt);
+                        tap_cmd.record_clone(dst,tap_scaled,opt);tap_cmd.record_clone(in_gpu,tap_input,opt);
                         uint64_t d=tap_cmd.pending_dispatch_total();int rc=tap_cmd.submit_and_wait();
                         double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-ts0).count();
                         LOGI("TENSOR_TAP frame=%lld imageTs=%lld mode=%d ret=%d dispatches=%llu wall=%.3fms PERTURBS_PIPELINE=1",
                              (long long)frame_id,(long long)image_timestamp_ns,tap_mode,rc,(unsigned long long)d,ms);
-                        if(rc==0){log_tensor_stats("ahb_rgb_0_255_snapshot",tap_rgb,frame_id,image_timestamp_ns);
-                            log_tensor_stats("ahb_scaled_0_1_snapshot",tap_scaled,frame_id,image_timestamp_ns);
+                        if(rc==0){log_tensor_stats("ahb_scaled_0_1_snapshot",tap_scaled,frame_id,image_timestamp_ns);
                             log_tensor_stats("ncnn_input_snapshot",tap_input,frame_id,image_timestamp_ns);}
                     }
 
@@ -1330,15 +1438,14 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
             if (dst.empty()) {
                 execute_ret = -31;
             } else {
-                ncnn::VkMat dst_normalized;
                 ncnn::VkMat input_gpu;
                 ncnn::VkCompute cmd(vkdev);
 
                 cmd.record_import_android_hardware_buffer(entry->pipeline, entry->src, dst);
-                execute_ret = scale_layer->forward(dst, dst_normalized, cmd, opt);
+                execute_ret = scale_layer->forward_inplace(dst, cmd, opt);
                 if (execute_ret == 0) {
                     const int cast_type = (opt.use_fp16_storage || opt.use_fp16_packed) ? 2 : 0;
-                    vkdev->convert_packing(dst_normalized, input_gpu, 1, cast_type, cmd, opt);
+                    vkdev->convert_packing(dst, input_gpu, 1, cast_type, cmd, opt);
                     if (input_gpu.empty()) execute_ret = -32;
                 }
 
