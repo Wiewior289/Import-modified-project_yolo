@@ -554,7 +554,6 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     }
 
     ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
-    ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* scale_staging_allocator = vkdev->acquire_staging_allocator();
     if (!scale_blob_allocator || !scale_staging_allocator) {
         if (scale_blob_allocator) vkdev->reclaim_blob_allocator(scale_blob_allocator);
