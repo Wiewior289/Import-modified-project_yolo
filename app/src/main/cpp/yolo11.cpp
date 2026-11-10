@@ -738,6 +738,9 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
     if (snapshot) {
         snapshot->out0=out; snapshot->detections=objects;
         snapshot->top_score=last_top_score; snapshot->top_class=last_top_class;
+        snapshot->preprocess_ms=preprocess_ms;
+        snapshot->infer_ms=infer_extract_ms;
+        snapshot->post_ms=post_ms;
     }
     return 0;
 }
@@ -791,6 +794,10 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
     log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
     log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
+    LOGI("AHBCMP_TIMING frame=%lld ts=%lld AHB(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV(preprocess=%.3fms inference=%.3fms post=%.3fms)",
+         (long long)frame_id,(long long)image_timestamp_ns,
+         ahb_snapshot.preprocess_ms,ahb_snapshot.infer_ms,ahb_snapshot.post_ms,
+         cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms);
     LOGI("AHBCMP_END sample=%u frame=%lld ts=%lld status=OK",
          sample_number,(long long)frame_id,(long long)image_timestamp_ns);
     return 0;
@@ -1140,6 +1147,9 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     if (snapshot) {
         snapshot->out0=out; snapshot->detections=objects;
         snapshot->top_score=last_top_score; snapshot->top_class=last_top_class;
+        snapshot->preprocess_ms=preprocess_total_ms;
+        snapshot->infer_ms=infer_total_ms;
+        snapshot->post_ms=postprocess_ms;
     }
     return 0;
 }
