@@ -63,12 +63,14 @@ adb logcat -s Yolo11_AHB_MaliG72:I Yolo11Ncnn_JNI:I
 
 Records beginning with `AHBCMP_` include:
 
-- `BEGIN`: frame ID, Camera2 timestamp, AHB size/stride/format/usage and rotation.
+- `BEGIN`: frame ID, Camera2 timestamp, source/target size, AHB stride/format/usage and rotation.
+- `AHB_YCBCR`: actual imported external format, feature flags, YCbCr model/range, chroma offsets and component mapping.
 - `YUV`: CPU plane rowStride and pixelStride for Y, U and V.
-- `TENSOR`: RGB before normalization, normalized model input, and `out0`; shape, type, min/max/mean/stddev and non-finite count for A and B.
+- `TENSOR`: RGB before normalization, normalized pre-cast input, matched post-cast input and `out0`; shape, element size, packing, min/max/mean/stddev and non-finite count for A and B.
 - `DIFF`: element-wise MAE, RMSE, maximum absolute difference and cosine similarity.
 - `RGB_SAMPLES`: eight fixed spatial positions with RGB values for both paths.
 - `DET`: detection count, top candidate and up to five decoded boxes for each path.
+- `TIMING`: per-path preprocessing, inference/extract and postprocessing wall times. AHB time includes diagnostic readback, marked as `diag_readback=1`.
 - `END`: completion or the path that failed.
 
 A comparison is useful only when `AHBCMP_BEGIN` and `AHBCMP_END status=OK` exist for the same sample. Compare the stages in order:
