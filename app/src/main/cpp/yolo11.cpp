@@ -1682,6 +1682,157 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
     return 0;
 }
 
+int Yolo11::cpu_delegate_frame(int slot_index)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -50;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || !cpu_net_loaded ||
+        compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC) return -51;
+    if (slot.state != AsyncFrameSlot::CPU_READY) return -52;
+
+    slot.state = AsyncFrameSlot::CPU_RUNNING;
+    const int64_t frame_id = slot.frame_id;
+    static const int delegate_blob_ids[3] = {133, 137, 136};
+
+    int execute_ret = 0;
+    {
+        ncnn::Extractor cpu_ex = cpu_net.create_extractor();
+        cpu_ex.set_light_mode(true);
+        for (int i = 0; i < 3 && execute_ret == 0; ++i) {
+            const ncnn::Mat& input = slot.cpu_inputs[static_cast<size_t>(i)];
+            if (input.empty() || input.elemsize != 4u || input.elempack != 1) {
+                LOGE("CPU delegate input invalid frame=%lld blob=%d dims=%d elemsize=%zu pack=%d",
+                     static_cast<long long>(frame_id), delegate_blob_ids[i],
+                     input.dims, input.elemsize, input.elempack);
+                execute_ret = -53;
+                break;
+            }
+            execute_ret = cpu_ex.input(delegate_blob_ids[i], input);
+        }
+
+        // Ask only for blob 141. The CPU Extractor evaluates the dependency
+        // closure ending at layer 113, not the rest of the YOLO graph.
+        if (execute_ret == 0) execute_ret = cpu_ex.extract(141, slot.cpu_bridge);
+    }
+
+    for (auto& input : slot.cpu_inputs) input.release();
+
+    if (execute_ret != 0 || slot.cpu_bridge.empty() ||
+        slot.cpu_bridge.elemsize != 4u || slot.cpu_bridge.elempack != 1) {
+        LOGE("CPU delegate failed frame=%lld ret=%d bridge_dims=%d elemsize=%zu pack=%d",
+             static_cast<long long>(frame_id), execute_ret,
+             slot.cpu_bridge.dims, slot.cpu_bridge.elemsize, slot.cpu_bridge.elempack);
+        slot.cpu_bridge.release();
+        // Keep the Vulkan Extractor and its allocators intact. Cancellation is
+        // queued to the serial GPU executor, avoiding cross-thread VkMat teardown.
+        slot.state = AsyncFrameSlot::FAILED_PENDING_CANCEL;
+        return execute_ret != 0 ? execute_ret : -54;
+    }
+
+    LOGD("ASYNC_CPU_DELEGATE_DONE frame=%lld slot=%d blob=141 dims=%d shape=%d,%d,%d elemsize=%zu pack=%d",
+         static_cast<long long>(frame_id), slot_index,
+         slot.cpu_bridge.dims, slot.cpu_bridge.w, slot.cpu_bridge.h, slot.cpu_bridge.c,
+         slot.cpu_bridge.elemsize, slot.cpu_bridge.elempack);
+    slot.state = AsyncFrameSlot::GPU_CONTINUATION_READY;
+    return 0;
+}
+
+int Yolo11::gpu_suffix_frame(int slot_index)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -60;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC || !vkdev) return -61;
+    if (slot.state != AsyncFrameSlot::GPU_CONTINUATION_READY ||
+        !slot.gpu_extractor || slot.cpu_bridge.empty()) return -62;
+
+    slot.state = AsyncFrameSlot::GPU_CONTINUING;
+    const int64_t frame_id = slot.frame_id;
+    int execute_ret = slot.gpu_extractor->input(141, slot.cpu_bridge);
+    if (execute_ret == 0) {
+        // This is the same GPU Extractor that recorded layers 0..109. The
+        // injected CPU bridge is uploaded by NCNN when layer 114 consumes it.
+        // All seven delayed prefix blobs remain available in blob_mats_gpu.
+        execute_ret = slot.gpu_extractor->extract("out0", slot.out0);
+    }
+
+    if (execute_ret != 0 || slot.out0.empty()) {
+        LOGE("GPU continuation failed frame=%lld slot=%d ret=%d",
+             static_cast<long long>(frame_id), slot_index, execute_ret);
+        release_async_slot_resources(slot);
+        slot.state = AsyncFrameSlot::FREE;
+        return execute_ret != 0 ? execute_ret : -63;
+    }
+
+    const int dims = slot.out0.dims;
+    const int w = slot.out0.w;
+    const int h = slot.out0.h;
+    const int c = slot.out0.c;
+    const size_t elemsize = slot.out0.elemsize;
+    const int elempack = slot.out0.elempack;
+
+    // out0 is now a CPU Mat owned by this slot. The persistent Vulkan state is
+    // no longer needed and can be reclaimed before CPU DFL/NMS is scheduled.
+    release_async_gpu_resources(slot);
+    for (auto& input : slot.cpu_inputs) input.release();
+    slot.cpu_bridge.release();
+    for (auto& boundary : slot.boundary) boundary.release();
+
+    LOGD("ASYNC_GPU_CONTINUATION_DONE frame=%lld slot=%d out0_dims=%d shape=%d,%d,%d elemsize=%zu pack=%d",
+         static_cast<long long>(frame_id), slot_index, dims, w, h, c, elemsize, elempack);
+    slot.state = AsyncFrameSlot::CPU_POSTPROCESS_READY;
+    return 0;
+}
+
+int Yolo11::cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_thresh,
+                                  std::vector<Object>& objects)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -70;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC) return -71;
+    if (slot.state != AsyncFrameSlot::CPU_POSTPROCESS_READY || slot.out0.empty()) return -72;
+
+    slot.state = AsyncFrameSlot::CPU_POSTPROCESSING;
+    const int64_t frame_id = slot.frame_id;
+    const int64_t image_timestamp_ns = slot.image_timestamp_ns;
+    last_top_score = 0.0f;
+    last_top_class = -1;
+    objects.clear();
+
+    proposal_scratchpad.clear();
+    decode_dfl_and_filter(slot.out0, conf_thresh);
+    nms_sorted_bboxes(nms_thresh, objects);
+
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        log_tensor_stats("async_gpu_out0", slot.out0, frame_id, image_timestamp_ns);
+        LOGI("ASYNC_FRAME_DONE frame=%lld slot=%d detections=%zu top=%.4f class=%d",
+             static_cast<long long>(frame_id), slot_index, objects.size(),
+             last_top_score, last_top_class);
+    }
+
+    slot.out0.release();
+    slot.state = AsyncFrameSlot::FREE;
+    return 0;
+}
+
+int Yolo11::cancel_async_frame(int slot_index)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -80;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    release_async_slot_resources(slot);
+    slot.state = AsyncFrameSlot::FREE;
+    slot.frame_id = 0;
+    slot.image_timestamp_ns = 0;
+    return 0;
+}
+
 int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh,
                              std::vector<Object>& objects)
 {
@@ -1689,7 +1840,7 @@ int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh
     AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
     std::lock_guard<std::mutex> slot_lock(slot.mutex);
 
-    if (!model_loaded || (compute_mode != YOLO_COMPUTE_VULKAN_AHB_SPLIT && compute_mode != YOLO_COMPUTE_VULKAN_AHB_ASYNC)) return -41;
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_VULKAN_AHB_SPLIT || !cpu_net_loaded) return -41;
     if (slot.state != AsyncFrameSlot::CPU_READY) return -42;
 
     slot.state = AsyncFrameSlot::CPU_RUNNING;
@@ -1716,26 +1867,25 @@ int Yolo11::cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh
         if (execute_ret == 0) execute_ret = cpu_ex.extract("out0", out);
     }
 
-    for (auto& boundary : slot.boundary) boundary.release();
-
     if (execute_ret != 0 || out.empty()) {
+        release_async_slot_resources(slot);
         slot.state = AsyncFrameSlot::FREE;
-        LOGE("Async CPU suffix failed frame=%lld slot=%d ret=%d",
+        LOGE("Point B CPU suffix failed frame=%lld slot=%d ret=%d",
              static_cast<long long>(frame_id), slot_index, execute_ret);
         return execute_ret != 0 ? execute_ret : -44;
     }
 
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
-    objects.clear();
     nms_sorted_bboxes(nms_thresh, objects);
 
     if (frame_id > 0 && frame_id % 30 == 0) {
-        log_tensor_stats("async_out0", out, frame_id, image_timestamp_ns);
-        LOGI("ASYNC_SUFFIX_DONE frame=%lld slot=%d detections=%zu top=%.4f class=%d",
+        log_tensor_stats("point_b_out0", out, frame_id, image_timestamp_ns);
+        LOGI("POINT_B_SUFFIX_DONE frame=%lld slot=%d detections=%zu top=%.4f class=%d",
              static_cast<long long>(frame_id), slot_index, objects.size(),
              last_top_score, last_top_class);
     }
+    release_async_slot_resources(slot);
     slot.state = AsyncFrameSlot::FREE;
     return 0;
 }
