@@ -101,6 +101,9 @@ if [[ "${INSTALLED_SHA}" != "${EXPECTED_SHA}" ]]; then
     exit 6
 fi
 
+# Discard Gradle/CMake caches that could still point at an older NCNN package.
+rm -rf "${REPO_ROOT}/app/.cxx" "${REPO_ROOT}/app/build"
+
 echo "OK: clean upstream NCNN installed."
 echo "NCNN_SOURCE_SHA=${INSTALLED_SHA}"
 echo "ncnn_DIR=${NCNN_CONFIG_DIR}"
