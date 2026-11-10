@@ -144,6 +144,17 @@ static void log_compare_tensor(const char* name, const ncnn::Mat& a, const ncnn:
          (long long)frame_id,(long long)image_timestamp_ns,name,sa.count,compared,nonfinite,mae,rmse,max_abs,cosine);
 }
 
+
+static void log_single_tensor(const char* name,const ncnn::Mat& m,int64_t frame_id,int64_t image_timestamp_ns)
+{
+    const CompareStats st=measure_tensor(m);
+    LOGI("AHBCMP_SINGLE frame=%lld ts=%lld name=%s shape=%d:%d,%d,%d,%d elemsize=%zu pack=%d count=%zu min=%.6g max=%.6g mean=%.6g std=%.6g nonfinite=%zu valid=%d",
+         (long long)frame_id,(long long)image_timestamp_ns,name,
+         m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,st.count,
+         st.valid?st.min_value:0.0,st.valid?st.max_value:0.0,
+         st.valid?st.mean:0.0,st.valid?st.stddev:0.0,st.nonfinite,st.valid?1:0);
+}
+
 static void log_rgb_samples(const ncnn::Mat& a, const ncnn::Mat& b,
                             int64_t frame_id, int64_t image_timestamp_ns)
 {
@@ -790,7 +801,8 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     last_top_class=ahb_snapshot.top_class;
     log_compare_tensor("RGB_0_255",ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
     log_rgb_samples(ahb_snapshot.rgb_0_255,cpu_snapshot.rgb_0_255,frame_id,image_timestamp_ns);
-    log_compare_tensor("INPUT_NORMALIZED",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+    log_compare_tensor("INPUT_NORMALIZED_FP32",ahb_snapshot.input_after_norm,cpu_snapshot.input_after_norm,frame_id,image_timestamp_ns);
+    log_single_tensor("AHB_INPUT_AFTER_CAST",ahb_snapshot.input_after_cast,frame_id,image_timestamp_ns);
     log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
     log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
     log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
@@ -1025,7 +1037,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             preprocess_cast_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                             if (snapshot) {
                                 preprocess_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
-                                preprocess_cmd.record_clone(in_gpu,snapshot->input_after_norm,opt);
+                                preprocess_cmd.record_clone(dst_normalized,snapshot->input_after_norm,opt);
+                                preprocess_cmd.record_clone(in_gpu,snapshot->input_after_cast,opt);
                             }
                         }
                         preprocess_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
