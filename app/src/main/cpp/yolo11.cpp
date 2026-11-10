@@ -782,17 +782,20 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 {
     if (!model_loaded) return -1;
     if (!ahb) return -2;
+    const int original_mode=compute_mode;
+    struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
+
     static const int64_t sample_interval=30;
     static const uint32_t max_samples=10;
-    if (frame_id<=0 || frame_id%sample_interval!=0 || ahb_compare_samples_done>=max_samples)
+    if (frame_id<=0 || frame_id%sample_interval!=0 || ahb_compare_samples_done>=max_samples) {
+        compute_mode=YOLO_COMPUTE_VULKAN_AHB;
         return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
+    }
 
     ++ahb_compare_samples_done;
     const uint32_t sample_number=ahb_compare_samples_done;
     AhbCompareSnapshot ahb_snapshot,cpu_snapshot;
     std::vector<Object> ahb_objects,cpu_objects;
-    const int original_mode=compute_mode;
-    struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
 
     AHardwareBuffer_Desc frame_desc{};
     AHardwareBuffer_describe(ahb,&frame_desc);
