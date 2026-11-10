@@ -775,9 +775,9 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 
     AHardwareBuffer_Desc frame_desc{};
     AHardwareBuffer_describe(ahb,&frame_desc);
-    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld size=%ux%u stride=%u format=0x%x usage=0x%llx rotate=%d",
+    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d",
          sample_number,(long long)frame_id,(long long)image_timestamp_ns,
-         frame_desc.width,frame_desc.height,frame_desc.stride,frame_desc.format,
+         frame_desc.width,frame_desc.height,target_w,target_h,frame_desc.stride,frame_desc.format,
          (unsigned long long)frame_desc.usage,rotate_type);
 
     compute_mode=YOLO_COMPUTE_VULKAN_AHB;
