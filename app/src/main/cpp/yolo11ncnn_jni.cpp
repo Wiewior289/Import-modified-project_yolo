@@ -174,6 +174,50 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_SuffixFrame(
     return copy_detections(env, out_buffer_obj, *engine, objects);
 }
 
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DelegateFrame(
+    JNIEnv* env, jobject thiz, jint slot_index)
+{
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -62;
+    return engine->cpu_delegate_frame(slot_index);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_ContinueFrame(
+    JNIEnv* env, jobject thiz, jint slot_index)
+{
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -63;
+    return engine->gpu_suffix_frame(slot_index);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_PostprocessFrame(
+    JNIEnv* env, jobject thiz, jint slot_index, jfloatArray out_buffer_obj,
+    jfloat conf_thresh, jfloat nms_thresh)
+{
+    if (!out_buffer_obj) return -64;
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -65;
+
+    static thread_local std::vector<Object> objects;
+    objects.clear();
+    if (objects.capacity() < 64) objects.reserve(64);
+    const int ret = engine->cpu_postprocess_frame(slot_index, conf_thresh, nms_thresh, objects);
+    if (ret != 0) return ret;
+    return copy_detections(env, out_buffer_obj, *engine, objects);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_CancelFrame(
+    JNIEnv* env, jobject thiz, jint slot_index)
+{
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine) return -66;
+    return engine->cancel_async_frame(slot_index);
+}
+
 JNIEXPORT jfloat JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_GetTopScore(JNIEnv* env, jobject thiz)
 {
