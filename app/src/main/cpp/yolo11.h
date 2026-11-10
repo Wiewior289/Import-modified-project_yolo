@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <array>
 #include <mutex>
+#include <memory>
 
 // NCNN includes
 #include "net.h"
@@ -88,7 +89,21 @@ public:
     int gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
                          int64_t frame_id, int64_t image_timestamp_ns);
 
-    // Stage 2: CPU-only suffix and postprocess from the slot's ten boundary Mats.
+    // Stage 2a: CPU-only delegate for the unsupported YOLO11 attention island (layers 110..113).
+    // Inputs 133, 137 and 136 are downloaded from the GPU Extractor; output 141 returns to it.
+    int cpu_delegate_frame(int slot_index);
+
+    // Stage 2b: continue the same per-frame GPU Extractor from blob 141 through out0.
+    int gpu_suffix_frame(int slot_index);
+
+    // Stage 3: CPU DFL decode and NMS after GPU out0 is ready.
+    int cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_thresh,
+                              std::vector<Object>& objects);
+
+    // Cancel/cleanup a failed or abandoned async frame. Call from the GPU executor.
+    int cancel_async_frame(int slot_index);
+
+    // Legacy Point B: CPU-only suffix and postprocess from the slot's ten boundary Mats.
     int cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh,
                          std::vector<Object>& objects);
 
@@ -152,15 +167,45 @@ private:
     ncnn::Layer* scale_layer;
 
     struct AsyncFrameSlot {
-        enum State { FREE = 0, GPU_RUNNING = 1, CPU_READY = 2, CPU_RUNNING = 3 };
+        enum State {
+            FREE = 0,
+            GPU_RUNNING = 1,
+            CPU_READY = 2,                 // legacy Point B and async CPU delegate input-ready
+            CPU_RUNNING = 3,
+            GPU_CONTINUATION_READY = 4,
+            GPU_CONTINUING = 5,
+            CPU_POSTPROCESS_READY = 6,
+            CPU_POSTPROCESSING = 7,
+            FAILED_PENDING_CANCEL = 8
+        };
         std::mutex mutex;
         State state;
+
+        // Legacy Point B hand-off: full ten-blob cut, kept unchanged.
         std::array<ncnn::Mat, 10> boundary;
+
+        // N/N+1 ring hand-off: only the three inputs to CPU layers 110..113.
+        std::array<ncnn::Mat, 3> cpu_inputs;
+        ncnn::Mat cpu_bridge;               // CPU result blob 141, injected into GPU Extractor
+        ncnn::Mat out0;                     // final GPU Extractor output, awaiting CPU decode/NMS
+
+        // One persistent GPU Extractor per frame. Its seven delayed graph branches
+        // stay resident across the CPU delegate stage.
+        std::unique_ptr<ncnn::Extractor> gpu_extractor;
+        ncnn::VkAllocator* blob_vkallocator;
+        ncnn::VkAllocator* staging_vkallocator;
+
         int64_t frame_id;
         int64_t image_timestamp_ns;
-        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
+
+        AsyncFrameSlot()
+            : state(FREE), blob_vkallocator(nullptr), staging_vkallocator(nullptr),
+              frame_id(0), image_timestamp_ns(0) {}
     };
     std::array<AsyncFrameSlot, 2> async_slots;
+
+    void release_async_gpu_resources(AsyncFrameSlot& slot);
+    void release_async_slot_resources(AsyncFrameSlot& slot);
 
     // Cache entries are keyed by the actual AHardwareBuffer pointer. Each entry
     // owns an AHB reference and keeps allocator, imported VkImageMat and pipeline
