@@ -24,6 +24,22 @@ This commit adds app-side evidence collection for Camera2 -> AHardwareBuffer -> 
 - AHB preprocessing timings split host recording time for import, Scale and packing/dtype conversion. Dispatch count is collected before submission. Wait time is wall time around `submit_and_wait()`, not pure GPU time.
 - `infer_extract_wall` remains wall time around canonical `Extractor::extract("out0", Mat)`; it includes the internal work and synchronization performed by the linked NCNN library.
 
+## Same-frame AHB versus CPU-YUV comparison
+
+Select `DIAG: AHB vs CPU YUV + Vulkan` in the compute selector. The native comparison runs inside one synchronous `DetectFrame` call while the originating Camera2 `Image` is still open. It uses the same underlying AHardwareBuffer sequentially for:
+- AHB import + GPU YCbCr preprocessing + Vulkan inference;
+- CPU `AHardwareBuffer_lockPlanes` YUV conversion + Vulkan inference on the same loaded Net.
+
+The comparison runs every 30th app frame, up to 10 samples per initialization. It logs `AHBCMP_BEGIN`, `AHBCMP_AHB_YCBCR`, `AHBCMP_YUV`, `AHBCMP_TENSOR`, `AHBCMP_DIFF`, `AHBCMP_RGB_SAMPLES`, `AHBCMP_SINGLE`, `AHBCMP_DET`, `AHBCMP_TIMING` and `AHBCMP_END`. `INPUT_NORMALIZED_FP32` compares preprocessing before dtype conversion; `AHB_INPUT_AFTER_CAST` separately records the actual AHB FP16 input. The normal application output remains the AHB detections.
+
+Filter only these compact diagnostics with:
+
+```sh
+adb logcat -s Yolo11_AHB_MaliG72:I Yolo11Ncnn_JNI:I
+```
+
+Do not enable `debug.yolo11.tensor_tap` during this comparison. That legacy tap adds independent GPU copies and waits.
+
 ## Optional explicit GPU tensor snapshots
 Default disabled.
 
@@ -58,7 +74,7 @@ adb logcat -v threadtime -s Yolo11_AHB_MaliG72:I Yolo11Ncnn_JNI:I MainActivity:I
 Use a rooted shell if Android blocks writing the debug system property from adb shell.
 
 ## What is still outside app visibility
-The app links NCNN as an external package via `find_package(ncnn REQUIRED)`. NCNN graph executor, allocator internals and Vulkan command implementation are not compiled in this app target. This patch therefore cannot conclusively expose:
+The app links NCNN as an external package via `find_package(ncnn REQUIRED)`. This diagnostic branch builds clean upstream Tencent/ncnn at the exact SHA in `ncnn.commit` and does not modify NCNN source. NCNN graph executor, allocator internals and Vulkan command implementation are not compiled in this app target. App-side comparison therefore cannot conclusively expose:
 - actual runtime CPU/Vulkan placement per layer;
 - implicit Mat/VkMat conversion, upload/download and residency changes;
 - internal barriers, command-buffer boundaries, queue submits/waits, fences or overlapping work;
