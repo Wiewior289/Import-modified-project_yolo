@@ -462,31 +462,37 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     scale_layer->vkdev = vkdev;
 
     ncnn::ParamDict pd;
-    pd.set(0, 1);
-    pd.set(1, 0);
-    if (scale_layer->load_param(pd) != 0) {
-        LOGE("Failed to load Scale layer parameters");
-        delete scale_layer;
-        scale_layer = nullptr;
-        return -5;
-    }
+pd.set(0, 3); // trzy współczynniki: R, G, B
+pd.set(1, 0); // bez biasu
 
-    ncnn::Mat weights[1];
-    weights[0].create(1);
-    if (weights[0].empty()) {
-        LOGE("Failed to allocate Scale layer weights");
-        delete scale_layer;
-        scale_layer = nullptr;
-        return -5;
-    }
-    weights[0][0] = 1.0f / 255.0f;
-    ncnn::ModelBinFromMatArray mb(weights);
-    if (scale_layer->load_model(mb) != 0) {
-        LOGE("Failed to load Scale layer weights");
-        delete scale_layer;
-        scale_layer = nullptr;
-        return -5;
-    }
+const int param_ret = scale_layer->load_param(pd);
+if (param_ret != 0) {
+    LOGE("Scale::load_param failed: %d", param_ret);
+    // obsłuż błąd inicjalizacji
+}
+
+ncnn::Mat weights[1];
+weights[0].create(3);
+weights[0][0] = 1.0f / 255.0f;
+weights[0][1] = 1.0f / 255.0f;
+weights[0][2] = 1.0f / 255.0f;
+if (weights[0].empty()) {
+    LOGE("Failed to allocate Scale weights");
+    // obsłuż błąd inicjalizacji
+}
+
+const float inv255 = 1.f / 255.f;
+weights[0][0] = inv255;
+weights[0][1] = inv255;
+weights[0][2] = inv255;
+
+ncnn::ModelBinFromMatArray mb(weights);
+const int model_ret = scale_layer->load_model(mb);
+if (model_ret != 0) {
+    LOGE("Scale::load_model failed: %d", model_ret);
+    // obsłuż błąd inicjalizacji
+}
+
 
     ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* scale_staging_allocator = vkdev->acquire_staging_allocator();
