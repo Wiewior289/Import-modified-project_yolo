@@ -16,3 +16,7 @@
 local.properties
 .env
 debug.keystore
+
+# Generated pinned NCNN source and Android build outputs
+.build/
+.deps/
