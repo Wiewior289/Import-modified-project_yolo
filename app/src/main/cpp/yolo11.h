@@ -124,6 +124,9 @@ private:
         std::vector<Object> detections;
         float top_score = 0.f;
         int top_class = -1;
+        double preprocess_ms = 0.0;
+        double infer_ms = 0.0;
+        double post_ms = 0.0;
     };
 
     int detect_ahb_compare(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
