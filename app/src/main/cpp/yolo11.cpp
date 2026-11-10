@@ -327,7 +327,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -3;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC) {
         cpu_net.opt.use_vulkan_compute = false;
         cpu_net.opt.use_fp16_packed = false;
         cpu_net.opt.use_fp16_storage = false;
