@@ -12,6 +12,7 @@
 #include <android/log.h>
 #include <chrono>
 #include <new>
+#include <memory>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -245,6 +246,11 @@ Yolo11::Yolo11()
 
 Yolo11::~Yolo11()
 {
+    for (auto& slot : async_slots) {
+        std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        release_async_slot_resources(slot);
+        slot.state = AsyncFrameSlot::FREE;
+    }
     clear_ahb_cache();
     if (scale_layer) {
         if (vkdev) {
@@ -256,6 +262,30 @@ Yolo11::~Yolo11()
     }
     net.clear();
     cpu_net.clear();
+}
+
+void Yolo11::release_async_gpu_resources(AsyncFrameSlot& slot)
+{
+    // Destroy the Extractor first: its blob_mats_gpu still reference allocations
+    // owned by these per-slot allocators.
+    slot.gpu_extractor.reset();
+    if (vkdev && slot.blob_vkallocator) {
+        vkdev->reclaim_blob_allocator(slot.blob_vkallocator);
+    }
+    if (vkdev && slot.staging_vkallocator) {
+        vkdev->reclaim_staging_allocator(slot.staging_vkallocator);
+    }
+    slot.blob_vkallocator = nullptr;
+    slot.staging_vkallocator = nullptr;
+}
+
+void Yolo11::release_async_slot_resources(AsyncFrameSlot& slot)
+{
+    release_async_gpu_resources(slot);
+    for (auto& boundary : slot.boundary) boundary.release();
+    for (auto& input : slot.cpu_inputs) input.release();
+    slot.cpu_bridge.release();
+    slot.out0.release();
 }
 
 void Yolo11::destroy_ahb_cache_entry(AHBImportCacheEntry* entry)
@@ -296,17 +326,19 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -4;
     }
 
-    clear_ahb_cache();
-    net.clear();
-    cpu_net.clear();
-    cpu_net_loaded = false;
+    // Persistent GPU Extractors must release their VkMat references before the
+    // Net and its Vulkan device state are reset.
     for (auto& slot : async_slots) {
         std::lock_guard<std::mutex> slot_lock(slot.mutex);
-        for (auto& boundary : slot.boundary) boundary.release();
+        release_async_slot_resources(slot);
         slot.state = AsyncFrameSlot::FREE;
         slot.frame_id = 0;
         slot.image_timestamp_ns = 0;
     }
+    clear_ahb_cache();
+    net.clear();
+    cpu_net.clear();
+    cpu_net_loaded = false;
 
     target_w = target_size;
     target_h = target_size;
@@ -422,7 +454,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             LOGE("CPU suffix Net failed to load model: %s (code %d)", binpath, cpu_model_ret);
             return -15;
         }
-        LOGI("ASYNC_GRAPH_READY gpu_layers=%zu cpu_layers=%zu boundary_blobs=10",
+        cpu_net_loaded = true;
+        LOGI("ASYNC_GRAPH_READY gpu_layers=%zu cpu_layers=%zu point_b_boundary_blobs=10",
              net.layers().size(), cpu_net.layers().size());
 
         static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
@@ -497,6 +530,79 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
                 return -22;
             }
         }
+        // Validate the narrower N/N+1 GPU -> CPU -> GPU island independently
+        // of the legacy Point B ten-blob cut. The two model files share this DAG.
+        static const int delegate_inputs[3] = {133, 137, 136};
+        static const int delegate_input_producers[3] = {107, 109, 108};
+        static const int gpu_carry_blobs[7] = {37, 72, 123, 125, 128, 129, 135};
+        static const int gpu_carry_producers[7] = {31, 60, 102, 103, 105, 105, 108};
+        for (int i = 0; i < 3; ++i) {
+            const int blob_id = delegate_inputs[i];
+            if (net.blobs()[static_cast<size_t>(blob_id)].producer != delegate_input_producers[i] ||
+                cpu_net.blobs()[static_cast<size_t>(blob_id)].producer != delegate_input_producers[i]) {
+                LOGE("CPU delegate input graph mismatch blob=%d producer_gpu=%d producer_cpu=%d expected=%d",
+                     blob_id, net.blobs()[static_cast<size_t>(blob_id)].producer,
+                     cpu_net.blobs()[static_cast<size_t>(blob_id)].producer,
+                     delegate_input_producers[i]);
+                return -23;
+            }
+        }
+        for (int i = 0; i < 7; ++i) {
+            const int blob_id = gpu_carry_blobs[i];
+            if (net.blobs()[static_cast<size_t>(blob_id)].producer != gpu_carry_producers[i]) {
+                LOGE("GPU carry blob graph mismatch blob=%d producer=%d expected=%d",
+                     blob_id, net.blobs()[static_cast<size_t>(blob_id)].producer,
+                     gpu_carry_producers[i]);
+                return -24;
+            }
+        }
+        if (net.blobs()[141].producer != 113 || net.blobs()[141].consumer != 114) {
+            LOGE("CPU delegate output contract mismatch blob=141 producer=%d consumer=%d expected=113/114",
+                 net.blobs()[141].producer, net.blobs()[141].consumer);
+            return -25;
+        }
+        static const char* delegate_layer_types[4] = {"MatMul", "BinaryOp", "Softmax", "MatMul"};
+        for (size_t i = 0; i < 4; ++i) {
+            const ncnn::Layer* layer = net.layers()[110 + i];
+            if (!layer || layer->type != delegate_layer_types[i]) {
+                LOGE("CPU delegate layer contract mismatch idx=%zu type=%s expected=%s",
+                     110 + i, layer ? layer->type.c_str() : "(null)", delegate_layer_types[i]);
+                return -26;
+            }
+        }
+        // Runtime log says only MatMul 110 and 113 are non-Vulkan. The complete
+        // 110..113 region is intentionally delegated to CPU to avoid a second
+        // GPU->CPU synchronization at MatMul 113.
+        if (net.layers()[110]->support_vulkan || !net.layers()[111]->support_vulkan ||
+            !net.layers()[112]->support_vulkan || net.layers()[113]->support_vulkan) {
+            LOGE("CPU delegate Vulkan capability signature changed at layers 110..113");
+            return -27;
+        }
+        for (size_t i = 114; i < net.layers().size(); ++i) {
+            const ncnn::Layer* layer = net.layers()[i];
+            if (!layer || !layer->support_vulkan) {
+                LOGE("GPU continuation contains a non-Vulkan layer at idx=%zu type=%s",
+                     i, layer ? layer->type.c_str() : "(null)");
+                return -28;
+            }
+        }
+        // The CPU island must have exactly these three prefix-produced inputs.
+        for (size_t layer_index = 110; layer_index <= 113; ++layer_index) {
+            const ncnn::Layer* layer = net.layers()[layer_index];
+            for (int blob_id : layer->bottoms) {
+                const int producer = net.blobs()[static_cast<size_t>(blob_id)].producer;
+                if (producer < 110) {
+                    bool is_delegate_input = false;
+                    for (int id : delegate_inputs) if (id == blob_id) is_delegate_input = true;
+                    if (!is_delegate_input) {
+                        LOGE("CPU delegate has untracked prefix dependency layer=%zu blob=%d producer=%d",
+                             layer_index, blob_id, producer);
+                        return -29;
+                    }
+                }
+            }
+        }
+        LOGI("ASYNC_GPU_CPU_GPU_GRAPH_READY cpu_inputs=3 cpu_output=141 gpu_carry=7 gpu_extractor_persistent=1");
     }
 
     if (use_vulkan_compute && !vkdev) {
