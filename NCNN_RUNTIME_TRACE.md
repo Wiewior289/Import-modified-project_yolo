@@ -30,7 +30,7 @@ Select `DIAG: AHB vs CPU YUV + Vulkan` in the compute selector. The native compa
 - AHB import + GPU YCbCr preprocessing + Vulkan inference;
 - CPU `AHardwareBuffer_lockPlanes` YUV conversion + Vulkan inference on the same loaded Net.
 
-The comparison runs every 30th app frame, up to 10 samples per initialization. It logs `AHBCMP_BEGIN`, `AHBCMP_AHB_YCBCR`, `AHBCMP_YUV`, `AHBCMP_TENSOR`, `AHBCMP_DIFF`, `AHBCMP_RGB_SAMPLES`, `AHBCMP_DET`, `AHBCMP_TIMING` and `AHBCMP_END`. `INPUT_NORMALIZED_PRE_CAST` compares preprocessing before dtype conversion; `INPUT_AFTER_CAST` compares both paths after matching FP16 conversion. The normal application output remains the AHB detections.
+The comparison runs every 30th app frame, up to 10 samples per initialization. It logs `AHBCMP_BEGIN`, `AHBCMP_AHB_YCBCR`, `AHBCMP_YUV`, `AHBCMP_TENSOR`, `AHBCMP_DIFF`, `AHBCMP_RGB_SAMPLES`, `AHBCMP_DET`, `AHBCMP_TIMING` and `AHBCMP_END`. `INPUT_NORMALIZED_PRE_CAST` compares the normalized tensors before conversion; `INPUT_AFTER_CAST` compares both paths after matching FP16 conversion. `INPUT_NORMALIZED_PRE_CAST` compares preprocessing before dtype conversion; `INPUT_AFTER_CAST` compares both paths after matching FP16 conversion. The normal application output remains the AHB detections.
 
 Filter only these compact diagnostics with:
 
