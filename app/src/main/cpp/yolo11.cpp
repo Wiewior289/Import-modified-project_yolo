@@ -552,6 +552,13 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         scale_layer = nullptr;
         return -5;
     }
+    if (!scale_layer->support_vulkan || !scale_layer->support_inplace) {
+        LOGE("Scale layer capability mismatch: vulkan=%d inplace=%d; AHB path requires both",
+             scale_layer->support_vulkan ? 1 : 0, scale_layer->support_inplace ? 1 : 0);
+        delete scale_layer;
+        scale_layer = nullptr;
+        return -5;
+    }
 
     ncnn::VkAllocator* scale_blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* scale_staging_allocator = vkdev->acquire_staging_allocator();
@@ -592,7 +599,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -5;
     }
 
-    LOGI("GPU Scale layer initialized: RGB [0,255] -> [0,1]");
+    LOGI("GPU Scale layer initialized: input=FP32 VkMat storage=FP32 coeffs=3 inv255=%.9g model_input=FP16 inplace=1", 1.f / 255.f);
     }
 
 
