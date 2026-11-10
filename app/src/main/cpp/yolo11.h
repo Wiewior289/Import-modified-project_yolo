@@ -36,7 +36,8 @@ enum YoloComputeMode {
     YOLO_COMPUTE_VULKAN = 1,
     YOLO_COMPUTE_VULKAN_AHB = 2,
     YOLO_COMPUTE_VULKAN_AHB_SPLIT = 3,
-    YOLO_COMPUTE_VULKAN_AHB_ASYNC = 4
+    YOLO_COMPUTE_VULKAN_AHB_ASYNC = 4,
+    YOLO_COMPUTE_AHB_COMPARE = 5
 };
 
 enum ObstacleZone {
@@ -116,12 +117,26 @@ public:
     bool is_ready() const { return model_loaded; }
 
 private:
+    struct AhbCompareSnapshot {
+        ncnn::Mat rgb_0_255;
+        ncnn::Mat input_after_norm;
+        ncnn::Mat out0;
+        std::vector<Object> detections;
+        float top_score = 0.f;
+        int top_class = -1;
+    };
+
+    int detect_ahb_compare(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
+                           std::vector<Object>& objects, int rotate_type,
+                           int64_t frame_id, int64_t image_timestamp_ns);
     int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                    std::vector<Object>& objects, int rotate_type,
-                   int64_t frame_id, int64_t image_timestamp_ns);
+                   int64_t frame_id, int64_t image_timestamp_ns,
+                   AhbCompareSnapshot* snapshot = nullptr);
     int detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                              std::vector<Object>& objects, int rotate_type,
-                             int64_t frame_id, int64_t image_timestamp_ns);
+                             int64_t frame_id, int64_t image_timestamp_ns,
+                             AhbCompareSnapshot* snapshot = nullptr);
     void generate_grids_and_stride(int target_w, int target_h);
     void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
     void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);
@@ -166,6 +181,7 @@ private:
     uint64_t ahb_cache_misses;
     uint64_t ahb_cache_evictions;
     uint64_t ahb_cache_rotate_rebuilds;
+    uint32_t ahb_compare_samples_done;
     void destroy_ahb_cache_entry(AHBImportCacheEntry* entry);
 
     // Pre-allocated static scratchpads to guarantee ZERO allocations in inference loop
