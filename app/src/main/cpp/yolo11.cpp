@@ -950,6 +950,16 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
 
         if (execute_ret == 0) {
             AHBImportCacheEntry* entry = cache_it->second;
+            if (snapshot) {
+                const auto& fp = entry->allocator->bufferFormatProperties;
+                LOGI("AHBCMP_AHB_YCBCR frame=%lld ts=%lld externalFormat=0x%llx features=0x%08x model=%d range=%d chromaX=%d chromaY=%d components=%d,%d,%d,%d",
+                     (long long)frame_id,(long long)image_timestamp_ns,
+                     (unsigned long long)fp.externalFormat,(unsigned int)fp.formatFeatures,
+                     (int)fp.suggestedYcbcrModel,(int)fp.suggestedYcbcrRange,
+                     (int)fp.suggestedXChromaOffset,(int)fp.suggestedYChromaOffset,
+                     (int)fp.samplerYcbcrConversionComponents.r,(int)fp.samplerYcbcrConversionComponents.g,
+                     (int)fp.samplerYcbcrConversionComponents.b,(int)fp.samplerYcbcrConversionComponents.a);
+            }
 
             if (!entry->pipeline || entry->rotate_type != rotate_type) {
                 ++ahb_cache_rotate_rebuilds;
