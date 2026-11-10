@@ -120,6 +120,7 @@ private:
     struct AhbCompareSnapshot {
         ncnn::Mat rgb_0_255;
         ncnn::Mat input_after_norm;
+        ncnn::Mat input_after_cast;
         ncnn::Mat out0;
         std::vector<Object> detections;
         float top_score = 0.f;
