@@ -71,7 +71,33 @@ class Yolo11Ncnn {
     ): Int
 
     /**
-     * Runs the CPU-only suffix (layers 110..256) from the selected frame slot.
+     * Runs only the CPU delegate island (layers 110..113) from GPU-produced blobs
+     * 133, 137 and 136. Produces bridge blob 141 for the same GPU Extractor.
+     */
+    external fun DelegateFrame(slotIndex: Int): Int
+
+    /**
+     * Resumes the persistent per-frame GPU Extractor from bridge blob 141 through out0.
+     */
+    external fun ContinueFrame(slotIndex: Int): Int
+
+    /**
+     * Runs CPU DFL decode and NMS after GPU out0 has been produced.
+     */
+    external fun PostprocessFrame(
+        slotIndex: Int,
+        outBuffer: FloatArray,
+        confThresh: Float,
+        nmsThresh: Float
+    ): Int
+
+    /**
+     * Releases a failed/abandoned slot. Must be called on the GPU executor.
+     */
+    external fun CancelFrame(slotIndex: Int): Int
+
+    /**
+     * Legacy Point B: runs the CPU-only suffix (layers 110..256) from ten boundary Mats.
      */
     external fun SuffixFrame(
         slotIndex: Int,
