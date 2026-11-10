@@ -63,20 +63,36 @@ struct CompareStats {
     double min_value = 0.0, max_value = 0.0, mean = 0.0, stddev = 0.0;
 };
 
+static size_t tensor_scalar_count(const ncnn::Mat& m)
+{
+    const size_t w = static_cast<size_t>(m.w);
+    const size_t h = m.dims >= 2 ? static_cast<size_t>(m.h) : 1u;
+    const size_t d = m.dims >= 3 ? static_cast<size_t>(m.d) : 1u;
+    const size_t c = m.dims >= 3 ? static_cast<size_t>(m.c) : 1u;
+    const size_t n = m.dims == 4 ? static_cast<size_t>(m.n) : 1u;
+    return w * h * d * c * n * static_cast<size_t>(m.elempack);
+}
+
 static const unsigned char* tensor_scalar_ptr(const ncnn::Mat& m, size_t scalar_index)
 {
     const size_t pack = static_cast<size_t>(m.elempack);
     const size_t scalar_bytes = m.elemsize / pack;
-    const size_t w = static_cast<size_t>(m.w);
-    const size_t h = m.dims >= 2 ? static_cast<size_t>(m.h) : 1u;
-    const size_t d = m.dims >= 3 ? static_cast<size_t>(m.d) : 1u;
-    const size_t spatial = w * h * d;
+    const size_t spatial = static_cast<size_t>(m.w) *
+                           (m.dims >= 2 ? static_cast<size_t>(m.h) : 1u) *
+                           (m.dims >= 3 ? static_cast<size_t>(m.d) : 1u);
     const size_t channel_scalars = spatial * pack;
-    const size_t channel = scalar_index / channel_scalars;
+    const size_t channel_index = scalar_index / channel_scalars;
     const size_t within = scalar_index % channel_scalars;
     const size_t packed_element = within / pack;
     const size_t lane = within % pack;
-    const size_t element_offset = (m.dims >= 3 ? channel * m.cstep : 0u) + packed_element;
+
+    size_t element_offset = packed_element;
+    if (m.dims >= 3) {
+        const size_t channels_per_batch = static_cast<size_t>(m.c);
+        const size_t batch = channel_index / channels_per_batch;
+        const size_t channel = channel_index % channels_per_batch;
+        element_offset = batch * m.nstep + channel * m.cstep + packed_element;
+    }
     return static_cast<const unsigned char*>(m.data) + element_offset * m.elemsize + lane * scalar_bytes;
 }
 
@@ -87,7 +103,7 @@ static CompareStats measure_tensor(const ncnn::Mat& m)
         (m.elemsize % static_cast<size_t>(m.elempack)) != 0) return st;
     const size_t scalar_bytes = m.elemsize / static_cast<size_t>(m.elempack);
     if (scalar_bytes != 1 && scalar_bytes != 2 && scalar_bytes != 4) return st;
-    st.count = m.total() * static_cast<size_t>(m.elempack);
+    st.count = tensor_scalar_count(m);
     if (st.count == 0) return st;
 
     st.min_value = std::numeric_limits<double>::infinity();
@@ -120,9 +136,12 @@ static void log_compare_tensor(const char* name, const ncnn::Mat& a, const ncnn:
          b.dims,b.w,b.h,b.d,b.c,b.elemsize,b.elempack,sb.count,
          sb.valid?sb.min_value:0.0,sb.valid?sb.max_value:0.0,sb.valid?sb.mean:0.0,sb.valid?sb.stddev:0.0,sb.nonfinite);
 
-    if (!sa.valid || !sb.valid || sa.count != sb.count) {
-        LOGW("AHBCMP_DIFF frame=%lld ts=%lld name=%s status=INCOMPATIBLE A_valid=%d B_valid=%d A_count=%zu B_count=%zu",
-             (long long)frame_id,(long long)image_timestamp_ns,name,sa.valid?1:0,sb.valid?1:0,sa.count,sb.count);
+    const bool same_shape = a.dims == b.dims && a.w == b.w && a.h == b.h &&
+                            a.d == b.d && a.c == b.c && a.n == b.n;
+    if (!sa.valid || !sb.valid || sa.count != sb.count || !same_shape) {
+        LOGW("AHBCMP_DIFF frame=%lld ts=%lld name=%s status=INCOMPATIBLE A_valid=%d B_valid=%d A_shape=%d:%d,%d,%d,%d,%d B_shape=%d:%d,%d,%d,%d,%d A_count=%zu B_count=%zu",
+             (long long)frame_id,(long long)image_timestamp_ns,name,sa.valid?1:0,sb.valid?1:0,
+             a.dims,a.w,a.h,a.d,a.c,a.n,b.dims,b.w,b.h,b.d,b.c,b.n,sa.count,sb.count);
         return;
     }
     const size_t ba=a.elemsize/static_cast<size_t>(a.elempack);
