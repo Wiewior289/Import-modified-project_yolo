@@ -761,6 +761,8 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
                                std::vector<Object>& objects,int rotate_type,
                                int64_t frame_id,int64_t image_timestamp_ns)
 {
+    if (!model_loaded) return -1;
+    if (!ahb) return -2;
     static const int64_t sample_interval=30;
     static const uint32_t max_samples=10;
     if (frame_id<=0 || frame_id%sample_interval!=0 || ahb_compare_samples_done>=max_samples)
@@ -806,7 +808,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     log_compare_tensor("OUT0",ahb_snapshot.out0,cpu_snapshot.out0,frame_id,image_timestamp_ns);
     log_compare_detections("AHB",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
     log_compare_detections("CPU_YUV",cpu_snapshot.detections,cpu_snapshot.top_score,cpu_snapshot.top_class,frame_id,image_timestamp_ns);
-    LOGI("AHBCMP_TIMING frame=%lld ts=%lld AHB(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV(preprocess=%.3fms inference=%.3fms post=%.3fms)",
+    LOGI("AHBCMP_TIMING frame=%lld ts=%lld diag_readback=1 AHB(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV(preprocess=%.3fms inference=%.3fms post=%.3fms)",
          (long long)frame_id,(long long)image_timestamp_ns,
          ahb_snapshot.preprocess_ms,ahb_snapshot.infer_ms,ahb_snapshot.post_ms,
          cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms);
