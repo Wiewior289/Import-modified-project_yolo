@@ -32,6 +32,30 @@ endif()
 message(STATUS "Looking for ncnn package at: ${ncnn_DIR}")
 find_package(ncnn REQUIRED)
 
+# Refuse stale or unknown NCNN binaries. The pinned builder writes this marker
+# beside ncnnConfig.cmake only after building the exact clean upstream commit.
+get_filename_component(YOLO_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
+set(NCNN_PIN_FILE "${YOLO_REPO_ROOT}/ncnn.commit")
+if(NOT EXISTS "${NCNN_PIN_FILE}")
+    message(FATAL_ERROR "Missing ${NCNN_PIN_FILE}; expected pinned Tencent/ncnn source SHA.")
+endif()
+file(READ "${NCNN_PIN_FILE}" NCNN_EXPECTED_SHA)
+string(STRIP "${NCNN_EXPECTED_SHA}" NCNN_EXPECTED_SHA)
+if(NOT NCNN_EXPECTED_SHA MATCHES "^[0-9a-f]{40}$")
+    message(FATAL_ERROR "Invalid NCNN SHA in ${NCNN_PIN_FILE}: '${NCNN_EXPECTED_SHA}'")
+endif()
+
+set(NCNN_BUILD_MARKER "${ncnn_DIR}/ncnn-source-sha.txt")
+if(NOT EXISTS "${NCNN_BUILD_MARKER}")
+    message(FATAL_ERROR "NCNN package has no source-SHA marker: ${NCNN_BUILD_MARKER}. Run scripts/build_pinned_ncnn_android.sh.")
+endif()
+file(READ "${NCNN_BUILD_MARKER}" NCNN_BUILT_SHA)
+string(STRIP "${NCNN_BUILT_SHA}" NCNN_BUILT_SHA)
+if(NOT NCNN_BUILT_SHA STREQUAL NCNN_EXPECTED_SHA)
+    message(FATAL_ERROR "NCNN package SHA mismatch. Required=${NCNN_EXPECTED_SHA}; package=${NCNN_BUILT_SHA}. Rebuild pinned clean NCNN.")
+endif()
+message(STATUS "Verified clean Tencent/ncnn source SHA: ${NCNN_BUILT_SHA}")
+
 add_library(yolo11ncnn SHARED
     yolo11.cpp
     yolo11ncnn_jni.cpp
@@ -39,6 +63,10 @@ add_library(yolo11ncnn SHARED
 
 target_include_directories(yolo11ncnn PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_definitions(yolo11ncnn PRIVATE
+    YOLO_NCNN_SOURCE_SHA=\"${NCNN_EXPECTED_SHA}\"
 )
 
 target_link_libraries(yolo11ncnn PRIVATE
