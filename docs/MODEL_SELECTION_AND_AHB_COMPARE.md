@@ -49,7 +49,7 @@ The comparison is performed inside the existing synchronous `DetectFrame` JNI ca
 3. Native code compares the two snapshots and returns Path A detections to the normal app pipeline.
 4. The JNI call returns; Kotlin closes the HardwareBuffer wrapper and then the originating Camera2 Image.
 
-Both inferences use the same loaded model, same Vulkan backend, target resolution, rotation, thresholds, and source frame. The CPU path refers only to YUV-to-RGB preprocessing, not CPU inference.
+Both inferences use the same loaded model, same Vulkan backend, target resolution, rotation, thresholds, and source frame. The CPU path refers only to YUV-to-RGB preprocessing, not CPU inference. The pre-cast snapshot reports its actual element size; the next stage converts both normalized Mats to FP16 with the same NCNN cast utility when FP16 storage is enabled, then compares those tensors separately.
 
 For log volume control, A/B comparison runs on every 30th camera frame, up to 10 samples per model initialization. Other frames continue through the regular AHB path. Each sample logs compact statistics, not tensor dumps.
 
