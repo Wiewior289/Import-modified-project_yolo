@@ -164,16 +164,6 @@ static void log_compare_tensor(const char* name, const ncnn::Mat& a, const ncnn:
 }
 
 
-static void log_single_tensor(const char* name,const ncnn::Mat& m,int64_t frame_id,int64_t image_timestamp_ns)
-{
-    const CompareStats st=measure_tensor(m);
-    LOGI("AHBCMP_SINGLE frame=%lld ts=%lld name=%s shape=%d:%d,%d,%d,%d elemsize=%zu pack=%d count=%zu min=%.6g max=%.6g mean=%.6g std=%.6g nonfinite=%zu valid=%d",
-         (long long)frame_id,(long long)image_timestamp_ns,name,
-         m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,st.count,
-         st.valid?st.min_value:0.0,st.valid?st.max_value:0.0,
-         st.valid?st.mean:0.0,st.valid?st.stddev:0.0,st.nonfinite,st.valid?1:0);
-}
-
 static void log_rgb_samples(const ncnn::Mat& a, const ncnn::Mat& b,
                             int64_t frame_id, int64_t image_timestamp_ns)
 {
