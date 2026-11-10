@@ -1350,9 +1350,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         }
     } // VkMat / VkCompute / Extractor references die before allocator reclaim.
 
-    vkdev->reclaim_blob_allocator(blob_allocator);
-    vkdev->reclaim_staging_allocator(staging_allocator);
-
     if (execute_ret != 0) {
         LOGE("AHB frame failed at GPU stage (code=%d)", execute_ret);
         return -11;
@@ -1425,13 +1422,13 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
     if (!ahb) return -22;
     if (slot.state != AsyncFrameSlot::FREE) return -23;
 
+    release_async_slot_resources(slot);
     slot.state = AsyncFrameSlot::GPU_RUNNING;
     slot.frame_id = frame_id;
     slot.image_timestamp_ns = image_timestamp_ns;
-    for (auto& boundary : slot.boundary) boundary.release();
 
     auto fail_slot = [&](int code) {
-        for (auto& boundary : slot.boundary) boundary.release();
+        release_async_slot_resources(slot);
         slot.state = AsyncFrameSlot::FREE;
         return code;
     };
@@ -1447,9 +1444,9 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
 
     ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
+    slot.blob_vkallocator = blob_allocator;
+    slot.staging_vkallocator = staging_allocator;
     if (!blob_allocator || !staging_allocator) {
-        if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
-        if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
         return fail_slot(-25);
     }
 
@@ -1562,18 +1559,70 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
                 }
 
                 if (execute_ret == 0) {
-                    ncnn::Extractor gpu_ex = net.create_extractor();
-                    gpu_ex.set_light_mode(false);
-                    gpu_ex.set_blob_vkallocator(blob_allocator);
-                    gpu_ex.set_workspace_vkallocator(blob_allocator);
-                    gpu_ex.set_staging_vkallocator(staging_allocator);
-                    execute_ret = gpu_ex.input("in0", input_gpu);
+                    // Keep one Extractor instance per frame in N/N+1 mode. Its
+                    // VkMat table contains the seven delayed branches crossing
+                    // the CPU island and must survive until GPU continuation.
+                    ncnn::Extractor local_gpu_ex = net.create_extractor();
+                    ncnn::Extractor* gpu_ex = &local_gpu_ex;
+                    const bool async_ring = (compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC);
+                    if (async_ring) {
+                        slot.gpu_extractor.reset(new (std::nothrow) ncnn::Extractor(local_gpu_ex));
+                        if (!slot.gpu_extractor) {
+                            execute_ret = -33;
+                        } else {
+                            gpu_ex = slot.gpu_extractor.get();
+                        }
+                    }
+
                     if (execute_ret == 0) {
+                        gpu_ex->set_light_mode(async_ring);
+                        gpu_ex->set_blob_vkallocator(blob_allocator);
+                        gpu_ex->set_workspace_vkallocator(blob_allocator);
+                        gpu_ex->set_staging_vkallocator(staging_allocator);
+                        execute_ret = gpu_ex->input("in0", input_gpu);
+                    }
+
+                    if (execute_ret == 0 && async_ring) {
+                        // CPU island idx110..113 consumes exactly 133, 137 and
+                        // 136. Do not download the seven GPU carry blobs:
+                        // 37,72,123,125,128,129,135 remain live in this Extractor.
+                        static const int delegate_blob_ids[3] = {133, 137, 136};
+                        ncnn::VkMat delegate_gpu[3];
+                        for (int i = 0; i < 3 && execute_ret == 0; ++i) {
+                            execute_ret = gpu_ex->extract(delegate_blob_ids[i], delegate_gpu[i], cmd);
+                            if (execute_ret == 0 && delegate_gpu[i].empty()) execute_ret = -34;
+                        }
+
+                        if (execute_ret == 0) {
+                            ncnn::Option download_opt = opt;
+                            download_opt.use_packing_layout = false;
+                            for (int i = 0; i < 3; ++i) {
+                                cmd.record_download(delegate_gpu[i], slot.cpu_inputs[static_cast<size_t>(i)], download_opt);
+                            }
+                            execute_ret = cmd.submit_and_wait();
+                            if (execute_ret == 0) {
+                                for (int i = 0; i < 3; ++i) {
+                                    const ncnn::Mat& input = slot.cpu_inputs[static_cast<size_t>(i)];
+                                    if (input.empty()) {
+                                        execute_ret = -35;
+                                        break;
+                                    }
+                                    if (input.elemsize != 4u || input.elempack != 1) {
+                                        LOGE("CPU delegate input format mismatch blob=%d elemsize=%zu elempack=%d; expected FP32 pack1",
+                                             delegate_blob_ids[i], input.elemsize, input.elempack);
+                                        execute_ret = -36;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } else if (execute_ret == 0) {
+                        // Legacy Point B keeps its original full ten-blob cut.
                         static const int boundary_blob_ids[10] = {37, 72, 123, 125, 128, 129, 133, 135, 136, 137};
                         ncnn::VkMat boundary_gpu[10];
                         for (int i = 0; i < 10 && execute_ret == 0; ++i) {
-                            execute_ret = gpu_ex.extract(boundary_blob_ids[i], boundary_gpu[i], cmd);
-                            if (execute_ret == 0 && boundary_gpu[i].empty()) execute_ret = -33;
+                            execute_ret = gpu_ex->extract(boundary_blob_ids[i], boundary_gpu[i], cmd);
+                            if (execute_ret == 0 && boundary_gpu[i].empty()) execute_ret = -37;
                         }
 
                         if (execute_ret == 0) {
@@ -1587,13 +1636,13 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
                                 for (int i = 0; i < 10; ++i) {
                                     const ncnn::Mat& boundary = slot.boundary[static_cast<size_t>(i)];
                                     if (boundary.empty()) {
-                                        execute_ret = -34;
+                                        execute_ret = -38;
                                         break;
                                     }
                                     if (boundary.elemsize != 4u || boundary.elempack != 1) {
-                                        LOGE("Async boundary format mismatch blob_index=%d elemsize=%zu elempack=%d; expected FP32 pack1",
+                                        LOGE("Point B boundary format mismatch blob_index=%d elemsize=%zu elempack=%d; expected FP32 pack1",
                                              boundary_blob_ids[i], boundary.elemsize, boundary.elempack);
-                                        execute_ret = -36;
+                                        execute_ret = -39;
                                         break;
                                     }
                                 }
@@ -1616,9 +1665,20 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
         return fail_slot(execute_ret);
     }
 
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT) {
+        // Point B has no persistent GPU state after the ten CPU boundary Mats
+        // have been downloaded, so its allocators can return to the pool here.
+        release_async_gpu_resources(slot);
+        LOGD("POINT_B_PREFIX_READY frame=%lld slot=%d boundary_count=10",
+             static_cast<long long>(frame_id), slot_index);
+    } else {
+        // N/N+1 keeps both allocators and the one GPU Extractor alive across the
+        // CPU delegate. The seven delayed VkMat branches remain owned by it.
+        LOGD("ASYNC_PREFIX_READY frame=%lld slot=%d cpu_inputs=3 gpu_carry=7 extractor=%p",
+             static_cast<long long>(frame_id), slot_index, slot.gpu_extractor.get());
+    }
+
     slot.state = AsyncFrameSlot::CPU_READY;
-    LOGD("ASYNC_PREFIX_READY frame=%lld slot=%d boundary_count=10",
-         static_cast<long long>(frame_id), slot_index);
     return 0;
 }
 
