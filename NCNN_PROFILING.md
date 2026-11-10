@@ -2,17 +2,18 @@
 
 ## Compute modes
 
-The app exposes three modes in the selector:
+The selector exposes the existing compute modes plus a bounded same-frame AHB comparison mode:
 
 | Mode | Camera input path | Model execution |
 |---|---|---|
 | CPU | AHardwareBuffer CPU lockPlanes -> YUV420 to RGB on CPU -> resize / normalize | NCNN CPU |
 | GPU Vulkan | Same CPU-mapped YUV and CPU preprocessing as CPU mode | NCNN Vulkan |
 | GPU Vulkan + AHB | Import the Camera2 AHardwareBuffer into Vulkan -> GPU YCbCr conversion / rotate / resize / normalize | NCNN Vulkan |
+| DIAG: AHB vs CPU YUV + Vulkan | Same Camera2 Image/AHB, sequential AHB GPU preprocessing and CPU YUV preprocessing | Same loaded Net and Vulkan inference for both paths |
 
 The CPU and GPU Vulkan baselines intentionally share the same input conversion and preprocessing code. Their model backend is the controlled variable. The AHB mode remains the direct-import implementation.
 
-The CPU conversion currently assumes BT.601 limited-range YUV420. The Vulkan YCbCr sampler path can use a driver-selected conversion. Therefore CPU/Vulkan inference comparisons use identical CPU-prepared pixels, while comparison against Vulkan+AHB also includes any colour-conversion difference. The log labels this as `colorspace=BT601_LIMITED`.
+The CPU conversion currently assumes BT.601 limited-range YUV420. The Vulkan YCbCr sampler path can use a driver-selected conversion. The diagnostic mode compares both preprocessing paths from the same acquired Camera2 Image: AHB preprocessing first, then CPU plane locking/conversion, followed by Vulkan inference through the same loaded Net. It samples every 30th app frame, at most 10 samples per model initialization. RGB and normalized FP32 inputs are compared separately; AHB FP16 input statistics are logged on their own so dtype conversion is not confused with preprocessing error.
 
 Every mode retains the high-level, known-good output path:
 ```cpp
@@ -67,4 +68,4 @@ A deeper Extractor instrumentation pass should place timers around:
 3. final queue submit/wait,
 4. GPU timestamp interval around the download command.
 
-That source-level patch must be applied to the NCNN source matching the linked binary and then rebuilt. It is deliberately not approximated in app code, because the current output extraction path is the correctness reference.
+This diagnostic branch deliberately leaves NCNN source untouched and pins the linked library to the clean upstream commit in `ncnn.commit`. The same-frame AHB/CPU comparison is implemented in the app layer. Deeper Extractor or queue instrumentation would require a separate rebuild of that exact pinned NCNN source and is outside this diagnostic change.
