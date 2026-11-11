@@ -19,6 +19,10 @@
 #define YOLO_NCNN_SOURCE_SHA "UNVERIFIED"
 #endif
 
+#ifndef YOLO_NCNN_PATCHSET_SHA
+#define YOLO_NCNN_PATCHSET_SHA "UNVERIFIED"
+#endif
+
 #define TAG "Yolo11Ncnn_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
@@ -52,6 +56,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
 {
     LOGI("JNI_OnLoad called for YOLO11 AHB Import Mali-G72 Native Module");
     LOGI("NCNN_SOURCE_SHA=%s", YOLO_NCNN_SOURCE_SHA);
+    LOGI("NCNN_PATCHSET_SHA=%s", YOLO_NCNN_PATCHSET_SHA);
     const int vk_ret = ncnn::create_gpu_instance();
     if (vk_ret != 0) {
         LOGE("ncnn::create_gpu_instance failed: %d", vk_ret);
