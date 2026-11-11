@@ -879,14 +879,15 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 {
     if (!model_loaded) return -1;
     if (!ahb) return -2;
-    if (!cpu_net_loaded) {
-        LOGE("%s requires the CPU reference Net, but it was not loaded", original_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ? "MATMULCMP" : "AHBCMP");
-        return -3;
-    }
 
     const int original_mode=compute_mode;
     const bool matmul_compare = original_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE;
     const char* compare_tag = matmul_compare ? "MATMULCMP" : "AHBCMP";
+    if (!cpu_net_loaded) {
+        LOGE("%s requires the CPU reference Net, but it was not loaded", compare_tag);
+        return -3;
+    }
+
     struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
 
     static const int64_t sample_interval=30;
