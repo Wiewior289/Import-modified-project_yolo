@@ -95,7 +95,7 @@
  
              VkMat feat_gpu;
              ret = extract(blob_index, feat_gpu, cmd);
-@@ -2951,19 +2970,38 @@
+@@ -2951,19 +2970,39 @@
  
                  ret = cmd.submit_and_wait();
  
