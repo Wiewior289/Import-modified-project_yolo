@@ -55,33 +55,33 @@ string(STRIP "${NCNN_BUILT_SHA}" NCNN_BUILT_SHA)
 if(NOT NCNN_BUILT_SHA STREQUAL NCNN_EXPECTED_SHA)
     message(FATAL_ERROR "NCNN package SHA mismatch. Required=${NCNN_EXPECTED_SHA}; package=${NCNN_BUILT_SHA}. Rebuild pinned clean NCNN.")
 endif()
-message(STATUS "Verified pinned Tencent/ncnn base SHA: \${NCNN_BUILT_SHA}")
+message(STATUS "Verified pinned Tencent/ncnn base SHA: ${NCNN_BUILT_SHA}")
 
 # Verify the installed NCNN library was built with exactly this branch's local patchset.
-set(NCNN_PATCHSET_DIR "\${YOLO_REPO_ROOT}/patches/ncnn")
-set(NCNN_PATCH_HEADER "\${NCNN_PATCHSET_DIR}/matmul_vulkan.h")
-set(NCNN_PATCH_SOURCE "\${NCNN_PATCHSET_DIR}/matmul_vulkan.cpp")
-set(NCNN_PATCH_SHADER "\${NCNN_PATCHSET_DIR}/matmul.comp")
-foreach(PATCH_FILE IN ITEMS "\${NCNN_PATCH_HEADER}" "\${NCNN_PATCH_SOURCE}" "\${NCNN_PATCH_SHADER}")
-    if(NOT EXISTS "\${PATCH_FILE}")
-        message(FATAL_ERROR "Missing required NCNN patch file: \${PATCH_FILE}")
+set(NCNN_PATCHSET_DIR "${YOLO_REPO_ROOT}/patches/ncnn")
+set(NCNN_PATCH_HEADER "${NCNN_PATCHSET_DIR}/matmul_vulkan.h")
+set(NCNN_PATCH_SOURCE "${NCNN_PATCHSET_DIR}/matmul_vulkan.cpp")
+set(NCNN_PATCH_SHADER "${NCNN_PATCHSET_DIR}/matmul.comp")
+foreach(PATCH_FILE IN ITEMS "${NCNN_PATCH_HEADER}" "${NCNN_PATCH_SOURCE}" "${NCNN_PATCH_SHADER}")
+    if(NOT EXISTS "${PATCH_FILE}")
+        message(FATAL_ERROR "Missing required NCNN patch file: ${PATCH_FILE}")
     endif()
 endforeach()
-file(READ "\${NCNN_PATCH_HEADER}" NCNN_PATCH_HEADER_TEXT)
-file(READ "\${NCNN_PATCH_SOURCE}" NCNN_PATCH_SOURCE_TEXT)
-file(READ "\${NCNN_PATCH_SHADER}" NCNN_PATCH_SHADER_TEXT)
-string(SHA256 NCNN_EXPECTED_PATCHSET_SHA "\${NCNN_PATCH_HEADER_TEXT}\${NCNN_PATCH_SOURCE_TEXT}\${NCNN_PATCH_SHADER_TEXT}")
+file(READ "${NCNN_PATCH_HEADER}" NCNN_PATCH_HEADER_TEXT)
+file(READ "${NCNN_PATCH_SOURCE}" NCNN_PATCH_SOURCE_TEXT)
+file(READ "${NCNN_PATCH_SHADER}" NCNN_PATCH_SHADER_TEXT)
+string(SHA256 NCNN_EXPECTED_PATCHSET_SHA "${NCNN_PATCH_HEADER_TEXT}${NCNN_PATCH_SOURCE_TEXT}${NCNN_PATCH_SHADER_TEXT}")
 
-set(NCNN_PATCHSET_MARKER "\${ncnn_DIR}/ncnn-patchset-sha.txt")
-if(NOT EXISTS "\${NCNN_PATCHSET_MARKER}")
-    message(FATAL_ERROR "NCNN package has no patchset-SHA marker: \${NCNN_PATCHSET_MARKER}. Run scripts/build_pinned_ncnn_android.sh.")
+set(NCNN_PATCHSET_MARKER "${ncnn_DIR}/ncnn-patchset-sha.txt")
+if(NOT EXISTS "${NCNN_PATCHSET_MARKER}")
+    message(FATAL_ERROR "NCNN package has no patchset-SHA marker: ${NCNN_PATCHSET_MARKER}. Run scripts/build_pinned_ncnn_android.sh.")
 endif()
-file(READ "\${NCNN_PATCHSET_MARKER}" NCNN_BUILT_PATCHSET_SHA)
-string(STRIP "\${NCNN_BUILT_PATCHSET_SHA}" NCNN_BUILT_PATCHSET_SHA)
+file(READ "${NCNN_PATCHSET_MARKER}" NCNN_BUILT_PATCHSET_SHA)
+string(STRIP "${NCNN_BUILT_PATCHSET_SHA}" NCNN_BUILT_PATCHSET_SHA)
 if(NOT NCNN_BUILT_PATCHSET_SHA STREQUAL NCNN_EXPECTED_PATCHSET_SHA)
-    message(FATAL_ERROR "NCNN patchset mismatch. Required=\${NCNN_EXPECTED_PATCHSET_SHA}; package=\${NCNN_BUILT_PATCHSET_SHA}. Rebuild patched NCNN.")
+    message(FATAL_ERROR "NCNN patchset mismatch. Required=${NCNN_EXPECTED_PATCHSET_SHA}; package=${NCNN_BUILT_PATCHSET_SHA}. Rebuild patched NCNN.")
 endif()
-message(STATUS "Verified NCNN patchset SHA: \${NCNN_BUILT_PATCHSET_SHA}")
+message(STATUS "Verified NCNN patchset SHA: ${NCNN_BUILT_PATCHSET_SHA}")
 
 add_library(yolo11ncnn SHARED
     yolo11.cpp
@@ -93,8 +93,8 @@ target_include_directories(yolo11ncnn PRIVATE
 )
 
 target_compile_definitions(yolo11ncnn PRIVATE
-    YOLO_NCNN_SOURCE_SHA=\"\${NCNN_EXPECTED_SHA}\"
-    YOLO_NCNN_PATCHSET_SHA=\"\${NCNN_BUILT_PATCHSET_SHA}\"
+    YOLO_NCNN_SOURCE_SHA=\"${NCNN_EXPECTED_SHA}\"
+    YOLO_NCNN_PATCHSET_SHA=\"${NCNN_BUILT_PATCHSET_SHA}\"
 )
 
 target_link_libraries(yolo11ncnn PRIVATE
