@@ -201,7 +201,7 @@
  
      return 0;
  }
-@@ -2121,52 +2125,89 @@
+@@ -2121,49 +2125,86 @@
  
  #if NCNN_BENCHMARK
  int VkCompute::create_query_pool(uint32_t _query_count)
