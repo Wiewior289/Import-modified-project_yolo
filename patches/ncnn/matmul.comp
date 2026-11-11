@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Conservative FP32 MatMul. One invocation computes one output scalar.
+// Uses only ordinary storage-buffer reads/writes supported by Mali-G72.
+
+#version 450
+
+layout(constant_id = 0) const int transB = 0;
+
+layout(binding = 0) readonly buffer A_blob { sfp A_data[]; };
+layout(binding = 1) readonly buffer B_blob { sfp B_data[]; };
+layout(binding = 2) writeonly buffer top_blob { sfp top_data[]; };
+
+layout(push_constant) uniform parameter
+{
+    int M;
+    int N;
+    int K;
+
+    int A_dims;
+    int A_w;
+    int A_h;
+    int A_d;
+    int A_c;
+    int A_cstep;
+
+    int B_dims;
+    int B_w;
+    int B_h;
+    int B_d;
+    int B_c;
+    int B_cstep;
+
+    int out_dims;
+    int out_w;
+    int out_h;
+    int out_d;
+    int out_c;
+    int out_cstep;
+
+    int vector_mode;
+    int batch_layout_dims;
+} p;
+
+int input_base(int dims, int w, int h, int d, int cstep,
+               int batch_d, int batch_c)
+{
+    if (dims == 3)
+    {
+        // In a rank-4 matrix product, an original rank-3 input is promoted
+        // to (w,h,old_c,1): old c therefore maps to batch_d.
+        int channel = p.batch_layout_dims == 4 ? batch_d : batch_c;
+        return channel * cstep;
+    }
+    if (dims == 4)
+        return batch_c * cstep + batch_d * w * h;
+    return 0;
+}
+
+void main()
+{
+    const int gx = int(gl_GlobalInvocationID.x);
+    const int gy = int(gl_GlobalInvocationID.y);
+    const int gz = int(gl_GlobalInvocationID.z);
+
+    if (gx >= psc(out_w))
+        return;
+
+    int m = 0;
+    int n = 0;
+    int batch_d = 0;
+    int batch_c = 0;
+
+    if (p.out_dims == 1)
+    {
+        if (gy != 0 || gz != 0)
+            return;
+
+        if (p.vector_mode == 1)
+            n = gx;
+        else if (p.vector_mode == 2)
+            m = gx;
+        // vector_mode == 3 is the scalar dot product.
+    }
+    else if (p.vector_mode == 1 || p.vector_mode == 2)
+    {
+        if (p.out_dims == 2)
+        {
+            if (gy >= psc(out_h) || gz != 0)
+                return;
+            batch_c = gy;
+        }
+        else
+        {
+            if (gy >= psc(out_h) || gz >= psc(out_c))
+                return;
+            batch_d = gy;
+            batch_c = gz;
+        }
+
+        if (p.vector_mode == 1)
+            n = gx;
+        else
+            m = gx;
+    }
+    else if (p.out_dims == 2)
+    {
+        if (gy >= psc(out_h) || gz != 0)
+            return;
+        m = gy;
+        n = gx;
+    }
+    else if (p.out_dims == 3)
+    {
+        if (gy >= psc(out_h) || gz >= psc(out_c))
+            return;
+        m = gy;
+        n = gx;
+        batch_c = gz;
+    }
+    else
+    {
+        if (gy >= psc(out_h) * psc(out_d) || gz >= psc(out_c))
+            return;
+        batch_d = gy / psc(out_h);
+        m = gy - batch_d * psc(out_h);
+        n = gx;
+        batch_c = gz;
+    }
+
+    const int A_base = input_base(p.A_dims, psc(A_w), psc(A_h),
+                                  psc(A_d), psc(A_cstep), batch_d, batch_c);
+    const int B_base = input_base(p.B_dims, psc(B_w), psc(B_h),
+                                  psc(B_d), psc(B_cstep), batch_d, batch_c);
+
+    afp sum = afp(0.f);
+    for (int k = 0; k < psc(K); k++)
+    {
+        const int ai = A_base + (p.A_dims == 1 ? k : m * psc(A_w) + k);
+        const int bi = B_base + (p.B_dims == 1
+            ? k
+            : (transB == 0 ? k * psc(B_w) + n : n * psc(B_w) + k));
+
+        sum += buffer_ld1(A_data, ai) * buffer_ld1(B_data, bi);
+    }
+
+    int out_index;
+    if (p.out_dims == 1)
+        out_index = gx;
+    else if (p.out_dims == 2)
+        out_index = gy * psc(out_w) + gx;
+    else
+        out_index = gz * psc(out_cstep) + gy * psc(out_w) + gx;
+
+    buffer_st1(top_data, out_index, sum);
+}
