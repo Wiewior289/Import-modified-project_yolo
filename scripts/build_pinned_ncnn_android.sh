@@ -66,8 +66,9 @@ PATCH_DIR="${REPO_ROOT}/patches/ncnn"
 PATCH_HEADER="${PATCH_DIR}/matmul_vulkan.h"
 PATCH_SOURCE="${PATCH_DIR}/matmul_vulkan.cpp"
 PATCH_SHADER="${PATCH_DIR}/matmul.comp"
+PATCH_BENCHMARK="${PATCH_DIR}/benchmark_timestamp_safety.patch"
 
-for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}"; do
+for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}"; do
     if [[ ! -s "${patch_file}" ]]; then
         echo "ERROR: required MatMul Vulkan patch file is missing or empty: ${patch_file}" >&2
         exit 4
@@ -78,7 +79,13 @@ install -D -m 0644 "${PATCH_HEADER}" "${SOURCE_DIR}/src/layer/vulkan/matmul_vulk
 install -D -m 0644 "${PATCH_SOURCE}" "${SOURCE_DIR}/src/layer/vulkan/matmul_vulkan.cpp"
 install -D -m 0644 "${PATCH_SHADER}" "${SOURCE_DIR}/src/layer/vulkan/shader/matmul.comp"
 
-PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" | sha256sum | awk '{print $1}')"
+# Apply NCNN runtime instrumentation only to the pristine pinned source. The patch
+# defers query reads until the final fence, preserves query IDs across partial
+# submits, validates query handles/ranges, and emits MatMul CPU/Vulkan route logs.
+git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK}"
+git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK}"
+
+PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "ERROR: failed to calculate NCNN patchset SHA." >&2
     exit 4
@@ -87,7 +94,7 @@ fi
 echo "NCNN_SOURCE=${SOURCE_DIR}"
 echo "NCNN_SOURCE_SHA=${ACTUAL_SHA}"
 echo "NCNN_SOURCE_STATUS=PINNED_BASE_WITH_LOCAL_PATCHSET"
-echo "NCNN_PATCHES=MATMUL_VULKAN_FP32_ACCUMULATE"
+echo "NCNN_PATCHES=MATMUL_VULKAN_FP32_ACCUMULATE+BENCHMARK_TIMESTAMP_SAFETY"
 echo "NCNN_PATCHSET_SHA=${PATCHSET_SHA}"
 
 # Remove previous generated outputs so no old library can survive the reset.
@@ -103,7 +110,7 @@ cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
     -DNCNN_VULKAN=ON \
     -DNCNN_BATCH=ON \
-    -DNCNN_BENCHMARK=OFF \
+    -DNCNN_BENCHMARK=ON \
     -DNCNN_BUILD_BENCHMARK=OFF \
     -DNCNN_BUILD_TESTS=OFF \
     -DNCNN_BUILD_TOOLS=OFF \
