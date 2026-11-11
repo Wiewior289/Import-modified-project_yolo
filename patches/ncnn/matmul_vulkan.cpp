@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Conservative FP32 MatMul Vulkan backend.
-// No cooperative-matrix, subgroup-shuffle, or FP16 arithmetic requirement.
+// Conservative FP32-accumulate MatMul Vulkan backend.
+// No cooperative-matrix or subgroup-shuffle requirement.
 
 #include "matmul_vulkan.h"
 
