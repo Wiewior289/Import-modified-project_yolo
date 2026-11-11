@@ -311,7 +311,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     target_w = target_size;
     target_h = target_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
-        requested_compute_mode > YOLO_COMPUTE_AHB_COMPARE) {
+        requested_compute_mode > YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
         return -4;
     }
@@ -336,7 +336,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             return -4;
         }
 
-        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
             LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
@@ -379,7 +379,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -3;
     }
 
-    if (compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
+    if (compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
         cpu_net.opt.use_vulkan_compute = false;
         cpu_net.opt.use_fp16_packed = false;
         cpu_net.opt.use_fp16_storage = false;
@@ -504,7 +504,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -5;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;
@@ -617,6 +617,27 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     }
     LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
 
+    if (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+        int matmul_layers = 0;
+        for (size_t i = 0; i < model_layers.size(); ++i) {
+            const ncnn::Layer* layer = model_layers[i];
+            if (!layer || layer->type != "MatMul") continue;
+            ++matmul_layers;
+            LOGI("MATMUL_VK_LAYER idx=%zu name=%s support_vulkan=%d", i,
+                 layer->name.c_str(), layer->support_vulkan ? 1 : 0);
+            if (!layer->support_vulkan) {
+                LOGE("MatMul Vulkan diagnostic refused: layer %zu (%s) is still CPU-only",
+                     i, layer->name.c_str());
+                return -23;
+            }
+        }
+        if (matmul_layers == 0) {
+            LOGE("MatMul Vulkan diagnostic requested, but this model has no MatMul layers");
+            return -24;
+        }
+        LOGI("MATMUL_VK_GRAPH_READY layers=%d backend=FP32_VULKAN_REFERENCE=CPU", matmul_layers);
+    }
+
     generate_grids_and_stride(target_w, target_h);
 
     const size_t total_anchors = grid_strides.size();
@@ -659,7 +680,7 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
 
 int Yolo11::detect_frame(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns){
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode==YOLO_COMPUTE_VULKAN_AHB_ASYNC)return -13;
- if(compute_mode==YOLO_COMPUTE_AHB_COMPARE)return detect_ahb_compare(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
+ if(compute_mode==YOLO_COMPUTE_AHB_COMPARE || compute_mode==YOLO_COMPUTE_MATMUL_VULKAN_COMPARE)return detect_ahb_compare(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  return detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
 }
@@ -859,11 +880,13 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     if (!model_loaded) return -1;
     if (!ahb) return -2;
     if (!cpu_net_loaded) {
-        LOGE("AHBCMP requires the CPU reference Net, but it was not loaded");
+        LOGE("%s requires the CPU reference Net, but it was not loaded", original_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ? "MATMULCMP" : "AHBCMP");
         return -3;
     }
 
     const int original_mode=compute_mode;
+    const bool matmul_compare = original_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE;
+    const char* compare_tag = matmul_compare ? "MATMULCMP" : "AHBCMP";
     struct ModeRestore { int& mode; int original; ~ModeRestore(){mode=original;} } restore{compute_mode,original_mode};
 
     static const int64_t sample_interval=30;
@@ -880,7 +903,8 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
 
     AHardwareBuffer_Desc frame_desc{};
     AHardwareBuffer_describe(ahb,&frame_desc);
-    LOGI("AHBCMP_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d paths=CPU_YUV_CPU,CPU_YUV_VULKAN,AHB_VULKAN",
+    LOGI("%s_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d paths=AHB_VULKAN,CPU_YUV_CPU,CPU_YUV_VULKAN",
+         compare_tag,
          sample_number,(long long)frame_id,(long long)image_timestamp_ns,
          frame_desc.width,frame_desc.height,target_w,target_h,frame_desc.stride,frame_desc.format,
          (unsigned long long)frame_desc.usage,rotate_type);
@@ -889,7 +913,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     const int ret_ahb=detect_ahb(ahb,conf_thresh,nms_thresh,ahb_objects,rotate_type,
                                  frame_id,image_timestamp_ns,&ahb_snapshot);
     if(ret_ahb!=0){
-        LOGE("AHBCMP_END sample=%u frame=%lld status=FAIL_AHB ret=%d",sample_number,(long long)frame_id,ret_ahb);
+        LOGE("%s_END sample=%u frame=%lld status=FAIL_AHB ret=%d",compare_tag,sample_number,(long long)frame_id,ret_ahb);
         return ret_ahb;
     }
 
@@ -908,8 +932,8 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     last_top_score=ahb_snapshot.top_score;
     last_top_class=ahb_snapshot.top_class;
 
-    LOGI("AHBCMP_PATH_STATUS frame=%lld ts=%lld AHB_VULKAN=OK CPU_YUV_CPU=%s(%d) CPU_YUV_VULKAN=%s(%d)",
-         (long long)frame_id,(long long)image_timestamp_ns,
+    LOGI("%s_PATH_STATUS frame=%lld ts=%lld AHB_VULKAN=OK CPU_YUV_CPU=%s(%d) CPU_YUV_VULKAN=%s(%d)",
+         compare_tag, (long long)frame_id,(long long)image_timestamp_ns,
          ret_cpu==0?"OK":"FAIL",ret_cpu,ret_gpu==0?"OK":"FAIL",ret_gpu);
 
     if(ret_cpu==0){
@@ -944,13 +968,13 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     log_tensor_channels("AHB_OUT0",ahb_snapshot.out0,frame_id,image_timestamp_ns);
     log_compare_detections("AHB_VULKAN",ahb_snapshot.detections,ahb_snapshot.top_score,ahb_snapshot.top_class,frame_id,image_timestamp_ns);
 
-    LOGI("AHBCMP_TIMING frame=%lld ts=%lld AHB_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV_CPU(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) CPU_YUV_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) diagnostic_sample_cost_includes_3_full_passes=1",
-         (long long)frame_id,(long long)image_timestamp_ns,
+    LOGI("%s_TIMING frame=%lld ts=%lld AHB_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms) CPU_YUV_CPU(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) CPU_YUV_VULKAN(preprocess=%.3fms inference=%.3fms post=%.3fms ret=%d) diagnostic_sample_cost_includes_3_full_passes=1",
+         compare_tag, (long long)frame_id,(long long)image_timestamp_ns,
          ahb_snapshot.preprocess_ms,ahb_snapshot.infer_ms,ahb_snapshot.post_ms,
          cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms,ret_cpu,
          gpu_snapshot.preprocess_ms,gpu_snapshot.infer_ms,gpu_snapshot.post_ms,ret_gpu);
-    LOGI("AHBCMP_END sample=%u frame=%lld ts=%lld status=%s",
-         sample_number,(long long)frame_id,image_timestamp_ns,
+    LOGI("%s_END sample=%u frame=%lld ts=%lld status=%s",
+         compare_tag, sample_number,(long long)frame_id,image_timestamp_ns,
          (ret_cpu==0&&ret_gpu==0)?"OK":"PARTIAL");
     return 0;
 }
