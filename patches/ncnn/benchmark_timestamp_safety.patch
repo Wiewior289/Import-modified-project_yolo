@@ -110,9 +110,7 @@
 -                        continue;
 -
 -                    double duration_us = (end - start) * d->net->vulkan_device()->info.timestamp_period() / 1000;
--                    if (d->net->layers()[i]->type == "MatMul")
-                                NCNN_LOGE("[NCNN_BENCHMARK_GPU] type=%-16s name=%-30s duration=%.2lfus",
-                                          d->net->layers()[i]->type.c_str(), d->net->layers()[i]->name.c_str(), duration_us);
+-                    NCNN_LOGE("%-24s %-30s %8.2lfus    |", d->net->layers()[i]->type.c_str(), d->net->layers()[i]->name.c_str(), duration_us);
 +                if (ret == 0 && query_pool_ready)
 +                {
 +                    std::vector<uint64_t> results(d->net->layers().size() * 2, 0);
