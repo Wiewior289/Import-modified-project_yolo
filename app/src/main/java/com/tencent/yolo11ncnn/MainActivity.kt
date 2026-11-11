@@ -135,7 +135,8 @@ class MainActivity : AppCompatActivity() {
             "GPU Vulkan + AHB",
             "GPU AHB prefix + CPU suffix (Point B)",
             "GPU AHB + CPU suffix (N/N+1)",
-            "DIAG: AHB vs CPU YUV + Vulkan (10 samples)"
+            "DIAG: AHB vs CPU YUV + Vulkan (10 samples)",
+            "DIAG: MatMul Vulkan vs CPU (same frame, 10 samples)"
         )
         val computeAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, computeLabels)
         computeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
@@ -250,6 +251,7 @@ class MainActivity : AppCompatActivity() {
         Yolo11Ncnn.COMPUTE_VULKAN_AHB_SPLIT -> "GPU AHB prefix + CPU suffix (Point B)"
         Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC -> "GPU AHB + CPU suffix (N/N+1)"
         Yolo11Ncnn.COMPUTE_AHB_COMPARE -> "DIAG: AHB vs CPU YUV + Vulkan"
+        Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE -> "DIAG: MatMul Vulkan vs CPU (same frame)"
         else -> "UNKNOWN($mode)"
     }
 
@@ -353,8 +355,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun switchComputeMode(newMode: Int) {
         val previousMode = selectedComputeMode
-        if ((newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC &&
-             newMode != Yolo11Ncnn.COMPUTE_AHB_COMPARE) ||
+        if ((newMode !in Yolo11Ncnn.COMPUTE_CPU..Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE) ||
             newMode == previousMode) return
         selectedComputeMode = newMode
         reinitializePipeline("COMPUTE_MODE_SWITCH", previousMode)
