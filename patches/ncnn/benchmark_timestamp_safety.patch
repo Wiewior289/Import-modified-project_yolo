@@ -95,7 +95,7 @@
  
              VkMat feat_gpu;
              ret = extract(blob_index, feat_gpu, cmd);
-@@ -2951,19 +2970,37 @@
+@@ -2951,19 +2970,38 @@
  
                  ret = cmd.submit_and_wait();
  
@@ -131,7 +131,9 @@
 +
 +                            available_pairs++;
 +                            const double duration_us = (end - start) * d->net->vulkan_device()->info.timestamp_period() / 1000;
-+                            NCNN_LOGE("%-24s %-30s %8.2lfus    |", d->net->layers()[i]->type.c_str(), d->net->layers()[i]->name.c_str(), duration_us);
++                            if (d->net->layers()[i]->type == "MatMul")
++                                NCNN_LOGE("[NCNN_BENCHMARK_GPU] type=%-16s name=%-30s duration=%.2lfus",
++                                          d->net->layers()[i]->type.c_str(), d->net->layers()[i]->name.c_str(), duration_us);
 +                        }
 +                        NCNN_LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
 +                                  available_pairs, d->net->layers().size(), query_ret == 1 ? 1 : 0);
