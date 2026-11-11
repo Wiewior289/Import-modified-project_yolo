@@ -311,7 +311,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     target_w = target_size;
     target_h = target_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
-        requested_compute_mode > YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+        requested_compute_mode > YOLO_COMPUTE_MATMUL_VULKAN) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
         return -4;
     }
@@ -336,7 +336,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
             return -4;
         }
 
-        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+        if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE || compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN) {
             LOGI("AHB_CACHE_LIMIT=%zu", AHB_CACHE_LIMIT);
             const int ahb_ext = vkdev->info.support_VK_ANDROID_external_memory_android_hardware_buffer();
             if (ahb_ext <= 0) {
@@ -617,25 +617,50 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     }
     LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
 
-    if (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN ||
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+        const bool request_gpu_matmul =
+            compute_mode == YOLO_COMPUTE_MATMUL_VULKAN ||
+            compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE;
         int matmul_layers = 0;
+
         for (size_t i = 0; i < model_layers.size(); ++i) {
-            const ncnn::Layer* layer = model_layers[i];
+            ncnn::Layer* layer = model_layers[i];
             if (!layer || layer->type != "MatMul") continue;
             ++matmul_layers;
-            LOGI("MATMUL_VK_LAYER idx=%zu name=%s support_vulkan=%d", i,
-                 layer->name.c_str(), layer->support_vulkan ? 1 : 0);
-            if (!layer->support_vulkan) {
-                LOGE("MatMul Vulkan diagnostic refused: layer %zu (%s) is still CPU-only",
+
+            const int support_before = layer->support_vulkan ? 1 : 0;
+            if (!request_gpu_matmul && layer->support_vulkan) {
+                // Release the custom Vulkan pipeline and make Layer_final route
+                // this layer through its CPU implementation. The flag is set
+                // after load_model so Layer_final cannot overwrite this choice.
+                const int destroy_ret = layer->destroy_pipeline(net.opt);
+                if (destroy_ret != 0) {
+                    LOGE("MatMul CPU-control could not destroy Vulkan pipeline idx=%zu ret=%d", i, destroy_ret);
+                    return -25;
+                }
+                layer->support_vulkan = false;
+            }
+
+            LOGI("MATMUL_CONFIG idx=%zu name=%s requested=%s support_before=%d support_after=%d",
+                 i, layer->name.c_str(), request_gpu_matmul ? "VULKAN" : "CPU",
+                 support_before, layer->support_vulkan ? 1 : 0);
+
+            if (request_gpu_matmul && !layer->support_vulkan) {
+                LOGE("MatMul Vulkan requested but Layer_final has no active Vulkan implementation idx=%zu name=%s",
                      i, layer->name.c_str());
                 return -23;
             }
         }
+
         if (matmul_layers == 0) {
-            LOGE("MatMul Vulkan diagnostic requested, but this model has no MatMul layers");
+            LOGE("MatMul placement mode requested, but this model has no MatMul layers");
             return -24;
         }
-        LOGI("MATMUL_VK_GRAPH_READY layers=%d backend=FP32_VULKAN_REFERENCE=CPU", matmul_layers);
+
+        LOGI("MATMUL_GRAPH_READY layers=%d requested=%s capability_check=PASS runtime_route=WAITING_FOR_FRAME",
+             matmul_layers, request_gpu_matmul ? "VULKAN" : "CPU");
     }
 
     generate_grids_and_stride(target_w, target_h);
@@ -681,7 +706,7 @@ void Yolo11::generate_grids_and_stride(int target_w, int target_h)
 int Yolo11::detect_frame(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns){
  if(compute_mode==YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode==YOLO_COMPUTE_VULKAN_AHB_ASYNC)return -13;
  if(compute_mode==YOLO_COMPUTE_AHB_COMPARE || compute_mode==YOLO_COMPUTE_MATMUL_VULKAN_COMPARE)return detect_ahb_compare(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
- if(compute_mode==YOLO_COMPUTE_VULKAN_AHB)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
+ if(compute_mode==YOLO_COMPUTE_VULKAN_AHB || compute_mode==YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU || compute_mode==YOLO_COMPUTE_MATMUL_VULKAN)return detect_ahb(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
  return detect_cpu_or_vulkan(ahb,conf_thresh,nms_thresh,objects,rotate_type,frame_id,image_timestamp_ns);
 }
 
@@ -987,7 +1012,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     objects.clear();
     if (!model_loaded) return -1;
     if (!ahb) return -2;
-    if (compute_mode != YOLO_COMPUTE_VULKAN_AHB || !use_vulkan_compute || !vkdev) return -3;
+    if ((compute_mode != YOLO_COMPUTE_VULKAN_AHB &&
+         compute_mode != YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU &&
+         compute_mode != YOLO_COMPUTE_MATMUL_VULKAN) ||
+        !use_vulkan_compute || !vkdev) return -3;
 
     const auto frame_start = std::chrono::steady_clock::now();
 
