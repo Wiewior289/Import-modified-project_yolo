@@ -27,6 +27,8 @@ class Yolo11Ncnn {
         const val COMPUTE_VULKAN_AHB_ASYNC = 4
         const val COMPUTE_AHB_COMPARE = 5
         const val COMPUTE_MATMUL_VULKAN_COMPARE = 6
+        const val COMPUTE_VULKAN_AHB_MATMUL_CPU = 7
+        const val COMPUTE_MATMUL_VULKAN = 8
 
         const val ZONE_NEAR = 0
         const val ZONE_MID = 1
