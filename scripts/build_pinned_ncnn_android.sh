@@ -65,6 +65,36 @@ echo "NCNN_SOURCE_SHA=${ACTUAL_SHA}"
 echo "NCNN_SOURCE_STATUS=CLEAN"
 echo "NCNN_PATCHES=NONE"
 
+# Apply the repository-owned MatMul Vulkan extension after every pristine checkout.
+# The upstream NCNN SHA remains pinned; the local patchset is identified separately.
+PATCH_DIR="\${REPO_ROOT}/patches/ncnn"
+PATCH_HEADER="\${PATCH_DIR}/matmul_vulkan.h"
+PATCH_SOURCE="\${PATCH_DIR}/matmul_vulkan.cpp"
+PATCH_SHADER="\${PATCH_DIR}/matmul.comp"
+
+for patch_file in "\${PATCH_HEADER}" "\${PATCH_SOURCE}" "\${PATCH_SHADER}"; do
+    if [[ ! -s "\${patch_file}" ]]; then
+        echo "ERROR: required MatMul Vulkan patch file is missing or empty: \${patch_file}" >&2
+        exit 4
+    fi
+done
+
+install -D -m 0644 "\${PATCH_HEADER}" "\${SOURCE_DIR}/src/layer/vulkan/matmul_vulkan.h"
+install -D -m 0644 "\${PATCH_SOURCE}" "\${SOURCE_DIR}/src/layer/vulkan/matmul_vulkan.cpp"
+install -D -m 0644 "\${PATCH_SHADER}" "\${SOURCE_DIR}/src/layer/vulkan/shader/matmul.comp"
+
+PATCHSET_SHA="$(cat "\${PATCH_HEADER}" "\${PATCH_SOURCE}" "\${PATCH_SHADER}" | sha256sum | awk '{print $1}')"
+if [[ ! "\${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "ERROR: failed to calculate NCNN patchset SHA." >&2
+    exit 4
+fi
+
+echo "NCNN_SOURCE=\${SOURCE_DIR}"
+echo "NCNN_SOURCE_SHA=\${ACTUAL_SHA}"
+echo "NCNN_SOURCE_STATUS=PINNED_BASE_WITH_LOCAL_PATCHSET"
+echo "NCNN_PATCHES=MATMUL_VULKAN_FP32"
+echo "NCNN_PATCHSET_SHA=\${PATCHSET_SHA}"
+
 # Remove previous generated outputs so no old library can survive the reset.
 rm -rf "${BUILD_DIR}" "${INSTALL_PREFIX}"
 mkdir -p "${BUILD_DIR}" "$(dirname "${INSTALL_PREFIX}")"
@@ -101,11 +131,19 @@ if [[ "${INSTALLED_SHA}" != "${EXPECTED_SHA}" ]]; then
     exit 6
 fi
 
+printf '%s\n' "\${PATCHSET_SHA}" > "\${NCNN_CONFIG_DIR}/ncnn-patchset-sha.txt"
+INSTALLED_PATCHSET_SHA="$(tr -d '[:space:]' < "\${NCNN_CONFIG_DIR}/ncnn-patchset-sha.txt")"
+if [[ "\${INSTALLED_PATCHSET_SHA}" != "\${PATCHSET_SHA}" ]]; then
+    echo "ERROR: installed NCNN patchset marker mismatch." >&2
+    exit 6
+fi
+
 # Discard Gradle/CMake caches that could still point at an older NCNN package.
 rm -rf "${REPO_ROOT}/app/.cxx" "${REPO_ROOT}/app/build"
 
-echo "OK: clean upstream NCNN installed."
+echo "OK: pinned NCNN base + MatMul Vulkan patchset installed."
 echo "NCNN_SOURCE_SHA=${INSTALLED_SHA}"
+echo "NCNN_PATCHSET_SHA=${INSTALLED_PATCHSET_SHA}"
 echo "ncnn_DIR=${NCNN_CONFIG_DIR}"
 echo "Next:"
 echo "  rm -rf app/.cxx app/build"
