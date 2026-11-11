@@ -59,8 +59,10 @@ static bool make_matmul_plan(const VkMat& A, const VkMat& B,
     if (A.n != 1 || B.n != 1)
         return false;
 
-    // This first implementation intentionally consumes and produces FP32 pack1.
-    if (A.elemsize != 4u || B.elemsize != 4u ||
+    // NCNN's Vulkan graph may store activations as FP16. Keep the storage
+    // type used by the surrounding graph, but accumulate in FP32 in the shader.
+    if ((A.elemsize != 2u && A.elemsize != 4u) ||
+        A.elemsize != B.elemsize ||
         A.elempack != 1 || B.elempack != 1)
         return false;
 
@@ -211,10 +213,12 @@ int MatMul_vulkan::create_pipeline(const Option& opt)
     delete pipeline_matmul;
     pipeline_matmul = 0;
 
-    Option fp32_opt = opt;
-    fp32_opt.use_fp16_packed = false;
-    fp32_opt.use_fp16_storage = false;
-    fp32_opt.use_fp16_arithmetic = false;
+    // Preserve NCNN's FP16/FP32 storage ABI so this layer can connect to
+    // either kind of Vulkan producer without a hidden conversion/download.
+    // Arithmetic remains FP32 for accuracy and to avoid implicit-fp16 quirks.
+    Option matmul_opt = opt;
+    matmul_opt.use_fp16_arithmetic = false;
+    matmul_opt.use_fp16_uniform = false;
 
     std::vector<vk_specialization_type> specializations(1);
     specializations[0].i = transB;
@@ -223,7 +227,7 @@ int MatMul_vulkan::create_pipeline(const Option& opt)
     pipeline_matmul->set_local_size_xyz(8, 8, 1);
 
     const int ret = pipeline_matmul->create(
-        LayerShaderType::matmul, fp32_opt, specializations);
+        LayerShaderType::matmul, matmul_opt, specializations);
     if (ret != 0)
     {
         delete pipeline_matmul;
@@ -255,7 +259,7 @@ int MatMul_vulkan::forward(const std::vector<VkMat>& bottom_blobs,
     MatMulPlan plan;
     if (!make_matmul_plan(A, B, transB, plan))
     {
-        NCNN_LOGE("MatMul_vulkan unsupported shape/type A=%d:%d,%d,%d,%d pack=%d es=%zu B=%d:%d,%d,%d,%d pack=%d es=%zu transB=%d",
+        NCNN_LOGE("MatMul_vulkan unsupported shape/storage A=%d:%d,%d,%d,%d pack=%d es=%zu B=%d:%d,%d,%d,%d pack=%d es=%zu transB=%d",
                   A.dims, A.w, A.h, A.d, A.c, A.elempack, A.elemsize,
                   B.dims, B.w, B.h, B.d, B.c, B.elempack, B.elemsize,
                   transB);
@@ -263,14 +267,14 @@ int MatMul_vulkan::forward(const std::vector<VkMat>& bottom_blobs,
     }
 
     if (plan.out_dims == 1)
-        top_blob.create(plan.out_w, 4u, opt.blob_vkallocator);
+        top_blob.create(plan.out_w, A.elemsize, opt.blob_vkallocator);
     else if (plan.out_dims == 2)
-        top_blob.create(plan.out_w, plan.out_h, 4u, opt.blob_vkallocator);
+        top_blob.create(plan.out_w, plan.out_h, A.elemsize, opt.blob_vkallocator);
     else if (plan.out_dims == 3)
-        top_blob.create(plan.out_w, plan.out_h, plan.out_c, 4u, opt.blob_vkallocator);
+        top_blob.create(plan.out_w, plan.out_h, plan.out_c, A.elemsize, opt.blob_vkallocator);
     else
         top_blob.create(plan.out_w, plan.out_h, plan.out_d, plan.out_c,
-                        4u, opt.blob_vkallocator);
+                        A.elemsize, opt.blob_vkallocator);
 
     if (top_blob.empty())
         return -100;
