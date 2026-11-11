@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Conservative FP32 MatMul. One invocation computes one output scalar.
-// Uses only ordinary storage-buffer reads/writes supported by Mali-G72.
+// Conservative FP32-accumulate MatMul. One invocation computes one output scalar.
+// Storage follows NCNN FP16/FP32 graph format; accumulation uses afp (FP32).
 
 #version 450
 
