@@ -29,10 +29,11 @@
      double start = get_current_time();
      Mat bottom_blob;
      if (layer->one_blob_only)
-@@ -177,4 +179,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
-         {
-             benchmark(layer, start, end);
-         }
+@@ -178,5 +180,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
+     else
+     {
+         benchmark(layer, start, end);
+     }
 +    }
  #endif
 @@ -296,4 +299,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
@@ -64,7 +65,8 @@
          double start = get_current_time();
          Mat bottom_blob;
          if (layer->one_blob_only)
-@@ -356,4 +361,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -359,5 +364,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+         else
          {
              benchmark(layer, start, end);
          }
