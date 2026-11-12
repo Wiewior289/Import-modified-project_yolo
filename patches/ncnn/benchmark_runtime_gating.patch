@@ -34,7 +34,7 @@
              benchmark(layer, start, end);
          }
 +    }
- #endif
+ #endif // NCNN_BENCHMARK
 @@ -296,4 +299,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -        if (layer->type == "MatMul")
 +        if (opt.use_benchmark && layer->type == "MatMul")
@@ -45,12 +45,12 @@
  #if NCNN_BENCHMARK
 -        cmd.record_write_timestamp(layer_index * 2);
 +        if (opt.use_benchmark) cmd.record_write_timestamp(layer_index * 2);
- #endif
+ #endif // NCNN_BENCHMARK
 @@ -316,3 +319,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        cmd.record_write_timestamp(layer_index * 2 + 1);
 +        if (opt.use_benchmark) cmd.record_write_timestamp(layer_index * 2 + 1);
- #endif
+ #endif // NCNN_BENCHMARK
 @@ -322,4 +325,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -        if (layer->type == "MatMul")
 +        if (opt.use_benchmark && layer->type == "MatMul")
@@ -69,7 +69,7 @@
              benchmark(layer, start, end);
          }
 +        }
- #endif
+ #endif // NCNN_BENCHMARK
 @@ -361,3 +367,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -    if (layer->type == "MatMul")
 +    if (opt.use_benchmark && layer->type == "MatMul")
