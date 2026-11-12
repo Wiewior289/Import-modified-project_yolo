@@ -82,13 +82,13 @@ install -D -m 0644 "${PATCH_SHADER}" "${SOURCE_DIR}/src/layer/vulkan/shader/matm
 
 # Apply NCNN runtime instrumentation only to the pristine pinned source. The patch
 # defers query reads until the final fence, preserves query IDs across partial
-# submits, validates query handles/ranges, and emits MatMul CPU/Vulkan route logs.
+# submits, validates query handles/ranges, and emits per-layer GPU timings in diagnostic modes.
 git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK}"
 git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK}"
 git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK_RUNTIME}"
 git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK_RUNTIME}"
 
-PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" | sha256sum | awk '{print $1}')"
+PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "ERROR: failed to calculate NCNN patchset SHA." >&2
     exit 4
