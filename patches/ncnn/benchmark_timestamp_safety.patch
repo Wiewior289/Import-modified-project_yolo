@@ -131,9 +131,9 @@
 +
 +                            available_pairs++;
 +                            const double duration_us = (end - start) * d->net->vulkan_device()->info.timestamp_period() / 1000;
-+                            if (d->net->layers()[i]->type == "MatMul")
-+                                NCNN_LOGE("[NCNN_BENCHMARK_GPU] type=%-16s name=%-30s duration=%.2lfus",
-+                                          d->net->layers()[i]->type.c_str(), d->net->layers()[i]->name.c_str(), duration_us);
+                            NCNN_LOGE("[NCNN_BENCHMARK_GPU] idx=%zu type=%-16s name=%-30s duration=%.2lfus",
+                                      i, d->net->layers()[i]->type.c_str(),
+                                      d->net->layers()[i]->name.c_str(), duration_us);
 +                        }
 +                        NCNN_LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
 +                                  available_pairs, d->net->layers().size(), query_ret == 1 ? 1 : 0);

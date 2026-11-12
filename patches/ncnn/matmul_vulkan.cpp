@@ -315,15 +315,21 @@ int MatMul_vulkan::forward(const std::vector<VkMat>& bottom_blobs,
 
     // The real output VkMat is the dispatcher. In particular, its d/c fields
     // are required for complete 4-D dispatch coverage.
-    NCNN_LOGE("[MATMUL_VK_FORWARD] name=%s transB=%d A=%dx%dx%dx%d/d%d es=%zu B=%dx%dx%dx%d/d%d es=%zu M=%d N=%d K=%d out=%dx%dx%dx%d/d%d",
-              name.c_str(), transB,
-              A.w, A.h, A.d, A.c, A.dims, A.elemsize,
-              B.w, B.h, B.d, B.c, B.dims, B.elemsize,
-              plan.M, plan.N, plan.K,
-              top_blob.w, top_blob.h, top_blob.d, top_blob.c, top_blob.dims);
+    if (opt.use_benchmark)
+    {
+        NCNN_LOGE("[MATMUL_VK_FORWARD] name=%s transB=%d A=%dx%dx%dx%d/d%d es=%zu B=%dx%dx%dx%d/d%d es=%zu M=%d N=%d K=%d out=%dx%dx%dx%d/d%d",
+                  name.c_str(), transB,
+                  A.w, A.h, A.d, A.c, A.dims, A.elemsize,
+                  B.w, B.h, B.d, B.c, B.dims, B.elemsize,
+                  plan.M, plan.N, plan.K,
+                  top_blob.w, top_blob.h, top_blob.d, top_blob.c, top_blob.dims);
+    }
     cmd.record_pipeline(pipeline_matmul, bindings, constants, top_blob);
-    NCNN_LOGE("[MATMUL_VK_DISPATCH_RECORDED] name=%s local_size=8x8x1 M=%d N=%d K=%d",
-              name.c_str(), plan.M, plan.N, plan.K);
+    if (opt.use_benchmark)
+    {
+        NCNN_LOGE("[MATMUL_VK_DISPATCH_RECORDED] name=%s local_size=8x8x1 M=%d N=%d K=%d",
+                  name.c_str(), plan.M, plan.N, plan.K);
+    }
     return 0;
 }
 

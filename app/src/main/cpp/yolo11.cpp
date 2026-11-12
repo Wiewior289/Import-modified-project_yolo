@@ -364,6 +364,11 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     net.opt.use_fp16_arithmetic = use_vulkan_compute;
     net.opt.lightmode           = true;
     net.opt.num_threads         = 4;
+    const bool runtime_benchmark =
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ||
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU;
+    net.opt.use_benchmark = runtime_benchmark;
+    LOGI("NCNN_BENCHMARK_RUNTIME enabled=%d mode=%d", runtime_benchmark ? 1 : 0, compute_mode);
 
     char parampath[256];
     char binpath[256];
@@ -393,6 +398,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         cpu_net.opt.use_packing_layout = true;
         cpu_net.opt.lightmode = true;
         cpu_net.opt.num_threads = 4;
+        cpu_net.opt.use_benchmark = (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE);
 
         const int cpu_param_ret = cpu_net.load_param(mgr, parampath);
         if (cpu_param_ret != 0) {
