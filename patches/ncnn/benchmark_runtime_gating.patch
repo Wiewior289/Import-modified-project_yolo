@@ -1,6 +1,6 @@
 --- a/src/option.h
 +++ b/src/option.h
-@@ -112,6 +112,9 @@ public:
+@@ -158,6 +158,9 @@ public:
      bool use_int16_packed;
      bool use_int16_storage;
      bool use_reserved_11;
@@ -22,60 +22,60 @@
  } // namespace ncnn
 --- a/src/net.cpp
 +++ b/src/net.cpp
-@@ -115,4 +115,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
+@@ -145,4 +145,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
  #if NCNN_BENCHMARK
 +    if (opt.use_benchmark)
 +    {
      double start = get_current_time();
      Mat bottom_blob;
      if (layer->one_blob_only)
-@@ -138,4 +140,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
+@@ -177,4 +179,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
          {
              benchmark(layer, start, end);
          }
 +    }
  #endif
-@@ -279,4 +282,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -296,4 +299,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -        if (layer->type == "MatMul")
 +        if (opt.use_benchmark && layer->type == "MatMul")
          {
              const int b0 = layer->bottoms.empty() ? -1 : layer->bottoms[0];
              const int b1 = layer->bottoms.size() < 2 ? -1 : layer->bottoms[1];
-@@ -304,3 +307,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -305,3 +308,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        cmd.record_write_timestamp(layer_index * 2);
 +        if (opt.use_benchmark) cmd.record_write_timestamp(layer_index * 2);
  #endif
-@@ -315,3 +318,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -316,3 +319,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        cmd.record_write_timestamp(layer_index * 2 + 1);
 +        if (opt.use_benchmark) cmd.record_write_timestamp(layer_index * 2 + 1);
  #endif
-@@ -320,4 +323,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -322,4 +325,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -        if (layer->type == "MatMul")
 +        if (opt.use_benchmark && layer->type == "MatMul")
          {
              const int b0 = layer->bottoms.empty() ? -1 : layer->bottoms[0];
              const int b1 = layer->bottoms.size() < 2 ? -1 : layer->bottoms[1];
-@@ -335,4 +338,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -331,4 +334,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 +        if (opt.use_benchmark)
 +        {
          double start = get_current_time();
          Mat bottom_blob;
          if (layer->one_blob_only)
-@@ -357,4 +362,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -356,4 +361,5 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
          {
              benchmark(layer, start, end);
          }
 +        }
  #endif
-@@ -364,3 +370,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -361,3 +367,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
 -    if (layer->type == "MatMul")
 +    if (opt.use_benchmark && layer->type == "MatMul")
          NCNN_LOGE("[MATMUL_ROUTE_DONE] idx=%d name=%s route=%s ret=%d",
                    layer_index, layer->name.c_str(), layer->support_vulkan ? "VULKAN" : "CPU", ret);
-@@ -2960,6 +2966,7 @@ int Extractor::extract(int blob_index, Mat& feat, int type)
+@@ -2957,6 +2963,7 @@ int Extractor::extract(int blob_index, Mat& feat, int type)
  #if NCNN_BENCHMARK
 -            const int query_pool_ret = cmd.create_query_pool((uint32_t)d->net->layers().size() * 2);
 -            const bool query_pool_ready = query_pool_ret == 0;
