@@ -52,6 +52,12 @@ static void log_tensor_stats(const char*name,const ncnn::Mat&m,int64_t frame,int
  (long long)frame,(long long)ts,name,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,n,mn,mx,finite?sum/finite:0.0,nf,s[0],s[1],s[2],s[3]);
 }
 static void log_vkmat(const char*name,const ncnn::VkMat&m,int64_t frame,int64_t ts){
+ if (!m.data) {
+  LOGW("TENSOR_VK frame=%lld ts=%lld name=%s EMPTY_OR_NO_BUFFER empty=%d dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d total=%zu data=%p allocator=%p",
+       (long long)frame,(long long)ts,name,m.empty()?1:0,m.dims,m.w,m.h,m.d,m.c,
+       m.elemsize,m.elempack,m.total(),(const void*)m.data,(const void*)m.allocator);
+  return;
+ }
  LOGI("TENSOR_VK frame=%lld ts=%lld name=%s empty=%d dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d total=%zu data=%p allocator=%p offset=%zu capacity=%zu",
  (long long)frame,(long long)ts,name,m.empty()?1:0,m.dims,m.w,m.h,m.d,m.c,m.elemsize,m.elempack,m.total(),
  (const void*)m.data,(const void*)m.allocator,m.buffer_offset(),m.buffer_capacity());
@@ -504,7 +510,13 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -5;
     }
 
-    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB || compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT || compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC || compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
+    if (compute_mode == YOLO_COMPUTE_VULKAN_AHB ||
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_SPLIT ||
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_ASYNC ||
+        compute_mode == YOLO_COMPUTE_AHB_COMPARE ||
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ||
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN) {
     if (scale_layer) {
         scale_layer->destroy_pipeline(net.opt);
         delete scale_layer;

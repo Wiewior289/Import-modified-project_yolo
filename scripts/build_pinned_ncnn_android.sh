@@ -63,17 +63,23 @@ fi
 # Apply the repository-owned MatMul Vulkan extension after every pristine checkout.
 # The upstream NCNN SHA remains pinned; the local patchset is identified separately.
 PATCH_DIR="${REPO_ROOT}/patches/ncnn"
+PATCH_AHB="${PATCH_DIR}/0001-ahb-normalized-ycbcr-sampling.patch"
 PATCH_HEADER="${PATCH_DIR}/matmul_vulkan.h"
 PATCH_SOURCE="${PATCH_DIR}/matmul_vulkan.cpp"
 PATCH_SHADER="${PATCH_DIR}/matmul.comp"
 PATCH_BENCHMARK="${PATCH_DIR}/benchmark_timestamp_safety.patch"
 
-for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}"; do
+for patch_file in "${PATCH_AHB}" "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}"; do
     if [[ ! -s "${patch_file}" ]]; then
         echo "ERROR: required MatMul Vulkan patch file is missing or empty: ${patch_file}" >&2
         exit 4
     fi
 done
+
+# Restore the AHB YCbCr sampler/coordinate correction used by the known-good branch.
+# ncnn.commit is pinned to the exact upstream revision this patch was authored for.
+git -C "${SOURCE_DIR}" apply --check "${PATCH_AHB}"
+git -C "${SOURCE_DIR}" apply "${PATCH_AHB}"
 
 install -D -m 0644 "${PATCH_HEADER}" "${SOURCE_DIR}/src/layer/vulkan/matmul_vulkan.h"
 install -D -m 0644 "${PATCH_SOURCE}" "${SOURCE_DIR}/src/layer/vulkan/matmul_vulkan.cpp"
@@ -85,7 +91,7 @@ install -D -m 0644 "${PATCH_SHADER}" "${SOURCE_DIR}/src/layer/vulkan/shader/matm
 git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK}"
 git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK}"
 
-PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" | sha256sum | awk '{print $1}')"
+PATCHSET_SHA="$(cat "${PATCH_AHB}" "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "ERROR: failed to calculate NCNN patchset SHA." >&2
     exit 4
@@ -94,7 +100,7 @@ fi
 echo "NCNN_SOURCE=${SOURCE_DIR}"
 echo "NCNN_SOURCE_SHA=${ACTUAL_SHA}"
 echo "NCNN_SOURCE_STATUS=PINNED_BASE_WITH_LOCAL_PATCHSET"
-echo "NCNN_PATCHES=MATMUL_VULKAN_FP32_ACCUMULATE+BENCHMARK_TIMESTAMP_SAFETY"
+echo "NCNN_PATCHES=AHB_NORMALIZED_YCBCR_SAMPLING+MATMUL_VULKAN_FP32_ACCUMULATE+BENCHMARK_TIMESTAMP_SAFETY"
 echo "NCNN_PATCHSET_SHA=${PATCHSET_SHA}"
 
 # Remove previous generated outputs so no old library can survive the reset.
@@ -143,7 +149,7 @@ fi
 # Discard Gradle/CMake caches that could still point at an older NCNN package.
 rm -rf "${REPO_ROOT}/app/.cxx" "${REPO_ROOT}/app/build"
 
-echo "OK: pinned NCNN base + MatMul Vulkan patchset installed."
+echo "OK: pinned NCNN base + AHB + MatMul Vulkan patchset installed."
 echo "NCNN_SOURCE_SHA=${INSTALLED_SHA}"
 echo "NCNN_PATCHSET_SHA=${INSTALLED_PATCHSET_SHA}"
 echo "ncnn_DIR=${NCNN_CONFIG_DIR}"
