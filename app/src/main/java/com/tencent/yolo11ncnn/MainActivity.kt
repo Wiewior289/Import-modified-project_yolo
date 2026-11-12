@@ -131,14 +131,18 @@ class MainActivity : AppCompatActivity() {
         val computeSpinner = Spinner(this)
         val computeModes = listOf(
             Yolo11Ncnn.COMPUTE_CPU,
+            Yolo11Ncnn.COMPUTE_VULKAN,
+            Yolo11Ncnn.COMPUTE_VULKAN_AHB,
             Yolo11Ncnn.COMPUTE_VULKAN_AHB_MATMUL_CPU,
             Yolo11Ncnn.COMPUTE_MATMUL_VULKAN,
             Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE
         )
         val computeLabels = listOf(
             "CPU (pełny baseline)",
+            "GPU Vulkan + wejście Mat",
+            "GPU Vulkan + AHB",
             "GPU Vulkan + AHB / MatMul CPU (kontrola)",
-            "GPU_MATMUL Vulkan + AHB",
+            "GPU Vulkan + AHB / MatMul Vulkan (cel)",
             "DIAG: porównanie MatMul Vulkan vs CPU"
         )
         val computeAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, computeLabels)
@@ -363,6 +367,8 @@ class MainActivity : AppCompatActivity() {
         val previousMode = selectedComputeMode
         val selectableModes = setOf(
             Yolo11Ncnn.COMPUTE_CPU,
+            Yolo11Ncnn.COMPUTE_VULKAN,
+            Yolo11Ncnn.COMPUTE_VULKAN_AHB,
             Yolo11Ncnn.COMPUTE_VULKAN_AHB_MATMUL_CPU,
             Yolo11Ncnn.COMPUTE_MATMUL_VULKAN,
             Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE
