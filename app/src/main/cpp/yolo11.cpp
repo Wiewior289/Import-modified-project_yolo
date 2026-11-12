@@ -616,19 +616,6 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
 
 
 
-    // Static graph/capabilities only; does not claim runtime backend placement.
-    const auto& model_layers=net.layers();const auto& model_blobs=net.blobs();
-    LOGI("NCNN_GRAPH_INVENTORY layers=%zu blobs=%zu mode=%d",model_layers.size(),model_blobs.size(),compute_mode);
-    for(size_t i=0;i<model_layers.size();i++){const ncnn::Layer*l=model_layers[i];if(!l)continue;
-        const std::string b=blob_edges(l->bottoms,model_blobs),t=blob_edges(l->tops,model_blobs);
-        LOGI("NCNN_GRAPH_LAYER idx=%zu type=%s name=%s hint=%s vulkan=%d pack=%d vkpack=%d fp16=%d int8=%d tensor=%d anypack=%d vkanypack=%d bottoms=%s tops=%s",
-             i,l->type.c_str(),l->name.c_str(),l->support_vulkan?"VULKAN_CAPABLE_RUNTIME_UNVERIFIED":"CPU_ONLY_CANDIDATE",
-             l->support_vulkan?1:0,l->support_packing?1:0,l->support_vulkan_packing?1:0,
-             l->support_fp16_storage?1:0,l->support_int8_storage?1:0,l->support_tensor_storage?1:0,
-             l->support_any_packing?1:0,l->support_vulkan_any_packing?1:0,b.c_str(),t.c_str());
-    }
-    LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
-
     if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN ||
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
@@ -674,6 +661,33 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         LOGI("MATMUL_GRAPH_READY layers=%d requested=%s capability_check=PASS runtime_route=WAITING_FOR_FRAME",
              matmul_layers, request_gpu_matmul ? "VULKAN" : "CPU");
     }
+
+    if (vkdev) {
+        LOGI("VULKAN_FP16_CAPS device=%s packed=%d storage=%d uniform=%d arithmetic=%d implicit_arithmetic_bug=%d",
+             vkdev->info.device_name(),
+             vkdev->info.support_fp16_packed() ? 1 : 0,
+             vkdev->info.support_fp16_storage() ? 1 : 0,
+             vkdev->info.support_fp16_uniform() ? 1 : 0,
+             vkdev->info.support_fp16_arithmetic() ? 1 : 0,
+             vkdev->info.bug_implicit_fp16_arithmetic() ? 1 : 0);
+    }
+    LOGI("NCNN_NET_OPTIONS mode=%d vulkan=%d fp16_packed=%d fp16_storage=%d fp16_arithmetic=%d fp16_uniform=%d",
+         compute_mode, net.opt.use_vulkan_compute ? 1 : 0,
+         net.opt.use_fp16_packed ? 1 : 0, net.opt.use_fp16_storage ? 1 : 0,
+         net.opt.use_fp16_arithmetic ? 1 : 0, net.opt.use_fp16_uniform ? 1 : 0);
+
+    // Inventory follows MatMul backend selection, so mode 7 reports final placement.
+    const auto& model_layers=net.layers();const auto& model_blobs=net.blobs();
+    LOGI("NCNN_GRAPH_INVENTORY layers=%zu blobs=%zu mode=%d",model_layers.size(),model_blobs.size(),compute_mode);
+    for(size_t i=0;i<model_layers.size();i++){const ncnn::Layer*l=model_layers[i];if(!l)continue;
+        const std::string b=blob_edges(l->bottoms,model_blobs),t=blob_edges(l->tops,model_blobs);
+        LOGI("NCNN_GRAPH_LAYER idx=%zu type=%s name=%s hint=%s vulkan=%d pack=%d vkpack=%d fp16=%d int8=%d tensor=%d anypack=%d vkanypack=%d bottoms=%s tops=%s",
+             i,l->type.c_str(),l->name.c_str(),l->support_vulkan?"VULKAN_CAPABLE_RUNTIME_UNVERIFIED":"CPU_ONLY_CANDIDATE",
+             l->support_vulkan?1:0,l->support_packing?1:0,l->support_vulkan_packing?1:0,
+             l->support_fp16_storage?1:0,l->support_int8_storage?1:0,l->support_tensor_storage?1:0,
+             l->support_any_packing?1:0,l->support_vulkan_any_packing?1:0,b.c_str(),t.c_str());
+    }
+    LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
 
     generate_grids_and_stride(target_w, target_h);
 
