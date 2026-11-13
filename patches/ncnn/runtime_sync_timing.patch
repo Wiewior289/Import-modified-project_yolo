@@ -1,21 +1,18 @@
 diff --git a/src/command.cpp b/src/command.cpp
-index 49ca3e94097a..000000000000 100644
+index 49ca3e9..b718207 100644
 --- a/src/command.cpp
 +++ b/src/command.cpp
-@@ -6,8 +6,11 @@
- #if NCNN_VULKAN
- 
+@@ -8,6 +8,9 @@
  #include "option.h"
  #include "pipeline.h"
-+
+ 
 +#include <atomic>
 +#include <chrono>
- 
++
  namespace ncnn {
  
  class VkComputePrivate
-@@ -1832,9 +1835,24 @@
- #endif // NCNN_PLATFORM_API
+@@ -1833,7 +1833,22 @@ void VkCompute::record_import_android_hardware_buffer(const ImportAndroidHardwar
  
  int VkCompute::submit_and_wait()
  {
@@ -38,9 +35,7 @@ index 49ca3e94097a..000000000000 100644
  
      if (!vkdev->info.support_VK_KHR_push_descriptor())
      {
-         d->begin_command_buffer();
-@@ -1932,18 +1950,28 @@
-             }
+@@ -1933,16 +1951,26 @@ int VkCompute::submit_and_wait()
          }
      }
  
@@ -68,9 +63,7 @@ index 49ca3e94097a..000000000000 100644
          return -1;
      }
  
-     // submit compute
-@@ -1958,12 +1986,16 @@
-         submitInfo.pCommandBuffers = &d->compute_command_buffer;
+@@ -1959,10 +1987,14 @@ int VkCompute::submit_and_wait()
          submitInfo.signalSemaphoreCount = 0;
          submitInfo.pSignalSemaphores = 0;
  
@@ -86,8 +79,7 @@ index 49ca3e94097a..000000000000 100644
              vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
              return -1;
          }
-@@ -1971,17 +2003,22 @@
-     vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+@@ -1972,15 +2004,20 @@ int VkCompute::submit_and_wait()
  
      // wait
      {
@@ -109,9 +101,7 @@ index 49ca3e94097a..000000000000 100644
      for (size_t i = 0; i < d->delayed_records.size(); i++)
      {
          const VkComputePrivate::record& r = d->delayed_records[i];
- 
-@@ -2033,11 +2070,24 @@
-             break;
+@@ -2034,10 +2071,23 @@ int VkCompute::submit_and_wait()
          }
      }
  
@@ -121,7 +111,7 @@ index 49ca3e94097a..000000000000 100644
      d->delayed_records.clear();
  
      d->pending_dispatch_total = 0;
-+
+ 
 +    const double total_wall_ms = std::chrono::duration<double, std::milli>(
 +        sync_clock::now() - sync_start).count();
 +    NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=OK pending_dispatches=%llu delayed_records=%zu download_buffers=%zu "
@@ -131,24 +121,23 @@ index 49ca3e94097a..000000000000 100644
 +              delayed_record_count, download_buffer_count,
 +              delayed_record_replay_ms, command_buffer_end_ms, queue_acquire_ms,
 +              queue_submit_ms, fence_wait_wall_ms, post_download_cpu_ms, total_wall_ms);
- 
++
      return 0;
  }
  
 diff --git a/src/net.cpp b/src/net.cpp
-index e03b93bda3dd..000000000000 100644
+index 66dd737..a6dcada 100644
 --- a/src/net.cpp
 +++ b/src/net.cpp
-@@ -10,8 +10,9 @@
+@@ -11,6 +11,7 @@
+ 
  #include <stdarg.h>
  #include <stdint.h>
 +#include <chrono>
  #include <string.h>
  
  #if NCNN_BENCHMARK
- #include "benchmark.h"
-@@ -198,8 +199,9 @@
- 
+@@ -199,6 +200,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
      //     NCNN_LOGE("forward_layer %d %d %s", layer->support_vulkan, layer_index, layer->name.c_str());
  
      bool cmd_submit_and_wait = false;
@@ -156,9 +145,7 @@ index e03b93bda3dd..000000000000 100644
  
      // load bottom blobs
      for (size_t i = 0; i < layer->bottoms.size(); i++)
-     {
-@@ -242,8 +244,9 @@
-                     blob_mats_gpu[bottom_blob_index].release();
+@@ -243,6 +245,7 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
                  }
  
                  cmd_submit_and_wait = true;
@@ -166,9 +153,7 @@ index e03b93bda3dd..000000000000 100644
              }
          }
      }
- 
-@@ -266,17 +269,32 @@
-     else if (rough_score > 10)
+@@ -267,7 +270,9 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
      {
          pending_dispatch_threshold = 256 * 1024; // 256K
      }
@@ -179,7 +164,7 @@ index e03b93bda3dd..000000000000 100644
      {
          cmd_submit_and_wait = true;
      }
- 
+@@ -275,7 +280,20 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
      int ret;
      if (cmd_submit_and_wait)
      {
@@ -198,5 +183,5 @@ index e03b93bda3dd..000000000000 100644
 +        NCNN_LOGE("[NCNN_VK_FLUSH_DONE] layer_idx=%d name=%s trigger=%s submit_wait_wall_ms=%.3f ret=%d",
 +                  layer_index, layer->name.c_str(), flush_trigger, flush_wall_ms, ret);
  
- #if NCNN_BENCHMARK
-         std::vector<uint64_t> results(layer_index * 2);
+         // GPU timestamps are collected once, after the final submit_and_wait().
+         // Reading them during a partial flush repeatedly calls into the Mali
