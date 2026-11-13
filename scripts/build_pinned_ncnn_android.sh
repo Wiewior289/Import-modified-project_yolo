@@ -68,8 +68,9 @@ PATCH_SOURCE="${PATCH_DIR}/matmul_vulkan.cpp"
 PATCH_SHADER="${PATCH_DIR}/matmul.comp"
 PATCH_BENCHMARK="${PATCH_DIR}/benchmark_timestamp_safety.patch"
 PATCH_BENCHMARK_RUNTIME="${PATCH_DIR}/benchmark_runtime_gating.patch"
+PATCH_SYNC="${PATCH_DIR}/runtime_sync_timing.patch"
 
-for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}"; do
+for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}"; do
     if [[ ! -s "${patch_file}" ]]; then
         echo "ERROR: required MatMul Vulkan patch file is missing or empty: ${patch_file}" >&2
         exit 4
@@ -87,8 +88,10 @@ git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK}"
 git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK}"
 git -C "${SOURCE_DIR}" apply --check "${PATCH_BENCHMARK_RUNTIME}"
 git -C "${SOURCE_DIR}" apply "${PATCH_BENCHMARK_RUNTIME}"
+git -C "${SOURCE_DIR}" apply --check "${PATCH_SYNC}"
+git -C "${SOURCE_DIR}" apply "${PATCH_SYNC}"
 
-PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" | sha256sum | awk '{print $1}')"
+PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "ERROR: failed to calculate NCNN patchset SHA." >&2
     exit 4
@@ -97,7 +100,7 @@ fi
 echo "NCNN_SOURCE=${SOURCE_DIR}"
 echo "NCNN_SOURCE_SHA=${ACTUAL_SHA}"
 echo "NCNN_SOURCE_STATUS=PINNED_BASE_WITH_LOCAL_PATCHSET"
-echo "NCNN_PATCHES=MATMUL_VULKAN_FP32_ACCUMULATE+BENCHMARK_TIMESTAMP_SAFETY+RUNTIME_BENCHMARK_GATING"
+echo "NCNN_PATCHES=MATMUL_VULKAN_FP32_ACCUMULATE+BENCHMARK_TIMESTAMP_SAFETY+RUNTIME_BENCHMARK_GATING+RUNTIME_SYNC_TIMING"
 echo "NCNN_PATCHSET_SHA=${PATCHSET_SHA}"
 
 # Remove previous generated outputs so no old library can survive the reset.
