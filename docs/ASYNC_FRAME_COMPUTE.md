@@ -51,7 +51,13 @@ FREE -> GPU_RUNNING -> CPU_READY -> CPU_RUNNING -> FREE.
 - The camera Image and Java HardwareBuffer wrapper must remain alive through GPU prefix completion. They may be closed immediately after the prefix fence completes because the CPU suffix consumes only copied boundary Mat objects.
 - AHardwareBuffer_acquire() extends object lifetime; it does not prove that GPU reads have completed. Fence completion is the content-lifetime boundary.
 
-The overlap is between separate stage workers. NCNN's public VkCompute::submit_and_wait() is synchronous; this design does not pretend it is an asynchronous submit API.
+Modes 3/4 overlap the GPU prefix and CPU suffix across frames, but the
+prefix still waits for its boundary readback fence.
+
+Mode 8 overlaps full-GPU inference of frame N+1 with CPU DFL/NMS for frame N.
+It still waits for final `out0` readback before queuing CPU postprocessing.
+No path in this implementation has a nonblocking `VkCompute` submission API;
+NCNN command resources remain fence-protected.
 
 ## Implementation status in this branch
 
@@ -72,7 +78,18 @@ Ownership assumptions that remain deliberate:
 - The same Net is never shared between the GPU and CPU workers.
 - This is stage-level asynchronous overlap, not a nonblocking NCNN Vulkan submit API. The GPU prefix call waits for its boundary fence before the CPU suffix is queued.
 
-Modes 3 and 4 are opt-in and are not the default. The code has not been built or run on the target Android device yet. The validation gates below are still mandatory before treating the implementation as correct.
+Modes 3 and 4 retain the ten-tensor GPU-prefix / CPU-suffix split.
+
+Mode 8 now uses the same two-slot scheduling framework with a different stage
+boundary: the complete NCNN graph, including MatMul 110 and 113, executes on
+Vulkan; only the final `out0` Mat is handed to the CPU worker for DFL/NMS.
+This allows CPU postprocessing for frame N to overlap GPU inference of frame
+N+1. It does not remove the synchronous output-readback fence or the
+dispatch-threshold flushes inside NCNN.
+
+The mode-8 source changes have not yet been built or run on the target Android
+device. The validation gates below are mandatory before treating the
+implementation as correct.
 
 ## AHB correctness patch
 
