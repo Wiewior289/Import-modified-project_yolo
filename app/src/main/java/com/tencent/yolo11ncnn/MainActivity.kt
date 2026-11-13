@@ -28,6 +28,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicIntegerArray
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * ============================================================================
@@ -42,9 +43,8 @@ import java.util.concurrent.atomic.AtomicIntegerArray
 class MainActivity : AppCompatActivity() {
 
     private val yoloEngine = Yolo11Ncnn()
-    @Volatile private var selectedComputeMode: Int = Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
+    private val selectedComputeMode: Int = Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
     @Volatile private var modeGeneration: Long = 0L
-    private var modeSelectorInitialized = false
     private var modelSelectorInitialized = false
     @Volatile private var selectedModelType: Int = Yolo11Ncnn.MODEL_YOLO11N
     @Volatile private var selectedTargetSize: Int = TARGET_SIZE_MIN
@@ -75,6 +75,7 @@ class MainActivity : AppCompatActivity() {
     private val isYoloReady = AtomicBoolean(false)
     private val isCameraRunning = AtomicBoolean(false)
     private val isProcessingFrame = AtomicBoolean(false)
+    private val droppedBusyFrames = AtomicLong(0L)
 
     private var frameSequence: Long = 0L
     private var fpsWindowStartMs: Long = 0L
@@ -90,7 +91,7 @@ class MainActivity : AppCompatActivity() {
         // Start telemetry before installing the selector, so an early spinner
         // callback can safely report a mode change.
         startTelemetryServer()
-        installComputeModeSelector()
+        installModelResolutionControls()
 
         // KROK 2 & 3: Weryfikacja uprawnień i asynchroniczny start potoku
         if (allPermissionsGranted()) {
@@ -118,49 +119,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun installComputeModeSelector() {
+    private fun installModelResolutionControls() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 16, 20, 8)
-        }
-
-        val computeLabel = TextView(this).apply {
-            text = "Tryb obliczeniowy NCNN"
-            textSize = 16f
-        }
-        val computeSpinner = Spinner(this)
-        val computeModes = listOf(
-            Yolo11Ncnn.COMPUTE_CPU,
-            Yolo11Ncnn.COMPUTE_VULKAN,
-            Yolo11Ncnn.COMPUTE_VULKAN_AHB,
-            Yolo11Ncnn.COMPUTE_VULKAN_AHB_MATMUL_CPU,
-            Yolo11Ncnn.COMPUTE_MATMUL_VULKAN,
-            Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE
-        )
-        val computeLabels = listOf(
-            "CPU (pełny baseline)",
-            "GPU Vulkan + wejście Mat",
-            "GPU Vulkan + AHB",
-            "GPU Vulkan + AHB / MatMul CPU (kontrola)",
-            "GPU Vulkan + AHB / MatMul Vulkan (cel)",
-            "DIAG: porównanie MatMul Vulkan vs CPU"
-        )
-        val computeAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, computeLabels)
-        computeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        computeSpinner.adapter = computeAdapter
-        computeSpinner.setSelection(computeModes.indexOf(selectedComputeMode).coerceAtLeast(0))
-        computeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val requestedMode = computeModes.getOrElse(position) { Yolo11Ncnn.COMPUTE_CPU }
-                if (!modeSelectorInitialized) {
-                    modeSelectorInitialized = true
-                    if (requestedMode != selectedComputeMode) switchComputeMode(requestedMode)
-                    return
-                }
-                switchComputeMode(requestedMode)
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
         val modelLabelView = TextView(this).apply {
@@ -228,12 +190,6 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        root.addView(computeLabel, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(computeSpinner, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-        ))
         root.addView(modelLabelView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
         ))
@@ -361,21 +317,6 @@ class MainActivity : AppCompatActivity() {
         } else {
             enqueueReinitialization()
         }
-    }
-
-    private fun switchComputeMode(newMode: Int) {
-        val previousMode = selectedComputeMode
-        val selectableModes = setOf(
-            Yolo11Ncnn.COMPUTE_CPU,
-            Yolo11Ncnn.COMPUTE_VULKAN,
-            Yolo11Ncnn.COMPUTE_VULKAN_AHB,
-            Yolo11Ncnn.COMPUTE_VULKAN_AHB_MATMUL_CPU,
-            Yolo11Ncnn.COMPUTE_MATMUL_VULKAN,
-            Yolo11Ncnn.COMPUTE_MATMUL_VULKAN_COMPARE
-        )
-        if (newMode !in selectableModes || newMode == previousMode) return
-        selectedComputeMode = newMode
-        reinitializePipeline("COMPUTE_MODE_SWITCH", previousMode)
     }
 
     private fun closeCameraForModeSwitch() {
@@ -711,8 +652,16 @@ class MainActivity : AppCompatActivity() {
             )
 
             imageReader?.setOnImageAvailableListener({ reader ->
-                if (!isYoloReady.get() ||
-                    (selectedComputeMode != Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC && isProcessingFrame.get())) {
+                val callbackStartNs = SystemClock.elapsedRealtimeNanos()
+                if (!isYoloReady.get()) {
+                    reader.acquireLatestImage()?.close()
+                    return@setOnImageAvailableListener
+                }
+                if (isProcessingFrame.get()) {
+                    val dropped = droppedBusyFrames.incrementAndGet()
+                    if (dropped % 30L == 0L) {
+                        Log.w(TAG, "FRAME_DROP reason=processing_busy total=" + dropped)
+                    }
                     reader.acquireLatestImage()?.close()
                     return@setOnImageAvailableListener
                 }
@@ -728,22 +677,19 @@ class MainActivity : AppCompatActivity() {
                     else -> 1
                 }
 
-                if (selectedComputeMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC) {
-                    queueAsyncFrame(image, frameId, imageTimestampNs, rotateType)
-                    return@setOnImageAvailableListener
-                }
-
                 if (!isProcessingFrame.compareAndSet(false, true)) {
                     image.close()
                     return@setOnImageAvailableListener
                 }
 
-                if (selectedComputeMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_SPLIT) {
-                    queueSplitFrameSync(image, frameId, imageTimestampNs, rotateType)
-                    return@setOnImageAvailableListener
-                }
-
+                val queuedAtNs = SystemClock.elapsedRealtimeNanos()
                 backgroundInitExecutor.execute {
+                    val taskStartNs = SystemClock.elapsedRealtimeNanos()
+                    var nativeDetectWallMs = -1.0
+                    var hardwareBufferCloseMs = 0.0
+                    var jsonBuildMs = 0.0
+                    var websocketSendMs = 0.0
+                    var stm32SendMs = 0.0
                     try {
                         detectionBuffer.fill(0f)
                         var rawCount = -1
@@ -755,14 +701,19 @@ class MainActivity : AppCompatActivity() {
                             rawCount = -4
                         } else {
                             try {
+                                val nativeStartNs = SystemClock.elapsedRealtimeNanos()
                                 rawCount = yoloEngine.DetectFrame(
                                     hwBuffer, detectionBuffer, confThreshold, nmsThreshold,
                                     rotateType, frameId, imageTimestampNs
                                 )
+                                nativeDetectWallMs = (SystemClock.elapsedRealtimeNanos() - nativeStartNs) / 1_000_000.0
                             } catch (e: Exception) {
                                 Log.e(TAG, "Błąd DetectFrame frame=$frameId", e)
                             } finally {
+                                val closeStartNs = SystemClock.elapsedRealtimeNanos()
                                 hwBuffer.close()
+                                hardwareBufferCloseMs =
+                                    (SystemClock.elapsedRealtimeNanos() - closeStartNs) / 1_000_000.0
                             }
                         }
 
@@ -781,20 +732,50 @@ class MainActivity : AppCompatActivity() {
                                 " class=$topClass")
                         }
 
+                        val jsonStartNs = SystemClock.elapsedRealtimeNanos()
                         val jsonPayload = buildJson(
                             count, detectionBuffer, currentFps, topScore, topClass, frameId, imageTimestampNs
                         )
+                        jsonBuildMs = (SystemClock.elapsedRealtimeNanos() - jsonStartNs) / 1_000_000.0
+
+                        val websocketStartNs = SystemClock.elapsedRealtimeNanos()
                         try {
                             telemetryServer.sendDetections(jsonPayload)
                         } catch (e: Exception) {
                             Log.e(TAG, "Błąd wysyłania telemetrii", e)
                         }
+                        websocketSendMs =
+                            (SystemClock.elapsedRealtimeNanos() - websocketStartNs) / 1_000_000.0
 
                         // Vision test only: no actuator command is issued.
+                        val stm32StartNs = SystemClock.elapsedRealtimeNanos()
                         sendToSTM32(count, detectionBuffer, false)
+                        stm32SendMs =
+                            (SystemClock.elapsedRealtimeNanos() - stm32StartNs) / 1_000_000.0
                     } finally {
-                        image.close()
-                        isProcessingFrame.set(false)
+                        try {
+                            image.close()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Camera Image close failed frame=" + frameId, e)
+                        } finally {
+                            isProcessingFrame.set(false)
+                        }
+                        val frameEndNs = SystemClock.elapsedRealtimeNanos()
+                        if (frameId % 30L == 0L) {
+                            val queueWaitMs = (taskStartNs - queuedAtNs) / 1_000_000.0
+                            val callbackToTaskMs = (taskStartNs - callbackStartNs) / 1_000_000.0
+                            val callbackTotalMs = (frameEndNs - callbackStartNs) / 1_000_000.0
+                            Log.i(TAG, "APP_FRAME_TIMING frame=" + frameId +
+                                " callback_to_task_ms=" + callbackToTaskMs +
+                                " executor_queue_ms=" + queueWaitMs +
+                                " native_detect_wall_ms=" + nativeDetectWallMs +
+                                " ahb_wrapper_close_ms=" + hardwareBufferCloseMs +
+                                " json_build_ms=" + jsonBuildMs +
+                                " websocket_broadcast_ms=" + websocketSendMs +
+                                " stm32_send_ms=" + stm32SendMs +
+                                " callback_to_done_ms=" + callbackTotalMs +
+                                " busy_dropped_total=" + droppedBusyFrames.get())
+                        }
                     }
                 }
             }, cameraHandler)
