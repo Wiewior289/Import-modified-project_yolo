@@ -13,6 +13,7 @@
 #include <memory>
 #include <array>
 #include <vector>
+#include <chrono>
 #include "yolo11.h"
 
 #ifndef YOLO_NCNN_SOURCE_SHA
@@ -127,19 +128,41 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_DetectFrame(
             static_cast<unsigned long long>(desc.usage));
     }
 
+    const auto jni_frame_start = std::chrono::steady_clock::now();
     AHardwareBuffer_acquire(ahb);
     static thread_local std::vector<Object> objects;
     objects.clear();
     if (objects.capacity() < 64) objects.reserve(64);
+
+    const auto detect_start = std::chrono::steady_clock::now();
     const int ret = engine->detect_frame(ahb, conf_thresh, nms_thresh, objects,
         rotate_type, static_cast<int64_t>(frame_id), static_cast<int64_t>(image_timestamp_ns));
+    const double detect_frame_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - detect_start).count();
     AHardwareBuffer_release(ahb);
 
     if (ret != 0) {
+        if (frame_id > 0 && frame_id % 30 == 0) {
+            const double jni_total_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - jni_frame_start).count();
+            LOGI("JNI_FRAME_TIMING frame=%lld detect_frame_ms=%.3f array_pack_copy_ms=0.000 jni_total_ms=%.3f ret=%d",
+                 static_cast<long long>(frame_id), detect_frame_ms, jni_total_ms, ret);
+        }
         LOGE("DetectFrame failed: %d", ret);
         return ret;
     }
-    return copy_detections(env, out_buffer_obj, *engine, objects);
+
+    const auto copy_start = std::chrono::steady_clock::now();
+    const int count = copy_detections(env, out_buffer_obj, *engine, objects);
+    const double array_pack_copy_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - copy_start).count();
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        const double jni_total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - jni_frame_start).count();
+        LOGI("JNI_FRAME_TIMING frame=%lld detect_frame_ms=%.3f array_pack_copy_ms=%.3f jni_total_ms=%.3f detections=%d",
+             static_cast<long long>(frame_id), detect_frame_ms, array_pack_copy_ms, jni_total_ms, count);
+    }
+    return count;
 }
 
 JNIEXPORT jint JNICALL
