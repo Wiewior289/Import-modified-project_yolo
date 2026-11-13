@@ -1,109 +1,87 @@
 # Async frame compute: implementation contract
 
-## Target and mode separation
+## Architecture
 
-The active mode-8 path is full-GPU YOLO11 inference with bounded two-slot frame overlap:
+Mode 8 is full-GPU YOLO11 inference with two frame slots and three ordered stages:
 
-- GPU worker: Camera2 AHB import, preprocessing, the complete NCNN Vulkan graph (including MatMul 110 and 113), and final `out0` readback for frame N+1.
-- CPU worker: DFL decode/filtering and NMS for frame N.
-- MatMul is not delegated to CPU in mode 8.
-- The original YOLO `.param` and `.bin` are unchanged.
+1. GPU submit worker records AHB import, preprocessing, the complete NCNN Vulkan graph (including MatMul 110 and 113), and final `out0` download, then submits without waiting.
+2. GPU completion worker waits for the corresponding frame fence, performs deferred readback/casts, reads timestamp queries, releases frame resources and unpins the AHB cache entry.
+3. CPU worker runs DFL decode/filtering and NMS after `out0` is ready.
 
-Modes 3/4 are separate legacy diagnostic paths. They split the graph at the CPU island around layers 110–113. They are not the mode-8 execution path.
+Modes 3/4 remain legacy GPU-prefix/CPU-suffix diagnostic paths. Mode 8 does not delegate MatMul to CPU. The model `.param` and `.bin` are unchanged.
 
-## Pinned NCNN contracts
+## Pinned NCNN source contracts
 
-Pinned upstream NCNN source: `6a1bf000f363714839a36793addc8c879d3d899e`.
+Pinned upstream NCNN: `6a1bf000f363714839a36793addc8c879d3d899e`.
 
-- `Extractor::extract(int, VkMat&, VkCompute&)` records the requested graph dependency closure into the caller's command context. It does not create a separate command context or wait for completion.
-- `VkCompute::record_download(const VkMat&, Mat&, const Option&)` is the same readback primitive used by the high-level `Extractor::extract(int, Mat&)` implementation in this pinned source. It records conversion to a staging tensor and a device-to-staging transfer. After the fence, NCNN invalidates mapped memory, copies the tensor, and performs FP16/BF16-to-FP32 conversion where required.
-- `VkCompute::submit_and_wait()` ends the command buffer, acquires a compute queue, submits it, returns the queue to the pool, and then waits on that VkCompute object's fence. The queue handle is therefore not held during the fence wait.
-- `VkCompute::reset()` releases staging/download buffers and descriptor sets, processes image command references, and resets the command buffer and fence. It must not run while commands that reference those resources are still in flight.
-- NCNN's Vulkan blob and staging allocator instances are not internally synchronized for concurrent use. Each independently in-flight GPU execution needs distinct allocator instances. The device-level acquire/reclaim pools provide the synchronization for allocator ownership.
-- The Extractor owns per-execution blob state. The same Net must not be concurrently driven from GPU and CPU workers.
+- `Extractor::extract(int, VkMat&, VkCompute&)` records graph work into the caller's command context; it does not submit or wait.
+- The current milestone source already records AHB import, Scale, cast, Extractor input/graph and final `out0` download into one `VkCompute`. There is no separate preprocessing fence in this path.
+- `VkCompute::submit_and_wait()` ends/replays the command buffer, acquires a compute queue, submits, returns the queue handle to the device pool, and then waits on that VkCompute fence.
+- The async patch adds `VkCompute::submit()` and `VkCompute::wait()`. `submit()` reuses NCNN's existing recording/replay and queue-submit code but returns immediately after successful `vkQueueSubmit`. `wait()` waits on that frame's fence and performs the deferred download/cast records.
+- A submitted context cannot be reused before its fence completes and it is reset. `reset()` rejects a pending submission. The private destructor has a last-resort fence wait, but normal code must call `wait()` so deferred readback is materialized.
+- `VulkanDevice::acquire_blob_allocator()` and `acquire_staging_allocator()` return a free allocator from their pools or create another. Their reclaim functions return it to the pool. The individual VkBlobAllocator/VkStagingAllocator instances do not provide per-instance allocation locking; each in-flight frame retains its own allocator until its fence and readback complete.
+- Queue-pool acquire/reclaim is synchronized. The queue handle is returned immediately after `vkQueueSubmit`, so the host may submit another frame while the previous submission is executing. GPU submissions on the same queue remain ordered.
 
-## Historical CPU-island graph cut (modes 3/4 only)
+## Per-frame resource lifetime
 
-The older GPU-prefix/CPU-suffix implementation used the following ten boundary blobs. Their producers are at or before layer 109; their consumers are in the CPU suffix:
+Each async slot retains its `VkCompute`, `Extractor`, AHB-scaled/input/output VkMats, blob and staging allocators, timestamp-query state, and a pointer to its AHB cache entry. The entry is pinned by an atomic `in_flight` count.
 
-| Blob | Producer | First consumer |
-|---:|---:|---:|
-| 37 | 31 | 145 |
-| 72 | 60 | 130 |
-| 123 | 102 | 125 |
-| 125 | 103 | 119 |
-| 128 | 105 | 114 |
-| 129 | 105 | 115 |
-| 133 | 107 | 110 |
-| 135 | 108 | 115 |
-| 136 | 108 | 113 |
-| 137 | 109 | 110 |
+Only after `VkCompute::wait()` succeeds does the completion worker:
+- release Extractor and VkMat references;
+- destroy the completed command context;
+- return blob/staging allocators to the device pools;
+- decrement the AHB cache pin.
 
-The later `feat/gpu-cpu-gpu-ring-extractor` experiment narrowed the CPU island input transfer to blobs 133, 137, and 136. It retained seven GPU carry blobs (37, 72, 123, 125, 128, 129, 135) in a persistent per-frame GPU Extractor, with per-slot Vulkan allocators. The CPU delegate produced bridge blob 141, which was injected into the same Extractor for GPU continuation.
+The Camera2 `Image` and Java `HardwareBuffer` wrapper remain open from `FullGpuFrame()` until `WaitGpuFrame()` succeeds. An AHB reference protects object lifetime, not the camera producer's right to recycle the buffer contents. Cache eviction skips pinned entries; cache clear refuses to destroy pinned entries.
 
-That design directly addresses the lifetime dependency in a GPU→CPU→GPU graph: the GPU-produced tensors needed after the CPU island remain alive while the CPU computes the bridge tensor. It is not merged into mode 8 because the ring experiment delegates MatMul to CPU, while mode 8 keeps MatMul 110 and 113 on Vulkan.
+## Dispatch-threshold safety
 
-## Mode-8 command flow
+NCNN internal dispatch-threshold flushes in `NetPrivate::forward_layer()` remain synchronous. Mode 8 raises the workgroup threshold to 512K to avoid the repeated small flushes seen in earlier traces while retaining a finite safety cap. Any remaining flush must be visible through `NCNN_VK_FLUSH`.
 
-The mode-8 frame path records preprocessing and the full model graph into one `VkCompute` context:
+`pending_dispatch_total` is accumulated X×Y×Z workgroup count since the last submit/reset. It is not a dispatch-call count, frame count, or duration. If a graph is split by flushes, each flush reports only its current segment.
 
-```text
-Camera2 AHB
-  -> record_import_android_hardware_buffer
-  -> Scale
-  -> convert_packing / input cast
-  -> Extractor::input("in0", VkMat)
-  -> Extractor::extract("out0", VkMat, same VkCompute)
-  -> record_download(out0, CPU Mat)
-  -> submit_and_wait / final fence
-  -> CPU DFL decode + NMS
-```
+## Worker synchronization
 
-The explicit preprocessing `submit_and_wait()` boundary has been removed. The commands for AHB import, scale, cast, and the model graph are recorded in order into the same command context. The final `out0` readback still requires a completed fence before the CPU can consume the host Mat.
+The GPU submit worker and GPU completion worker are separate executors. Waiting for frame N's fence must not block recording/submission of frame N+1. CPU postprocessing is queued only after the corresponding fence and deferred readback. CPU interval N can overlap GPU execution of N+1.
 
-NCNN's internal dispatch-threshold flushes remain synchronous. When the pending workgroup count crosses the rough-score-derived threshold, NCNN submits the currently recorded command buffer, waits for its fence, resets the command context, and continues graph recording. This guard is intentionally retained.
+This is host-side pipeline overlap, not simultaneous execution of two inference command buffers on one GPU queue. Vulkan still orders submissions on that queue. The goal is to keep it fed while host readback and CPU postprocessing happen independently.
 
-The application uses two slots and two serial workers:
+If both slots are occupied, a new camera frame is dropped rather than reusing a slot still owned by a worker. Reinitialization drains GPU submission, then GPU completion, then CPU tasks before destroying native state.
 
-```text
-GPU worker (serial): frame N+1 full Vulkan inference -> slot[N+1].out0
-CPU worker (serial): slot[N].out0 -> DFL/NMS -> detections
-```
+## Historical logs and branch history
 
-The GPU worker owns the AHB cache, Vulkan Net/Extractor, and Vulkan allocators. The CPU worker owns DFL/NMS scratchpads, score state, and detection packing. The deferred full-GPU path does not modify the CPU postprocessing scratchpads or score fields. Each slot retains its own `out0` Mat until CPU postprocessing completes.
+The old `yolo_layers.txt` baseline showed `CPU_FALLBACK_DOWNLOAD` before MatMul 110 and 113. That is a real GPU→CPU→GPU boundary: the GPU-produced inputs had to be downloaded and synchronized before CPU MatMul; downstream GPU work could not consume the CPU result until it was uploaded again.
 
-The mode-8 listener bypasses the synchronous single-frame gate. If both slots are occupied, the incoming frame is dropped rather than reusing a slot still owned by a worker. Pipeline reinitialization drains GPU tasks first, then CPU tasks, before destroying native state. Teardown uses the same producer-before-consumer ordering.
+The current `milestone_matmul_diag(1).txt` shows `support_vulkan=1` for both MatMul layers, whereas the baseline showed `vulkan=0`. `VULKAN_CAPABLE_RUNTIME_UNVERIFIED` is the graph inventory's conservative label, not a CPU fallback marker and not runtime dispatch proof.
 
-This is stage-level frame overlap, not two simultaneously executing GPU inference graphs and not a nonblocking NCNN submit API.
+The closest tracked branch head before the 9-Nov diagnostic log is `feat/async-frame-compute`, commit `129efb9157d1ad71ce9bd62694948dd160559324`. Its tracked change is boundary-blob validation in `yolo11.cpp`; it does not add the `NCNN_RT` logger. The diagnostic branch's `NCNN_RUNTIME_TRACE.md` states that it did not modify NCNN source and used `NCNN_BENCHMARK=OFF`. I did not find the `NCNN_RT`/`TENSOR_TAP` implementation in the tracked NCNN patches examined, so those markers in `yolo_layers.txt` came from a local/untracked NCNN instrumentation build or another patch absent from the repository history.
 
-## What the traces establish
+The tracked instrumentation provides direct runtime evidence:
+- `MATMUL_ROUTE` / `MATMUL_ROUTE_DONE`: actual route and tensor residency for layers 110/113.
+- `MATMUL_VK_FORWARD` / `MATMUL_VK_DISPATCH_RECORDED`: custom MatMul Vulkan forward and recorded dispatch.
+- `NCNN_BENCHMARK_CPU` / `NCNN_BENCHMARK_GPU`: CPU timings and Vulkan timestamp timings.
+- `NCNN_VK_SYNC` / `NCNN_VK_FLUSH`: queue/fence timing and reason/size of synchronous threshold flushes.
 
-The old `yolo_layers.txt` CPU-delegated baseline showed `CPU_FALLBACK_DOWNLOAD` before MatMul 110 and 113. Those transitions required downloading GPU tensors to CPU, waiting for GPU completion, executing CPU MatMul, and later uploading CPU-produced tensors for dependent GPU layers. That is a genuine GPU→CPU→GPU dependency.
+The build script previously checked `runtime_sync_timing.patch` but did not apply it, while including it in `PATCHSET_SHA`. It now applies that patch and then `async_vk_submit.patch`; the patchset hash includes both.
 
-The current full-GPU `ncnn_milestone.txt` contains `MATMUL_VK_DISPATCH_RECORDED` for the custom Vulkan MatMul implementation. Its `NCNN_VK_FLUSH` events are dispatch-threshold flushes, not CPU MatMul downloads. The old CPU-island dependency is therefore absent from the current mode-8 graph.
+## Runtime telemetry
 
-The queue handle is returned to NCNN's queue pool before `vkWaitForFences()`. The host thread still waits for the submitted GPU batch to finish. A gap between batches while the host wakes, resets/re-records, and submits the next chunk is plausible, but fence-wait duration alone does not prove GPU idle time. It must be measured with queue/submit timing or a separately controlled asynchronous submission experiment.
+- `ASYNC_GPU_SUBMIT_DONE`: CPU recording and queue-submit interval, not GPU execution time.
+- `NCNN_VK_ASYNC_SUBMIT`: command-buffer replay/end, queue acquisition and queue-submit timing.
+- `NCNN_VK_ASYNC_WAIT`: fence wait and deferred CPU readback/cast timing.
+- `ASYNC_GPU_COMPLETE_DONE`: completion worker interval including fence wait and resource release.
+- `ASYNC_CPU_STAGE_DONE`: DFL/NMS interval.
+- `FRAME_ALLOCATORS_ACQUIRED/RECLAIM`: per-frame allocator leases.
+- `AHB_CACHE_PIN/UNPIN`: AHB import lifetime pin count.
 
-`pending_dispatch_total` is the accumulated workgroup count (sum of X×Y×Z group counts), not a count of dispatch calls, frames, or milliseconds. The threshold guard is retained.
+## Validation gates
 
-## Telemetry and validation
+1. Build the pinned NCNN source with the complete patchset and rebuild the APK; do not reuse old Gradle/NDK native outputs.
+2. Confirm `NCNN_VK_ASYNC_SUBMIT` and `NCNN_VK_ASYNC_WAIT` appear.
+3. Confirm layers 110/113 produce `MATMUL_ROUTE`, `MATMUL_VK_DISPATCH_RECORDED`, and GPU timestamp pairs; verify no `NCNN_BENCHMARK_CPU` for the full mode-8 graph.
+4. Check `NCNN_VK_FLUSH` at the selected resolution; compare workgroup count with the 512K cap.
+5. Compare detections and `out0` against the previous synchronous full-GPU path on identical AHB frames.
+6. Confirm CPU interval N overlaps GPU execution/completion of N+1 and that AHB pins and per-frame allocator ownership remain valid.
+7. Test rotations 1, 3, 6, 8 and resize/no-resize for long enough to detect allocator growth, stale AHB reuse, fence failures and slot starvation.
 
-Mode 8 records monotonic host timestamps every 30 frames:
-
-- `ASYNC_FRAME_QUEUED.queued_ns`: slot reservation and GPU-task enqueue.
-- `ASYNC_GPU_STAGE_DONE.start_ns/end_ns`: complete GPU-stage interval, including NCNN threshold flushes and final readback.
-- `ASYNC_CPU_STAGE_DONE.start_ns/end_ns`: CPU DFL/NMS interval.
-
-CPU interval N should intersect GPU interval N+1 when stage overlap is active. The stage wall times are host intervals, not pure GPU execution times. Use `NCNN_BENCHMARK_GPU` for per-layer GPU timestamps and `NCNN_VK_SYNC` / `NCNN_VK_FLUSH` for NCNN submission and wait analysis.
-
-Validation gates:
-
-1. Build the pinned NCNN source with the complete local patchset and rebuild the APK against that package. Do not reuse old `.cxx`/Gradle native build outputs.
-2. Compare mode-8 detections and `out0` against the prior synchronous full-GPU path on identical captured AHB frames.
-3. Verify `MATMUL_VK_DISPATCH_RECORDED` for layers 110 and 113, GPU timestamp pairs for both, and absence of `NCNN_BENCHMARK_CPU` records for the full graph.
-4. Compare `preprocess_host_wait` (expected zero except perturbative tensor taps), `infer_record_wall`, `final_submit_wait_wall`, and `NCNN_VK_SYNC` counts/waits with the previous build.
-5. Confirm CPU interval N overlaps GPU interval N+1. Check slot drops, AHB lifetime, slot reuse, and long-run stability.
-6. Test AHB rotations 1, 3, 6, and 8 plus resize/no-resize.
-
-The mode-8 source changes are committed but have not yet been built or executed on the target Android device. Treat them as an implementation candidate until these validation gates pass.
-
+The async source changes are an implementation candidate until the pinned NCNN patch applies, the Android build succeeds and target-device validation passes.

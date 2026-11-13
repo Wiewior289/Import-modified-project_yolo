@@ -8,6 +8,7 @@
  */
 
 #include "yolo11.h"
+#include <utility>
 
 #include <android/log.h>
 #include <chrono>
@@ -251,6 +252,18 @@ Yolo11::Yolo11()
 
 Yolo11::~Yolo11()
 {
+    for (size_t i = 0; i < async_slots.size(); ++i) {
+        bool pending = false;
+        {
+            std::lock_guard<std::mutex> slot_lock(async_slots[i].mutex);
+            pending = async_slots[i].state == AsyncFrameSlot::GPU_SUBMITTED;
+        }
+        if (pending) {
+            const int wait_ret = gpu_wait_frame(static_cast<int>(i));
+            if (wait_ret != 0)
+                LOGE("Destructor could not complete pending GPU slot=%zu ret=%d", i, wait_ret);
+        }
+    }
     clear_ahb_cache();
     if (scale_layer) {
         if (vkdev) {
@@ -267,6 +280,11 @@ Yolo11::~Yolo11()
 void Yolo11::destroy_ahb_cache_entry(AHBImportCacheEntry* entry)
 {
     if (!entry) return;
+    if (entry->in_flight.load(std::memory_order_acquire) != 0) {
+        LOGE("AHB_CACHE_DESTROY_BLOCKED ptr=%p in_flight=%u",
+             static_cast<void*>(entry->ahb), entry->in_flight.load(std::memory_order_relaxed));
+        return;
+    }
     delete entry->pipeline;
     entry->pipeline = nullptr;
     entry->src = ncnn::VkImageMat();
@@ -281,6 +299,14 @@ void Yolo11::destroy_ahb_cache_entry(AHBImportCacheEntry* entry)
 
 void Yolo11::clear_ahb_cache()
 {
+    for (const auto& item : ahb_import_cache) {
+        if (item.second->in_flight.load(std::memory_order_acquire) != 0) {
+            LOGE("AHB_CACHE_CLEAR_BLOCKED ptr=%p in_flight=%u",
+                 static_cast<void*>(item.first),
+                 item.second->in_flight.load(std::memory_order_relaxed));
+            return;
+        }
+    }
     for (auto& item : ahb_import_cache) destroy_ahb_cache_entry(item.second);
     ahb_import_cache.clear();
     ahb_cache_clock = 0;
@@ -302,12 +328,33 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         return -4;
     }
 
+    for (size_t i = 0; i < async_slots.size(); ++i) {
+        bool pending = false;
+        {
+            std::lock_guard<std::mutex> slot_lock(async_slots[i].mutex);
+            pending = async_slots[i].state == AsyncFrameSlot::GPU_SUBMITTED;
+        }
+        if (pending) {
+            const int wait_ret = gpu_wait_frame(static_cast<int>(i));
+            if (wait_ret != 0) {
+                LOGE("Cannot reload model while GPU slot=%zu is pending ret=%d", i, wait_ret);
+                return -17;
+            }
+        }
+    }
     clear_ahb_cache();
+    if (!ahb_import_cache.empty()) {
+        LOGE("Refusing model reload: AHB cache still contains pinned/in-use entries=%zu",
+             ahb_import_cache.size());
+        return -18;
+    }
     net.clear();
     cpu_net.clear();
     cpu_net_loaded = false;
     for (auto& slot : async_slots) {
         std::lock_guard<std::mutex> slot_lock(slot.mutex);
+        slot.gpu_execution.reset();
+        slot.out0.release();
         for (auto& boundary : slot.boundary) boundary.release();
         slot.state = AsyncFrameSlot::FREE;
         slot.frame_id = 0;
@@ -369,7 +416,10 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN;
     net.opt.use_benchmark = runtime_benchmark;
+    net.opt.use_vulkan_async = (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN);
     LOGI("NCNN_BENCHMARK_RUNTIME enabled=%d mode=%d", runtime_benchmark ? 1 : 0, compute_mode);
+    LOGI("NCNN_VULKAN_ASYNC enabled=%d dispatch_safety_cap=512K",
+         net.opt.use_vulkan_async ? 1 : 0);
 
     char parampath[256];
     char binpath[256];
@@ -389,6 +439,24 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     if (ret_bin != 0) {
         LOGE("Failed to load model: %s (code %d)", binpath, ret_bin);
         return -3;
+    }
+
+    if (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN) {
+        size_t cpu_only_layers = 0;
+        for (size_t i = 0; i < net.layers().size(); ++i) {
+            const ncnn::Layer* layer = net.layers()[i];
+            if (layer->type != "Input" && !layer->support_vulkan) {
+                ++cpu_only_layers;
+                LOGE("MODE8_GRAPH_REJECT layer=%zu type=%s name=%s support_vulkan=0",
+                     i, layer->type.c_str(), layer->name.c_str());
+            }
+        }
+        if (cpu_only_layers != 0) {
+            LOGE("MODE8 requires a full Vulkan graph; cpu_only_layers=%zu", cpu_only_layers);
+            return -17;
+        }
+        LOGI("MODE8_FULL_VULKAN_GRAPH_VALIDATED layers=%zu cpu_only=0 async_submit=1",
+             net.layers().size());
     }
 
     if (compute_mode == YOLO_COMPUTE_AHB_COMPARE || compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
@@ -1040,7 +1108,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     return 0;
 }
 
-int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot,ncnn::Mat* deferred_out0)
+int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot,ncnn::Mat* deferred_out0,AsyncFrameSlot* async_slot)
 {
     // In full-GPU asynchronous mode the GPU worker must not touch decoder
     // state while the CPU worker is decoding the previous frame.
@@ -1057,6 +1125,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         !use_vulkan_compute || !vkdev) return -3;
 
     const auto frame_start = std::chrono::steady_clock::now();
+    const bool async_submit = async_slot != nullptr;
+    if (async_submit && !deferred_out0) return -14;
+    std::unique_ptr<AsyncGpuExecution> pending_exec;
+    if (async_submit) pending_exec.reset(new AsyncGpuExecution());
+    bool async_resources_transferred = false;
 
     AHardwareBuffer_Desc desc{};
     AHardwareBuffer_describe(ahb, &desc);
@@ -1070,6 +1143,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     const auto allocator_acquire_start = std::chrono::steady_clock::now();
     ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
+    if (frame_id % 30 == 0) {
+        LOGI("FRAME_ALLOCATORS_ACQUIRED frame=%lld blob=%p staging=%p",
+             (long long)frame_id, static_cast<void*>(blob_allocator),
+             static_cast<void*>(staging_allocator));
+    }
     const double allocator_acquire_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - allocator_acquire_start).count();
     if (!blob_allocator || !staging_allocator) {
@@ -1112,20 +1190,29 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
             ++ahb_cache_misses;
 
             if (ahb_import_cache.size() >= AHB_CACHE_LIMIT) {
-                auto oldest = ahb_import_cache.begin();
+                auto oldest = ahb_import_cache.end();
                 for (auto it = ahb_import_cache.begin(); it != ahb_import_cache.end(); ++it) {
-                    if (it->second->last_used < oldest->second->last_used) oldest = it;
+                    if (it->second->in_flight.load(std::memory_order_acquire) == 0 &&
+                        (oldest == ahb_import_cache.end() ||
+                         it->second->last_used < oldest->second->last_used)) {
+                        oldest = it;
+                    }
                 }
 
-                ++ahb_cache_evictions;
-                LOGW("AHB_CACHE_EVICT ptr=%p entries_before=%zu hits=%llu misses=%llu evictions=%llu",
-                     static_cast<void*>(oldest->first), ahb_import_cache.size(),
-                     static_cast<unsigned long long>(ahb_cache_hits),
-                     static_cast<unsigned long long>(ahb_cache_misses),
-                     static_cast<unsigned long long>(ahb_cache_evictions));
+                if (oldest == ahb_import_cache.end()) {
+                    LOGW("AHB_CACHE_ALL_PINNED entries=%zu; allowing temporary overflow",
+                         ahb_import_cache.size());
+                } else {
+                    ++ahb_cache_evictions;
+                    LOGW("AHB_CACHE_EVICT ptr=%p entries_before=%zu hits=%llu misses=%llu evictions=%llu",
+                         static_cast<void*>(oldest->first), ahb_import_cache.size(),
+                         static_cast<unsigned long long>(ahb_cache_hits),
+                         static_cast<unsigned long long>(ahb_cache_misses),
+                         static_cast<unsigned long long>(ahb_cache_evictions));
 
-                destroy_ahb_cache_entry(oldest->second);
-                ahb_import_cache.erase(oldest);
+                    destroy_ahb_cache_entry(oldest->second);
+                    ahb_import_cache.erase(oldest);
+                }
             }
 
             auto* entry = new (std::nothrow) AHBImportCacheEntry();
@@ -1219,7 +1306,13 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                      (int)fp.samplerYcbcrConversionComponents.b,(int)fp.samplerYcbcrConversionComponents.a);
             }
 
-            if (!entry->pipeline || entry->rotate_type != rotate_type) {
+            if (entry->rotate_type != rotate_type &&
+                entry->in_flight.load(std::memory_order_acquire) != 0) {
+                LOGW("AHB_CACHE_ROTATE_REBUILD_DEFERRED ptr=%p in_flight=%u",
+                     static_cast<void*>(ahb), entry->in_flight.load(std::memory_order_relaxed));
+                execute_ret = -7;
+            }
+            if (execute_ret == 0 && (!entry->pipeline || entry->rotate_type != rotate_type)) {
                 ++ahb_cache_rotate_rebuilds;
                 delete entry->pipeline;
                 entry->pipeline = nullptr;
@@ -1254,9 +1347,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     execute_ret = -8;
                 } else {
                     ncnn::VkMat in_gpu;
-                    ncnn::VkCompute inference_cmd(vkdev);
-#if NCNN_BENCHMARK
+                    std::unique_ptr<ncnn::VkCompute> inference_cmd_owner(new ncnn::VkCompute(vkdev));
+                    ncnn::VkCompute& inference_cmd = *inference_cmd_owner;
                     bool timestamp_queries_ready = false;
+#if NCNN_BENCHMARK
                     if (opt.use_benchmark) {
                         const int query_pool_ret = inference_cmd.create_query_pool(
                             static_cast<uint32_t>(net.layers().size() * 2));
@@ -1308,7 +1402,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     static int prev_tap_mode=-1;static bool one_shot_latched=false;
                     if(tap_mode!=prev_tap_mode){if(tap_mode==1)one_shot_latched=false;prev_tap_mode=tap_mode;}
                     if(tap_mode==0)one_shot_latched=false;
-                    const bool do_tap=(tap_mode==1&&!one_shot_latched)||(tap_mode==2&&frame_id>0&&frame_id%30==0);
+                    const bool do_tap=!async_submit&&((tap_mode==1&&!one_shot_latched)||(tap_mode==2&&frame_id>0&&frame_id%30==0));
                     if(tap_mode==1&&do_tap)one_shot_latched=true;
                     if(do_tap){
                         ncnn::Mat tap_scaled,tap_input;
@@ -1334,7 +1428,9 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     // Scale and cast. Only the final out0 readback needs host visibility.
                     if (execute_ret == 0) {
                         t=std::chrono::steady_clock::now();
-                        ncnn::Extractor ex = net.create_extractor();
+                        std::unique_ptr<ncnn::Extractor> extractor_owner(
+                            new ncnn::Extractor(net.create_extractor()));
+                        ncnn::Extractor& ex = *extractor_owner;
                         ex.set_blob_vkallocator(blob_allocator);
                         ex.set_workspace_vkallocator(blob_allocator);
                         ex.set_staging_vkallocator(staging_allocator);
@@ -1363,17 +1459,35 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             if (execute_ret == 0) {
                                 inference_cmd.record_download(out_gpu,out,opt);
                                 t=std::chrono::steady_clock::now();
-                                execute_ret=inference_cmd.submit_and_wait();
+                                execute_ret = async_submit ? inference_cmd.submit() : inference_cmd.submit_and_wait();
                                 final_submit_wait_ms=std::chrono::duration<double,std::milli>(
                                     std::chrono::steady_clock::now()-t).count();
                                 infer_extract_ms=infer_record_ms+final_submit_wait_ms;
                                 if (execute_ret != 0) {
-                                    LOGE("Combined AHB+YOLO VkCompute submit_and_wait failed frame=%lld ret=%d",
+                                    LOGE("Combined AHB+YOLO VkCompute submit failed frame=%lld ret=%d",
                                          (long long)frame_id,execute_ret);
+                                } else if (async_submit) {
+                                    pending_exec->command = std::move(inference_cmd_owner);
+                                    pending_exec->extractor = std::move(extractor_owner);
+                                    pending_exec->ahb_scaled = dst;
+                                    pending_exec->input = in_gpu;
+                                    pending_exec->output = out_gpu;
+                                    pending_exec->blob_allocator = blob_allocator;
+                                    pending_exec->staging_allocator = staging_allocator;
+                                    pending_exec->cache_entry = entry;
+                                    pending_exec->timestamp_queries_ready = timestamp_queries_ready;
+                                    const uint32_t in_flight_after =
+                                        entry->in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
+                                    if (frame_id % 30 == 0) {
+                                        LOGI("AHB_CACHE_PIN frame=%lld ptr=%p in_flight=%u",
+                                             (long long)frame_id, static_cast<void*>(ahb), in_flight_after);
+                                    }
+                                    async_slot->gpu_execution = std::move(pending_exec);
+                                    async_resources_transferred = true;
                                 }
                             }
 #if NCNN_BENCHMARK
-                            if (timestamp_queries_ready && execute_ret == 0) {
+                            if (timestamp_queries_ready && execute_ret == 0 && !async_submit) {
                                 std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
                                 const int query_ret = inference_cmd.get_query_pool_results(
                                     0, static_cast<uint32_t>(query_results.size()), query_results);
@@ -1403,6 +1517,9 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             LOGE("Extractor input/extract failed frame=%lld ret=%d",
                                  (long long)frame_id,execute_ret);
                             execute_ret=-11;
+                        } else if (async_submit) {
+                            LOGD("Tensor CPU readback scheduled dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
+                                 out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
                         } else {
                             LOGD("Tensor CPU extracted dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
                                  out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
@@ -1411,10 +1528,12 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                 }
             }
         }
-    } // VkMat / VkCompute / Extractor references die before allocator reclaim.
+    } // GPU frame state either ends here (sync) or is transferred to its async slot.
 
-    vkdev->reclaim_blob_allocator(blob_allocator);
-    vkdev->reclaim_staging_allocator(staging_allocator);
+    if (!async_resources_transferred) {
+        vkdev->reclaim_blob_allocator(blob_allocator);
+        vkdev->reclaim_staging_allocator(staging_allocator);
+    }
 
     if (execute_ret != 0) {
         LOGE("AHB frame failed at GPU stage (code=%d)", execute_ret);
@@ -1426,9 +1545,9 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         if (frame_id > 0 && frame_id % 30 == 0) {
             const double gpu_stage_wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frame_start).count();
-            LOGI("GPU_FULL_FRAME_READY frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
-                 "preprocess_record=%.3fms preprocess_wait=%.3fms infer_record=%.3fms final_submit_wait=%.3fms infer_extract_wall=%.3fms "
-                 "gpu_stage_wall=%.3fms allocator_acquire=%.3fms cache_lookup=%.3fms cache_hit=%d",
+            LOGI("GPU_FULL_FRAME_SUBMITTED frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
+                 "preprocess_record=%.3fms preprocess_wait=%.3fms infer_record=%.3fms submit_wall=%.3fms infer_record_submit_wall=%.3fms "
+                 "gpu_record_submit_wall=%.3fms allocator_acquire=%.3fms cache_lookup=%.3fms cache_hit=%d",
                  (long long)frame_id, (long long)image_timestamp_ns,
                  out.dims, out.w, out.h, out.d, out.c, out.elemsize, out.elempack,
                  preprocess_record_ms, preprocess_wait_ms, infer_record_ms, final_submit_wait_ms, infer_extract_ms,
@@ -1530,20 +1649,116 @@ int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type
 
     std::vector<Object> unused_objects;
     const int ret = detect_ahb(ahb, 0.f, 0.f, unused_objects, rotate_type,
-                               frame_id, image_timestamp_ns, nullptr, &slot.out0);
-    if (ret != 0 || slot.out0.empty()) {
-        const int out0_empty = slot.out0.empty() ? 1 : 0;
+                               frame_id, image_timestamp_ns, nullptr, &slot.out0, &slot);
+    if (ret != 0 || !slot.gpu_execution) {
+        const int has_execution = slot.gpu_execution ? 1 : 0;
+        slot.out0.release();
+        slot.gpu_execution.reset();
+        slot.state = AsyncFrameSlot::FREE;
+        LOGE("GPU_FULL_FRAME_SUBMIT_FAILED frame=%lld slot=%d ret=%d execution=%d",
+             (long long)frame_id, slot_index, ret, has_execution);
+        return ret != 0 ? ret : -54;
+    }
+
+    slot.state = AsyncFrameSlot::GPU_SUBMITTED;
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        LOGI("GPU_FULL_SLOT_SUBMITTED frame=%lld slot=%d imageTs=%lld",
+             (long long)frame_id, slot_index, (long long)image_timestamp_ns);
+    }
+    return 0;
+}
+
+int Yolo11::gpu_wait_frame(int slot_index)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -55;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_MATMUL_VULKAN || !vkdev) return -56;
+    if (slot.state != AsyncFrameSlot::GPU_SUBMITTED || !slot.gpu_execution ||
+        !slot.gpu_execution->command) return -57;
+
+    AsyncGpuExecution& execution = *slot.gpu_execution;
+    const int64_t frame_id = slot.frame_id;
+    const int64_t image_timestamp_ns = slot.image_timestamp_ns;
+    const auto wait_start = std::chrono::steady_clock::now();
+    const int wait_ret = execution.command->wait();
+    const double wait_wall_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_start).count();
+    if (wait_ret != 0) {
+        LOGE("GPU_FENCE_WAIT_FAILED frame=%lld slot=%d ret=%d",
+             (long long)frame_id, slot_index, wait_ret);
+        return wait_ret;
+    }
+
+#if NCNN_BENCHMARK
+    if (execution.timestamp_queries_ready) {
+        std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
+        const int query_ret = execution.command->get_query_pool_results(
+            0, static_cast<uint32_t>(query_results.size()), query_results);
+        if (query_ret < 0) {
+            LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_FAILED ret=%d", query_ret);
+        } else {
+            size_t available_pairs = 0;
+            for (size_t i = 0; i < net.layers().size(); ++i) {
+                const uint64_t q_start = query_results[i * 2];
+                const uint64_t q_end = query_results[i * 2 + 1];
+                if (q_start == 0 || q_end == 0 || q_end < q_start) continue;
+                ++available_pairs;
+                const double duration_us =
+                    (q_end - q_start) * vkdev->info.timestamp_period() / 1000.0;
+                LOGI("[NCNN_BENCHMARK_GPU] idx=%zu type=%-16s name=%-30s duration=%.2lfus",
+                     i, net.layers()[i]->type.c_str(),
+                     net.layers()[i]->name.c_str(), duration_us);
+            }
+            LOGI("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
+                 available_pairs, net.layers().size(), query_ret == 1 ? 1 : 0);
+        }
+    }
+#endif
+
+    ncnn::VkAllocator* blob_allocator = execution.blob_allocator;
+    ncnn::VkAllocator* staging_allocator = execution.staging_allocator;
+    AHBImportCacheEntry* cache_entry = execution.cache_entry;
+
+    execution.extractor.reset();
+    execution.output.release();
+    execution.input.release();
+    execution.ahb_scaled.release();
+    execution.command.reset();
+
+    if (frame_id % 30 == 0) {
+        LOGI("FRAME_ALLOCATORS_RECLAIM frame=%lld blob=%p staging=%p",
+             (long long)frame_id, static_cast<void*>(blob_allocator),
+             static_cast<void*>(staging_allocator));
+    }
+    if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
+    if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
+    if (cache_entry) {
+        const uint32_t before = cache_entry->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+        if (before == 0) {
+            LOGE("AHB_CACHE_UNPIN_UNDERFLOW frame=%lld ptr=%p",
+                 (long long)frame_id, static_cast<void*>(cache_entry->ahb));
+        } else if (frame_id % 30 == 0) {
+            LOGI("AHB_CACHE_UNPIN frame=%lld ptr=%p in_flight=%u",
+                 (long long)frame_id, static_cast<void*>(cache_entry->ahb), before - 1);
+        }
+    }
+
+    slot.gpu_execution.reset();
+    if (slot.out0.empty()) {
         slot.out0.release();
         slot.state = AsyncFrameSlot::FREE;
-        LOGE("GPU_FULL_FRAME_FAILED frame=%lld slot=%d ret=%d out0_empty=%d",
-             (long long)frame_id, slot_index, ret, out0_empty);
-        return ret != 0 ? ret : -54;
+        LOGE("GPU_FENCE_COMPLETE_WITH_EMPTY_OUT0 frame=%lld slot=%d wait_wall=%.3fms",
+             (long long)frame_id, slot_index, wait_wall_ms);
+        return -58;
     }
 
     slot.state = AsyncFrameSlot::CPU_READY;
     if (frame_id > 0 && frame_id % 30 == 0) {
-        LOGI("GPU_FULL_SLOT_READY frame=%lld slot=%d imageTs=%lld",
-             (long long)frame_id, slot_index, (long long)image_timestamp_ns);
+        LOGI("GPU_FENCE_COMPLETE frame=%lld slot=%d imageTs=%lld wait_wall=%.3fms out0_bytes=%zu",
+             (long long)frame_id, slot_index, (long long)image_timestamp_ns,
+             wait_wall_ms, slot.out0.total() * slot.out0.elemsize);
     }
     return 0;
 }

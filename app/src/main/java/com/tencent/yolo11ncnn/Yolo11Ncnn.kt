@@ -74,8 +74,9 @@ class Yolo11Ncnn {
     ): Int
 
     /**
-     * Runs the complete Vulkan YOLO graph and retains CPU out0 in a frame slot.
-     * Returns only after NCNN's output readback fence has completed.
+     * Records and submits the complete Vulkan YOLO graph. Returns after
+     * vkQueueSubmit, not after GPU completion. Keep the Camera2 Image open.
+     * Call WaitGpuFrame(slotIndex) before closing the Image or reading out0.
      */
     external fun FullGpuFrame(
         hardwareBuffer: HardwareBuffer,
@@ -84,6 +85,13 @@ class Yolo11Ncnn {
         frameId: Long,
         imageTimestampNs: Long
     ): Int
+
+    /**
+     * Waits for the submitted frame fence, completes deferred downloads and
+     * releases frame-owned Vulkan resources. The Camera2 Image may be closed
+     * after this returns successfully.
+     */
+    external fun WaitGpuFrame(slotIndex: Int): Int
 
     /**
      * Runs DFL decode/NMS for the completed full-GPU frame slot.

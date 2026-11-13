@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var telemetryServer: TelemetryServer
     private lateinit var backgroundInitExecutor: ExecutorService
     private lateinit var gpuFrameExecutor: ExecutorService
+    private lateinit var gpuCompletionExecutor: ExecutorService
     private lateinit var cpuFrameExecutor: ExecutorService
 
     // Camera2 background thread & components
@@ -87,6 +88,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         backgroundInitExecutor = Executors.newSingleThreadExecutor()
         gpuFrameExecutor = Executors.newSingleThreadExecutor()
+        gpuCompletionExecutor = Executors.newSingleThreadExecutor()
         cpuFrameExecutor = Executors.newSingleThreadExecutor()
 
         // Start telemetry before installing the selector, so an early spinner
@@ -310,7 +312,9 @@ class MainActivity : AppCompatActivity() {
             val detachAndDrain = {
                 imageReader?.setOnImageAvailableListener(null, null)
                 gpuFrameExecutor.execute {
-                    cpuFrameExecutor.execute { enqueueReinitialization() }
+                    gpuCompletionExecutor.execute {
+                        cpuFrameExecutor.execute { enqueueReinitialization() }
+                    }
                 }
             }
             val handler = cameraHandler
@@ -506,15 +510,88 @@ class MainActivity : AppCompatActivity() {
             image.close()
             return
         }
+
         val queuedAtNs = SystemClock.elapsedRealtimeNanos()
         if (frameId % 30L == 0L) {
             Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode queued_ns=$queuedAtNs")
         }
 
+        // CPU postprocessing is queued only after the GPU fence has completed.
+        val enqueueCpuStage: () -> Unit = {
+            try {
+                cpuFrameExecutor.execute cpuTask@ {
+                    val output = asyncDetectionBuffers[slot]
+                    output.fill(0f)
+                    var cpuStageRet = -1
+                    val cpuStageStartNs = SystemClock.elapsedRealtimeNanos()
+                    try {
+                        cpuStageRet = if (fullGpuMode) {
+                            yoloEngine.PostprocessFrame(slot, output, confThreshold, nmsThreshold)
+                        } else {
+                            yoloEngine.SuffixFrame(slot, output, confThreshold, nmsThreshold)
+                        }
+                        val cpuStageEndNs = SystemClock.elapsedRealtimeNanos()
+                        val cpuStageWallMs = (cpuStageEndNs - cpuStageStartNs) / 1_000_000.0
+                        updateProcessingFps()
+                        val count = cpuStageRet.coerceAtLeast(0)
+                        val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
+                        val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
+                        if (frameId % 30L == 0L) {
+                            Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                                "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs ret=$cpuStageRet")
+                        }
+                        if (frameId % 30L == 0L) {
+                            Log.i(TAG, "ASYNC_FRAME frame=$frameId slot=$slot imageTs=$imageTimestampNs " +
+                                "FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
+                                " detections=$count top=" +
+                                String.format(java.util.Locale.US, "%.3f", topScore) +
+                                " class=$topClass")
+                        }
+                        if (cpuStageRet < 0) {
+                            Log.e(TAG, "CPU stage failed frame=$frameId slot=$slot ret=$cpuStageRet")
+                        }
+                        val jsonPayload = buildJson(
+                            count, output, currentFps, topScore, topClass, frameId, imageTimestampNs
+                        )
+                        try {
+                            telemetryServer.sendDetections(jsonPayload)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Błąd wysyłania telemetrii async", e)
+                        }
+                        sendToSTM32(count, output, false)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "CPU suffix exception frame=$frameId slot=$slot", e)
+                    } finally {
+                        asyncSlotBusy.set(slot, 0)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Nie udało się zakolejkować CPU postprocess frame=$frameId", e)
+                asyncSlotBusy.set(slot, 0)
+            }
+        }
+
         try {
-            gpuFrameExecutor.execute {
+            gpuFrameExecutor.execute gpuTask@ {
                 var gpuStageRet = -1
                 var hwBuffer: HardwareBuffer? = null
+                var deferImageRelease = false
+                val imageReleased = AtomicBoolean(false)
+                val releaseCameraImage: () -> Unit = {
+                    if (imageReleased.compareAndSet(false, true)) {
+                        try {
+                            hwBuffer?.close()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId", e)
+                        }
+                        try {
+                            image.close()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Camera Image close failed frame=$frameId", e)
+                        }
+                    }
+                }
+
                 val gpuStageStartNs = SystemClock.elapsedRealtimeNanos()
                 try {
                     val acquiredBuffer = image.hardwareBuffer
@@ -527,91 +604,73 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             yoloEngine.PrefixFrame(acquiredBuffer, slot, rotateType, frameId, imageTimestampNs)
                         }
+                        // FullGpuFrame now returns immediately after vkQueueSubmit.
+                        // Keep ImageReader ownership until WaitGpuFrame signals the fence.
+                        deferImageRelease = fullGpuMode && gpuStageRet == 0
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "GPU stage exception frame=$frameId slot=$slot fullGpu=$fullGpuMode", e)
+                    Log.e(TAG, "GPU submit exception frame=$frameId slot=$slot fullGpu=$fullGpuMode", e)
                     gpuStageRet = -71
                 } finally {
-                    try {
-                        hwBuffer?.close()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId", e)
-                    }
-                    try {
-                        image.close()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Camera Image close failed frame=$frameId", e)
-                    }
+                    if (!deferImageRelease) releaseCameraImage()
                 }
 
                 val gpuStageEndNs = SystemClock.elapsedRealtimeNanos()
                 val gpuStageWallMs = (gpuStageEndNs - gpuStageStartNs) / 1_000_000.0
                 if (frameId % 30L == 0L) {
-                    Log.i(TAG, "ASYNC_GPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                    Log.i(TAG, "ASYNC_GPU_SUBMIT_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
                         "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet")
                 }
                 if (gpuStageRet != 0) {
                     Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
                     asyncSlotBusy.set(slot, 0)
-                    return@execute
+                    return@gpuTask
                 }
 
-                try {
-                    cpuFrameExecutor.execute {
-                        val output = asyncDetectionBuffers[slot]
-                        output.fill(0f)
-                        var cpuStageRet = -1
-                        val cpuStageStartNs = SystemClock.elapsedRealtimeNanos()
+                if (fullGpuMode) {
+                    val completionTask: () -> Unit = completionTask@{
+                        val completionStartNs = SystemClock.elapsedRealtimeNanos()
+                        var waitRet = -1
                         try {
-                            cpuStageRet = if (fullGpuMode) {
-                                yoloEngine.PostprocessFrame(slot, output, confThreshold, nmsThreshold)
-                            } else {
-                                yoloEngine.SuffixFrame(slot, output, confThreshold, nmsThreshold)
-                            }
-                            val cpuStageEndNs = SystemClock.elapsedRealtimeNanos()
-                            val cpuStageWallMs = (cpuStageEndNs - cpuStageStartNs) / 1_000_000.0
-                            updateProcessingFps()
-                            val count = cpuStageRet.coerceAtLeast(0)
-                            val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
-                            val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
-                            if (frameId % 30L == 0L) {
-                                Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                                    "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs ret=$cpuStageRet")
-                            }
-
-                            if (frameId % 30L == 0L) {
-                                Log.i(TAG, "ASYNC_FRAME frame=$frameId slot=$slot imageTs=$imageTimestampNs " +
-                                    "FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
-                                    " detections=$count top=" +
-                                    String.format(java.util.Locale.US, "%.3f", topScore) +
-                                    " class=$topClass")
-                            }
-                            if (cpuStageRet < 0) {
-                                Log.e(TAG, "CPU stage failed frame=$frameId slot=$slot ret=$cpuStageRet")
-                            }
-                            val jsonPayload = buildJson(
-                                count, output, currentFps, topScore, topClass, frameId, imageTimestampNs
-                            )
-                            try {
-                                telemetryServer.sendDetections(jsonPayload)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Błąd wysyłania telemetrii async", e)
-                            }
-                            sendToSTM32(count, output, false)
+                            waitRet = yoloEngine.WaitGpuFrame(slot)
                         } catch (e: Exception) {
-                            Log.e(TAG, "CPU suffix exception frame=$frameId slot=$slot", e)
+                            Log.e(TAG, "GPU fence completion exception frame=$frameId slot=$slot", e)
+                            waitRet = -72
                         } finally {
-                            asyncSlotBusy.set(slot, 0)
+                            releaseCameraImage()
                         }
+                        val completionEndNs = SystemClock.elapsedRealtimeNanos()
+                        val completionWallMs = (completionEndNs - completionStartNs) / 1_000_000.0
+                        if (frameId % 30L == 0L) {
+                            Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot " +
+                                "start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs ret=$waitRet")
+                        }
+                        if (waitRet != 0) {
+                            Log.e(TAG, "GPU fence completion failed frame=$frameId slot=$slot ret=$waitRet; slot retained")
+                            isYoloReady.set(false)
+                            isCameraRunning.set(false)
+                            return@completionTask
+                        }
+                        enqueueCpuStage()
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Nie udało się zakolejkować CPU suffix frame=$frameId", e)
-                    asyncSlotBusy.set(slot, 0)
+
+                    try {
+                        gpuCompletionExecutor.execute { completionTask() }
+                    } catch (e: Exception) {
+                        // Executor rejection is only expected during teardown. Complete
+                        // synchronously rather than releasing an AHB still read by Mali.
+                        Log.e(TAG, "GPU completion queue rejected frame=$frameId; waiting inline", e)
+                        completionTask()
+                    }
+                } else {
+                    // Split mode's PrefixFrame is still synchronous; its AHB is no
+                    // longer referenced when the GPU task returns.
+                    enqueueCpuStage()
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Nie udało się zakolejkować GPU prefix frame=$frameId", e)
-            image.close()
+            Log.e(TAG, "Nie udało się zakolejkować GPU frame=$frameId", e)
+            try { image.close() } catch (_: Exception) {}
             asyncSlotBusy.set(slot, 0)
         }
     }
@@ -803,7 +862,7 @@ class MainActivity : AppCompatActivity() {
                             Log.i(TAG, "APP_FRAME_TIMING frame=" + frameId +
                                 " callback_to_task_ms=" + callbackToTaskMs +
                                 " executor_queue_ms=" + queueWaitMs +
-                                " native_detect_wall_ms=" + nativeDetectWallMs +
+                                " native_stage_call_wall_ms=" + nativeDetectWallMs +
                                 " ahb_wrapper_close_ms=" + hardwareBufferCloseMs +
                                 " json_build_ms=" + jsonBuildMs +
                                 " websocket_broadcast_ms=" + websocketSendMs +
@@ -1020,8 +1079,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Drain in producer -> consumer order. A GPU task may enqueue a CPU
-        // suffix until the GPU executor terminates, so CPU shutdown comes second.
+        // Drain in producer -> completion -> CPU consumer order. GPU submission
+        // may return while Mali still owns the frame's AHB and VkCompute resources.
         gpuFrameExecutor.shutdown()
         Thread {
             val gpuDrained = try {
@@ -1031,7 +1090,19 @@ class MainActivity : AppCompatActivity() {
                 false
             }
             if (!gpuDrained) {
-                Log.e(TAG, "GPU frame executor did not drain; keeping native engine alive until process teardown")
+                Log.e(TAG, "GPU submit executor did not drain; keeping native engine alive until process teardown")
+                return@Thread
+            }
+
+            gpuCompletionExecutor.shutdown()
+            val completionDrained = try {
+                gpuCompletionExecutor.awaitTermination(30, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                false
+            }
+            if (!completionDrained) {
+                Log.e(TAG, "GPU completion executor did not drain; keeping native engine alive until process teardown")
                 return@Thread
             }
 
@@ -1059,7 +1130,7 @@ class MainActivity : AppCompatActivity() {
                 return@Thread
             }
 
-            // All three workers have released their acquired Camera2 Images.
+            // All four workers have released their acquired Camera2 Images.
             try {
                 readerToClose?.close()
             } catch (e: Exception) {

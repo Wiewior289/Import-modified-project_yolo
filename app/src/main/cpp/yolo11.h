@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <array>
 #include <mutex>
+#include <memory>
+#include <atomic>
 
 // NCNN includes
 #include "net.h"
@@ -99,6 +101,7 @@ public:
     // a frame slot. CPU DFL/NMS is deliberately deferred to the CPU worker.
     int gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
                        int64_t frame_id, int64_t image_timestamp_ns);
+    int gpu_wait_frame(int slot_index);
     int cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_thresh,
                               std::vector<Object>& objects);
 
@@ -143,11 +146,15 @@ private:
     int detect_ahb_compare(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                            std::vector<Object>& objects, int rotate_type,
                            int64_t frame_id, int64_t image_timestamp_ns);
+    struct AsyncFrameSlot;
+    struct AHBImportCacheEntry;
+
     int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                    std::vector<Object>& objects, int rotate_type,
                    int64_t frame_id, int64_t image_timestamp_ns,
                    AhbCompareSnapshot* snapshot = nullptr,
-                   ncnn::Mat* deferred_out0 = nullptr);
+                   ncnn::Mat* deferred_out0 = nullptr,
+                   AsyncFrameSlot* async_slot = nullptr);
     int detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                              std::vector<Object>& objects, int rotate_type,
                              int64_t frame_id, int64_t image_timestamp_ns,
@@ -162,18 +169,6 @@ private:
     ncnn::VulkanDevice* vkdev;
     ncnn::Layer* scale_layer;
 
-    struct AsyncFrameSlot {
-        enum State { FREE = 0, GPU_RUNNING = 1, CPU_READY = 2, CPU_RUNNING = 3 };
-        std::mutex mutex;
-        State state;
-        std::array<ncnn::Mat, 10> boundary;
-        ncnn::Mat out0;
-        int64_t frame_id;
-        int64_t image_timestamp_ns;
-        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
-    };
-    std::array<AsyncFrameSlot, 2> async_slots;
-
     // Cache entries are keyed by the actual AHardwareBuffer pointer. Each entry
     // owns an AHB reference and keeps allocator, imported VkImageMat and pipeline
     // alive together for the lifetime of the camera buffer.
@@ -184,11 +179,38 @@ private:
         ncnn::VkImageMat src;
         int rotate_type;
         uint64_t last_used;
+        std::atomic<uint32_t> in_flight;
 
         AHBImportCacheEntry()
             : ahb(nullptr), allocator(nullptr), pipeline(nullptr),
-              rotate_type(1), last_used(0) {}
+              rotate_type(1), last_used(0), in_flight(0) {}
     };
+
+    struct AsyncGpuExecution {
+        std::unique_ptr<ncnn::VkCompute> command;
+        std::unique_ptr<ncnn::Extractor> extractor;
+        ncnn::VkMat ahb_scaled;
+        ncnn::VkMat input;
+        ncnn::VkMat output;
+        ncnn::VkAllocator* blob_allocator = nullptr;
+        ncnn::VkAllocator* staging_allocator = nullptr;
+        AHBImportCacheEntry* cache_entry = nullptr;
+        bool timestamp_queries_ready = false;
+    };
+
+    struct AsyncFrameSlot {
+        enum State { FREE = 0, GPU_RUNNING = 1, GPU_SUBMITTED = 2,
+                     CPU_READY = 3, CPU_RUNNING = 4 };
+        std::mutex mutex;
+        State state;
+        std::array<ncnn::Mat, 10> boundary;
+        ncnn::Mat out0;
+        std::unique_ptr<AsyncGpuExecution> gpu_execution;
+        int64_t frame_id;
+        int64_t image_timestamp_ns;
+        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
+    };
+    std::array<AsyncFrameSlot, 2> async_slots;
 
     static constexpr size_t AHB_CACHE_LIMIT = 12;
     std::unordered_map<AHardwareBuffer*, AHBImportCacheEntry*> ahb_import_cache;

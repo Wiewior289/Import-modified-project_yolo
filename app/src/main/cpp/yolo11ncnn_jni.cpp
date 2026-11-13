@@ -206,6 +206,15 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_FullGpuFrame(
 }
 
 JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_WaitGpuFrame(
+    JNIEnv* env, jobject thiz, jint slot_index)
+{
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -83;
+    return engine->gpu_wait_frame(slot_index);
+}
+
+JNIEXPORT jint JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_PostprocessFrame(
     JNIEnv* env, jobject thiz, jint slot_index, jfloatArray out_buffer_obj,
     jfloat conf_thresh, jfloat nms_thresh)

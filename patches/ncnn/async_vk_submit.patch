@@ -1,0 +1,205 @@
+diff --git a/src/command.h b/src/command.h
+index 49ca3e9..a7f12d1 100644
+--- a/src/command.h
++++ b/src/command.h
+@@ -64,5 +64,10 @@ public:
+ #endif // NCNN_PLATFORM_API
+ 
++    // Split queue submission from fence completion. Keep this VkCompute and
++    // every referenced tensor/allocator alive until wait() returns success.
++    int submit();
++    int wait();
++
+     int submit_and_wait();
+ 
+     int reset();
+diff --git a/src/command.cpp b/src/command.cpp
+index 49ca3e9..a8b0d10 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -181,3 +181,6 @@ class VkComputePrivate
+     std::vector<record> delayed_records;
+ 
+     uint64_t pending_dispatch_total;
++    bool async_submit;
++    bool submitted;
++    bool needs_reset;
+@@ -195,3 +198,6 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
+     compute_command_fence = 0;
+ 
+     pending_dispatch_total = 0;
++    async_submit = false;
++    submitted = false;
++    needs_reset = false;
+@@ -208,2 +214,13 @@ VkComputePrivate::~VkComputePrivate()
+ {
++    // Safety net only. Correct callers must use wait() so deferred readbacks
++    // are materialized before the VkCompute and its allocators are destroyed.
++    if (submitted && compute_command_fence)
++    {
++        NCNN_LOGE("[NCNN_VK_ASYNC] destructor found pending submission; waiting");
++        VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &compute_command_fence, VK_TRUE, (uint64_t)-1);
++        if (ret != VK_SUCCESS)
++            NCNN_LOGE("[NCNN_VK_ASYNC] destructor fence wait failed %d", ret);
++        submitted = false;
++    }
++
+     for (size_t i = 0; i < image_blocks_to_destroy.size(); i++)
+@@ -1833,2 +1848,5 @@ int VkCompute::submit_and_wait()
+ {
++    if (d->submitted || d->needs_reset)
++        return -1;
++
+     using sync_clock = std::chrono::steady_clock;
+@@ -1999,5 +2017,19 @@ int VkCompute::submit_and_wait()
+ 
+     vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+ 
++    if (d->async_submit)
++    {
++        d->submitted = true;
++        d->needs_reset = true;
++        NCNN_LOGE("[NCNN_VK_ASYNC_SUBMIT] seq=%llu pending_dispatches=%llu delayed_records=%zu "
++                  "download_buffers=%zu delayed_record_replay_ms=%.3f command_buffer_end_ms=%.3f "
++                  "queue_acquire_ms=%.3f queue_submit_ms=%.3f",
++                  (unsigned long long)sync_id,
++                  (unsigned long long)pending_dispatches,
++                  delayed_record_count, download_buffer_count, delayed_record_replay_ms,
++                  command_buffer_end_ms, queue_acquire_ms, queue_submit_ms);
++        return 0;
++    }
++
+     // wait
+     {
+@@ -2041,5 +2071,94 @@ int VkCompute::submit_and_wait()
+     return 0;
+ }
+ 
++int VkCompute::submit()
++{
++    if (d->submitted || d->needs_reset || d->async_submit)
++        return -1;
++    d->async_submit = true;
++    const int ret = submit_and_wait();
++    d->async_submit = false;
++    return ret;
++}
++
++int VkCompute::wait()
++{
++    if (!d->submitted)
++    {
++        NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] called without a pending submission");
++        return -1;
++    }
++    using async_clock = std::chrono::steady_clock;
++    const auto wait_start = async_clock::now();
++    const auto fence_start = async_clock::now();
++    VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence,
++                                   VK_TRUE, (uint64_t)-1);
++    const double fence_wait_wall_ms = std::chrono::duration<double, std::milli>(
++        async_clock::now() - fence_start).count();
++    if (ret != VK_SUCCESS)
++    {
++        NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] vkWaitForFences failed %d", ret);
++        return -1;
++    }
++    const auto post_start = async_clock::now();
++    for (size_t i = 0; i < d->delayed_records.size(); i++)
++    {
++        const VkComputePrivate::record& r = d->delayed_records[i];
++        switch (r.type)
++        {
++        case VkComputePrivate::record::TYPE_post_download:
++        {
++            const VkMat& src = d->download_post_buffers[r.post_download.download_post_buffer_mat_offset];
++            Mat& dst = d->download_post_mats_fp16[r.post_download.download_post_mat_fp16_offset];
++            src.allocator->invalidate(src.data);
++            for (int b = 0; b < dst.n; b++)
++            {
++                const VkMat src_b = src.batch(b);
++                Mat dst_b = dst.batch(b);
++                memcpy(dst_b.data, src_b.mapped_ptr(), dst_b.total() * dst_b.elemsize);
++            }
++            break;
++        }
++        case VkComputePrivate::record::TYPE_post_cast_float16_to_float32:
++        {
++            const Mat& src = d->download_post_mats_fp16[r.post_cast_float16_to_float32.download_post_mat_fp16_offset];
++            Mat& dst = d->download_post_mats[r.post_cast_float16_to_float32.download_post_mat_offset];
++            Option opt;
++            opt.num_threads = r.post_cast_float16_to_float32.num_threads;
++            opt.blob_allocator = dst.allocator;
++            ncnn::cast_float16_to_float32(src, dst, opt);
++            break;
++        }
++        case VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32:
++        {
++            const Mat& src = d->download_post_mats_fp16[r.post_cast_bfloat16_to_float32.download_post_mat_bf16_offset];
++            Mat& dst = d->download_post_mats[r.post_cast_bfloat16_to_float32.download_post_mat_offset];
++            Option opt;
++            opt.num_threads = r.post_cast_bfloat16_to_float32.num_threads;
++            opt.blob_allocator = dst.allocator;
++            ncnn::cast_bfloat16_to_float32(src, dst, opt);
++            break;
++        }
++        default:
++            break;
++        }
++    }
++    const double post_download_cpu_ms = std::chrono::duration<double, std::milli>(
++        async_clock::now() - post_start).count();
++    d->delayed_records.clear();
++    d->pending_dispatch_total = 0;
++    d->submitted = false;
++    const double total_wall_ms = std::chrono::duration<double, std::milli>(
++        async_clock::now() - wait_start).count();
++    NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] result=OK fence_wait_wall_ms=%.3f post_download_cpu_ms=%.3f total_wall_ms=%.3f",
++              fence_wait_wall_ms, post_download_cpu_ms, total_wall_ms);
++    return 0;
++}
++
+ int VkCompute::reset()
+ {
++    if (d->submitted)
++    {
++        NCNN_LOGE("[NCNN_VK_ASYNC] reset rejected while GPU work is pending");
++        return -1;
++    }
+@@ -2112,4 +2234,5 @@ int VkCompute::reset()
+ #endif // NCNN_BENCHMARK
+     }
++    d->needs_reset = false;
+     return 0;
+ }
+diff --git a/src/option.h b/src/option.h
+index 49ca3e9..af6d4f1 100644
+--- a/src/option.h
++++ b/src/option.h
+@@ -164,2 +164,5 @@ public:
+     bool use_benchmark;
++    // Use nonblocking queue submission for full-GPU frame execution.
++    // The caller owns VkCompute, Extractor and allocators until wait() succeeds.
++    bool use_vulkan_async;
+ };
+diff --git a/src/option.cpp b/src/option.cpp
+index 49ca3e9..f8d3c20 100644
+--- a/src/option.cpp
++++ b/src/option.cpp
+@@ -82,2 +82,3 @@ Option::Option()
+     use_benchmark = false;
++    use_vulkan_async = false;
+ }
+diff --git a/src/net.cpp b/src/net.cpp
+index 66dd737..d2e3f20 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -269,3 +269,8 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
+         pending_dispatch_threshold = 256 * 1024; // 256K
+     }
++    // Full-GPU mode avoids host fence waits at every small dispatch batch.
++    // Keep a finite 512K workgroup cap as protection for larger graphs.
++    if (opt.use_vulkan_async && pending_dispatch_threshold < 512 * 1024)
++        pending_dispatch_threshold = 512 * 1024;
++
+     const uint64_t pending_dispatch_before_flush = cmd.pending_dispatch_total();
