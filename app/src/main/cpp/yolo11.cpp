@@ -622,6 +622,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
 
 
 
+    const auto& model_layers = net.layers();
+
     if (compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN ||
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE) {
@@ -683,7 +685,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
          net.opt.use_fp16_arithmetic ? 1 : 0, net.opt.use_fp16_uniform ? 1 : 0);
 
     // Inventory follows MatMul backend selection, so mode 7 reports final placement.
-    const auto& model_layers=net.layers();const auto& model_blobs=net.blobs();
+    const auto& model_blobs = net.blobs();
     LOGI("NCNN_GRAPH_INVENTORY layers=%zu blobs=%zu mode=%d",model_layers.size(),model_blobs.size(),compute_mode);
     for(size_t i=0;i<model_layers.size();i++){const ncnn::Layer*l=model_layers[i];if(!l)continue;
         const std::string b=blob_edges(l->bottoms,model_blobs),t=blob_edges(l->tops,model_blobs);
@@ -1032,7 +1034,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
          cpu_snapshot.preprocess_ms,cpu_snapshot.infer_ms,cpu_snapshot.post_ms,ret_cpu,
          gpu_snapshot.preprocess_ms,gpu_snapshot.infer_ms,gpu_snapshot.post_ms,ret_gpu);
     LOGI("%s_END sample=%u frame=%lld ts=%lld status=%s",
-         compare_tag, sample_number,(long long)frame_id,image_timestamp_ns,
+         compare_tag, sample_number,(long long)frame_id,(long long)image_timestamp_ns,
          (ret_cpu==0&&ret_gpu==0)?"OK":"PARTIAL");
     return 0;
 }
