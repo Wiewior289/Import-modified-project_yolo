@@ -6,10 +6,17 @@ Vulkan + Camera2 AHardwareBuffer + Vulkan MatMul (compute mode 8). The
 compute-mode selector has been removed from the Android activity UI. The
 repository's `dashboard.html` did not contain a compute-mode selector.
 
-This milestone does **not** implement multi-frame GPU submission yet. The
-Camera2 listener still uses `isProcessingFrame` as a single-frame gate. That
-is intentional: timing data must be collected before changing submission,
-resource lifetime, and slot ownership rules.
+Mode 8 now uses a bounded two-slot frame pipeline. A serial GPU worker runs
+the complete Vulkan graph and waits for NCNN's CPU `out0` readback. A separate
+serial CPU worker performs DFL/NMS for that completed frame while the GPU worker
+can begin the next frame. The existing single-frame gate remains in the
+synchronous non-mode-8 path.
+
+This is **stage-level frame overlap**, not a nonblocking NCNN Vulkan submit
+API. Preprocessing `submit_and_wait()`, NCNN dispatch-threshold flushes, and
+the final `out0` readback wait remain intact. The change overlaps CPU
+postprocessing of frame N with GPU work for frame N+1; it does not yet overlap
+two inference graphs on the GPU or remove waits inside NCNN.
 
 ## Log groups
 
@@ -143,8 +150,41 @@ this milestone instruments it rather than disabling driver protection.
 - `json_build_ms`, `websocket_broadcast_ms`, `stm32_send_ms`: application
   output work after detection.
 - `callback_to_done_ms`: Camera2 callback-to-task completion wall time.
-- `busy_dropped_total`: number of frames discarded while a previous frame
-  holds the single-frame processing gate.
+- `busy_dropped_total`: number of frames discarded by the synchronous
+  single-frame gate or because both asynchronous frame slots are occupied.
+
+### Mode 8 full-GPU asynchronous stages
+
+Mode 8 reuses the two-slot scheduler but does not use the CPU graph suffix
+from modes 3/4:
+
+```text
+Camera2 AHB
+  -> GPU worker: AHB import + preprocess + full Vulkan YOLO graph
+  -> final out0 download/fence completion
+  -> slot.out0 (CPU Mat)
+       -> CPU worker: DFL + NMS + detection packing
+  -> slot released
+```
+
+The GPU worker owns the AHB import cache, Vulkan Net, Extractor and Vulkan
+allocators. The CPU worker owns DFL/NMS scratchpads and detection output. The
+GPU path does not touch shared score fields or postprocessing scratchpads while
+the CPU worker is active. Each slot retains its own `out0` Mat until
+postprocessing completes.
+
+Monotonic timestamps are logged every 30 frames:
+
+- `ASYNC_FRAME_QUEUED.queued_ns`: slot reservation and GPU task enqueue.
+- `ASYNC_GPU_STAGE_DONE.start_ns/end_ns`: complete GPU stage wall interval,
+  including preprocessing, NCNN internal flush waits and final output readback.
+- `ASYNC_CPU_STAGE_DONE.start_ns/end_ns`: CPU DFL/NMS interval.
+
+The overlap can be checked directly: CPU interval for frame N should intersect
+GPU interval for frame N+1. A slot is released only after its CPU stage returns.
+`ASYNC_GPU_STAGE_DONE.wall_ms` is not GPU execution time; use
+`NCNN_BENCHMARK_GPU` for GPU layer timestamps and `NCNN_VK_SYNC` for internal
+submission/fence waits.
 
 The native/JNI/app fields are nested measurements, not additive buckets.
 For example, `native_detect_wall_ms` contains the native `PipelineStages`
