@@ -147,7 +147,7 @@
 +                benchmark(layer, start, end);
 +            }
 +            NCNN_LOGE("[NCNN_BENCHMARK_CPU] idx=%d type=%s name=%s duration=%.3fms",
-+                      layer_index, layer->type.c_str(), layer->name.c_str(), (end - start) * 1000.0);
++                      layer_index, layer->type.c_str(), layer->name.c_str(), end - start);
 +    }
  #endif
 @@ -361,3 +369,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
