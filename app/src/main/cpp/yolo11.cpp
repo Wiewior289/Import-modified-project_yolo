@@ -1085,7 +1085,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     double image_import_ms = 0.0;
     double pipeline_create_ms = 0.0;
     double preprocess_record_ms=0.0,preprocess_import_record_ms=0.0,preprocess_scale_record_ms=0.0,preprocess_cast_record_ms=0.0;
-    double preprocess_wait_ms=0.0;uint64_t preprocess_dispatches=0;double infer_extract_ms=0.0;
+    double preprocess_wait_ms=0.0;uint64_t preprocess_dispatches=0;
+    double extractor_setup_ms=0.0,extractor_input_ms=0.0,infer_extract_ms=0.0;
     double dfl_decode_ms = 0.0;
     double nms_ms = 0.0;
     double postprocess_ms = 0.0;
@@ -1318,11 +1319,18 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     // VkMat/manual-download change. Extractor handles GPU output
                     // conversion, packing and readback for ncnn::Mat.
                     if (execute_ret == 0) {
+                        t=std::chrono::steady_clock::now();
                         ncnn::Extractor ex = net.create_extractor();
                         ex.set_blob_vkallocator(blob_allocator);
                         ex.set_workspace_vkallocator(blob_allocator);
                         ex.set_staging_vkallocator(staging_allocator);
+                        extractor_setup_ms=std::chrono::duration<double,std::milli>(
+                            std::chrono::steady_clock::now()-t).count();
+
+                        t=std::chrono::steady_clock::now();
                         const int in_ret=ex.input("in0",in_gpu);
+                        extractor_input_ms=std::chrono::duration<double,std::milli>(
+                            std::chrono::steady_clock::now()-t).count();
                         if(in_ret!=0){LOGE("Extractor::input(in0,VkMat) failed frame=%lld ret=%d",(long long)frame_id,in_ret);execute_ret=-12;}
                         else{t=std::chrono::steady_clock::now();execute_ret=ex.extract("out0",out);
                             infer_extract_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();}
@@ -1365,7 +1373,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     const double frame_total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - frame_start).count();
     const double accounted_stage_ms = allocator_acquire_ms + cache_lookup_ms + cache_setup_ms +
-        preprocess_record_ms + preprocess_wait_ms + infer_extract_ms + dfl_decode_ms + nms_ms;
+        preprocess_record_ms + preprocess_wait_ms + extractor_setup_ms + extractor_input_ms +
+        infer_extract_ms + dfl_decode_ms + nms_ms;
     const double unaccounted_wall_ms = std::max(0.0, frame_total_ms - accounted_stage_ms);
 
     static int s_frame_log = 0;
@@ -1383,13 +1392,15 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         LOGI("PipelineStages frame=%lld imageTs=%lld allocator_acquire=%.3fms cache_lookup=%.3fms cache_setup=%.3fms "
              "preprocess_record=%.3fms import_record=%.3fms scale_record=%.3fms cast_record=%.3fms "
              "dispatches=%llu preprocess_submit_wait_wall=%.3fms preprocess_total=%.3fms "
-             "infer_extract_wall=%.3fms dfl_decode=%.3fms nms=%.3fms post_total=%.3fms "
+             "extractor_setup=%.3fms extractor_input=%.3fms infer_extract_wall=%.3fms "
+             "dfl_decode=%.3fms nms=%.3fms post_total=%.3fms "
              "unaccounted_wall=%.3fms native_frame_total=%.3fms",
              (long long)frame_id,(long long)image_timestamp_ns,
              allocator_acquire_ms,cache_lookup_ms,cache_setup_ms,
              preprocess_record_ms,preprocess_import_record_ms,preprocess_scale_record_ms,preprocess_cast_record_ms,
              (unsigned long long)preprocess_dispatches,preprocess_wait_ms,preprocess_total_ms,
-             infer_total_ms,dfl_decode_ms,nms_ms,postprocess_ms,unaccounted_wall_ms,frame_total_ms);
+             extractor_setup_ms,extractor_input_ms,infer_total_ms,
+             dfl_decode_ms,nms_ms,postprocess_ms,unaccounted_wall_ms,frame_total_ms);
 
         LOGI("Tensor out0 frame=%lld imageTs=%lld dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d proposals=%zu detections=%zu top=%.3f cls=%d",
              (long long)frame_id,(long long)image_timestamp_ns,out.dims,out.w,out.h,out.d,out.c,out.elemsize,out.elempack,
