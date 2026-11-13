@@ -366,7 +366,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     net.opt.num_threads         = 4;
     const bool runtime_benchmark =
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ||
-        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU;
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
+        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN;
     net.opt.use_benchmark = runtime_benchmark;
     LOGI("NCNN_BENCHMARK_RUNTIME enabled=%d mode=%d", runtime_benchmark ? 1 : 0, compute_mode);
 
@@ -1062,8 +1063,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         return -4;
     }
 
+    const auto allocator_acquire_start = std::chrono::steady_clock::now();
     ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
+    const double allocator_acquire_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - allocator_acquire_start).count();
     if (!blob_allocator || !staging_allocator) {
         if (blob_allocator) vkdev->reclaim_blob_allocator(blob_allocator);
         if (staging_allocator) vkdev->reclaim_staging_allocator(staging_allocator);
@@ -1082,6 +1086,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     double pipeline_create_ms = 0.0;
     double preprocess_record_ms=0.0,preprocess_import_record_ms=0.0,preprocess_scale_record_ms=0.0,preprocess_cast_record_ms=0.0;
     double preprocess_wait_ms=0.0;uint64_t preprocess_dispatches=0;double infer_extract_ms=0.0;
+    double dfl_decode_ms = 0.0;
+    double nms_ms = 0.0;
     double postprocess_ms = 0.0;
     bool cache_hit = false;
 
@@ -1340,19 +1346,27 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     }
 
     if(frame_id>0&&frame_id%30==0)log_tensor_stats("out0",out,frame_id,image_timestamp_ns);
-    const auto post_start = std::chrono::steady_clock::now();
+    auto post_stage_start = std::chrono::steady_clock::now();
     proposal_scratchpad.clear();
     decode_dfl_and_filter(out, conf_thresh);
+    dfl_decode_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_stage_start).count();
+
     objects.clear();
+    post_stage_start = std::chrono::steady_clock::now();
     nms_sorted_bboxes(nms_thresh, objects);
-    postprocess_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - post_start).count();
+    nms_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_stage_start).count();
+    postprocess_ms = dfl_decode_ms + nms_ms;
 
     const double preprocess_total_ms = preprocess_record_ms + preprocess_wait_ms;
     const double infer_total_ms = infer_extract_ms; // Extractor wall time includes GPU execution, sync and output readback.
     const double cache_setup_ms = allocator_create_ms + image_import_ms + pipeline_create_ms;
     const double frame_total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - frame_start).count();
+    const double accounted_stage_ms = allocator_acquire_ms + cache_lookup_ms + cache_setup_ms +
+        preprocess_record_ms + preprocess_wait_ms + infer_extract_ms + dfl_decode_ms + nms_ms;
+    const double unaccounted_wall_ms = std::max(0.0, frame_total_ms - accounted_stage_ms);
 
     static int s_frame_log = 0;
     if (++s_frame_log % 30 == 0) {
@@ -1366,9 +1380,16 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
              ahb_import_cache.size(), cache_lookup_ms, allocator_create_ms,
              image_import_ms, pipeline_create_ms);
 
-        LOGI("Pipeline frame=%lld imageTs=%lld record_total=%.3fms import_record=%.3fms scale_record=%.3fms cast_record=%.3fms dispatches=%llu wait=%.3fms preprocess_total=%.3fms infer_extract_wall=%.3fms post=%.3fms cache_setup=%.3fms frame_total=%.3fms",
-             (long long)frame_id,(long long)image_timestamp_ns,preprocess_record_ms,preprocess_import_record_ms,preprocess_scale_record_ms,preprocess_cast_record_ms,
-             (unsigned long long)preprocess_dispatches,preprocess_wait_ms,preprocess_total_ms,infer_total_ms,postprocess_ms,cache_setup_ms,frame_total_ms);
+        LOGI("PipelineStages frame=%lld imageTs=%lld allocator_acquire=%.3fms cache_lookup=%.3fms cache_setup=%.3fms "
+             "preprocess_record=%.3fms import_record=%.3fms scale_record=%.3fms cast_record=%.3fms "
+             "dispatches=%llu preprocess_submit_wait_wall=%.3fms preprocess_total=%.3fms "
+             "infer_extract_wall=%.3fms dfl_decode=%.3fms nms=%.3fms post_total=%.3fms "
+             "unaccounted_wall=%.3fms native_frame_total=%.3fms",
+             (long long)frame_id,(long long)image_timestamp_ns,
+             allocator_acquire_ms,cache_lookup_ms,cache_setup_ms,
+             preprocess_record_ms,preprocess_import_record_ms,preprocess_scale_record_ms,preprocess_cast_record_ms,
+             (unsigned long long)preprocess_dispatches,preprocess_wait_ms,preprocess_total_ms,
+             infer_total_ms,dfl_decode_ms,nms_ms,postprocess_ms,unaccounted_wall_ms,frame_total_ms);
 
         LOGI("Tensor out0 frame=%lld imageTs=%lld dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d proposals=%zu detections=%zu top=%.3f cls=%d",
              (long long)frame_id,(long long)image_timestamp_ns,out.dims,out.w,out.h,out.d,out.c,out.elemsize,out.elempack,
