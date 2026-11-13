@@ -41,9 +41,13 @@ Emitted every 30 frames by `Yolo11::detect_ahb()`.
   `VkCompute::submit_and_wait()`. It is not a pure fence-wait measurement.
 - `preprocess_total`: preprocessing record time plus preprocessing
   submit-and-wait wall time.
-- `infer_extract_wall`: wall time of NCNN input/extraction for `out0`. It
-  includes graph execution, any internal command-buffer submissions and
-  synchronization, and the output readback to CPU `ncnn::Mat`. It is not the
+- `extractor_setup`: CPU time to construct the NCNN Extractor and attach the
+  frame blob/workspace/staging allocators.
+- `extractor_input`: CPU wall time of `ex.input("in0", in_gpu)`, which binds
+  the preprocessed Vulkan tensor as the graph input.
+- `infer_extract_wall`: wall time of `ex.extract("out0", out)`. It includes
+  graph traversal/execution, any internal command-buffer submissions and
+  synchronization, and output readback to CPU `ncnn::Mat`. It is not the
   GPU-only execution time.
 - `dfl_decode`: CPU DFL decode/filter after `out0` is available.
 - `nms`: CPU sort and non-maximum suppression.
@@ -133,7 +137,11 @@ this milestone instruments it rather than disabling driver protection.
 
 The native/JNI/app fields are nested measurements, not additive buckets.
 For example, `native_detect_wall_ms` contains the native `PipelineStages`
-and `JNI_FRAME_TIMING.detect_frame_ms` intervals.
+and `JNI_FRAME_TIMING.detect_frame_ms` intervals. Likewise,
+`extractor_setup`, `extractor_input`, and `infer_extract_wall` are separate
+sequential portions of the native frame path; the per-layer GPU timestamps and
+Vulkan submit/fence timings occur inside the Extractor interval and must not be
+added to it as if they were extra frame stages.
 
 ## Current synchronization boundary
 
