@@ -1,0 +1,188 @@
+diff --git a/src/command.cpp b/src/command.cpp
+index 49ca3e9..0000000 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -7,6 +7,9 @@
+ #if NCNN_VULKAN
+ 
+ #include "option.h"
+ #include "pipeline.h"
+ 
++#include <atomic>
++#include <chrono>
++
+ namespace ncnn {
+ 
+ class VkComputePrivate
+@@ -1831,8 +1834,25 @@
+ 
+ int VkCompute::submit_and_wait()
+ {
++    using sync_clock = std::chrono::steady_clock;
++    static std::atomic<uint64_t> sync_sequence(0);
++    const uint64_t sync_id = sync_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
++    const auto sync_start = sync_clock::now();
++    const uint64_t pending_dispatches = d->pending_dispatch_total;
++    const size_t delayed_record_count = d->delayed_records.size();
++    const size_t download_buffer_count = d->download_post_buffers.size();
++    double delayed_record_replay_ms = 0.0;
++    double command_buffer_end_ms = 0.0;
++    double queue_acquire_ms = 0.0;
++    double queue_submit_ms = 0.0;
++    double fence_wait_wall_ms = 0.0;
++    double post_download_cpu_ms = 0.0;
++
+     //     NCNN_LOGE("submit_and_wait");
+ 
++    const auto delayed_record_replay_start = sync_clock::now();
+     if (!vkdev->info.support_VK_KHR_push_descriptor())
+     {
+         d->begin_command_buffer();
+@@ -1940,14 +1960,26 @@
+         }
+     }
+ 
++    delayed_record_replay_ms = std::chrono::duration<double, std::milli>(
++        sync_clock::now() - delayed_record_replay_start).count();
++
+     // end command buffer
+     {
++        const auto end_start = sync_clock::now();
+         d->end_command_buffer();
++        command_buffer_end_ms = std::chrono::duration<double, std::milli>(
++            sync_clock::now() - end_start).count();
+     }
+ 
+     // acquire queue and reclaim on return
++    const auto queue_acquire_start = sync_clock::now();
+     VkQueue compute_queue = vkdev->acquire_queue(vkdev->info.compute_queue_family_index());
++    queue_acquire_ms = std::chrono::duration<double, std::milli>(
++        sync_clock::now() - queue_acquire_start).count();
+     if (compute_queue == 0)
+     {
+-        NCNN_LOGE("out of compute queue");
++        NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=QUEUE_ACQUIRE_FAILED queue_acquire_ms=%.3f",
++                  (unsigned long long)sync_id, queue_acquire_ms);
+         return -1;
+     }
+ 
+@@ -1960,7 +1992,11 @@
+         submitInfo.signalSemaphoreCount = 0;
+         submitInfo.pSignalSemaphores = 0;
+ 
++        const auto submit_start = sync_clock::now();
+         VkResult ret = vkQueueSubmit(compute_queue, 1, &submitInfo, d->compute_command_fence);
++        queue_submit_ms = std::chrono::duration<double, std::milli>(
++            sync_clock::now() - submit_start).count();
+         if (ret != VK_SUCCESS)
+         {
+-            NCNN_LOGE("vkQueueSubmit failed %d", ret);
++            NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=QUEUE_SUBMIT_FAILED vk_result=%d queue_submit_ms=%.3f",
++                      (unsigned long long)sync_id, ret, queue_submit_ms);
+             vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+             return -1;
+         }
+@@ -1971,8 +2007,12 @@
+     // wait
+     {
++        const auto fence_start = sync_clock::now();
+         VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, (uint64_t)-1);
++        fence_wait_wall_ms = std::chrono::duration<double, std::milli>(
++            sync_clock::now() - fence_start).count();
+         if (ret != VK_SUCCESS)
+         {
+-            NCNN_LOGE("vkWaitForFences failed %d", ret);
++            NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=FENCE_WAIT_FAILED vk_result=%d fence_wait_wall_ms=%.3f",
++                      (unsigned long long)sync_id, ret, fence_wait_wall_ms);
+             return -1;
+         }
+     }
+ 
+     // handle delayed post records
++    const auto post_download_start = sync_clock::now();
+     for (size_t i = 0; i < d->delayed_records.size(); i++)
+     {
+         const VkComputePrivate::record& r = d->delayed_records[i];
+@@ -2028,6 +2068,9 @@
+         }
+     }
+ 
++    post_download_cpu_ms = std::chrono::duration<double, std::milli>(
++        sync_clock::now() - post_download_start).count();
++
+     d->delayed_records.clear();
+ 
+     d->pending_dispatch_total = 0;
+ 
++    const double total_wall_ms = std::chrono::duration<double, std::milli>(
++        sync_clock::now() - sync_start).count();
++    NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=OK pending_dispatches=%llu delayed_records=%zu download_buffers=%zu "
++              "record_replay_ms=%.3f command_buffer_end_ms=%.3f queue_acquire_ms=%.3f "
++              "queue_submit_ms=%.3f fence_wait_wall_ms=%.3f post_download_cpu_ms=%.3f total_wall_ms=%.3f",
++              (unsigned long long)sync_id, (unsigned long long)pending_dispatches,
++              delayed_record_count, download_buffer_count,
++              delayed_record_replay_ms, command_buffer_end_ms, queue_acquire_ms,
++              queue_submit_ms, fence_wait_wall_ms, post_download_cpu_ms, total_wall_ms);
++
+     return 0;
+ }
+ 
+diff --git a/src/net.cpp b/src/net.cpp
+index e03b93b..0000000 100644
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -10,6 +10,7 @@
+ #include <stdarg.h>
+ #include <stdint.h>
++#include <chrono>
+ #include <string.h>
+ 
+ #if NCNN_BENCHMARK
+@@ -198,6 +199,7 @@
+     //     NCNN_LOGE("forward_layer %d %d %s", layer->support_vulkan, layer_index, layer->name.c_str());
+ 
+     bool cmd_submit_and_wait = false;
++    bool cmd_submit_for_cpu_download = false;
+ 
+     // load bottom blobs
+@@ -242,6 +244,7 @@
+                 }
+ 
+                 cmd_submit_and_wait = true;
++                cmd_submit_for_cpu_download = true;
+             }
+         }
+     }
+@@ -267,14 +270,31 @@
+     else if (rough_score > 10)
+     {
+         pending_dispatch_threshold = 256 * 1024; // 256K
+     }
+-    if (cmd.pending_dispatch_total() > pending_dispatch_threshold)
++    const uint64_t pending_dispatch_before_flush = cmd.pending_dispatch_total();
++    const bool dispatch_threshold_flush = pending_dispatch_before_flush > pending_dispatch_threshold;
++    if (dispatch_threshold_flush)
+     {
+         cmd_submit_and_wait = true;
+     }
+ 
+     int ret;
+     if (cmd_submit_and_wait)
+     {
++        const char* flush_trigger = cmd_submit_for_cpu_download && dispatch_threshold_flush
++            ? "cpu_layer_download+dispatch_threshold"
++            : (cmd_submit_for_cpu_download ? "cpu_layer_download" : "dispatch_threshold");
++        const auto flush_start = std::chrono::steady_clock::now();
++        NCNN_LOGE("[NCNN_VK_FLUSH] layer_idx=%d type=%s name=%s trigger=%s rough_score=%u "
++                  "pending_dispatches=%llu threshold=%u",
++                  layer_index, layer->type.c_str(), layer->name.c_str(), flush_trigger,
++                  rough_score, (unsigned long long)pending_dispatch_before_flush,
++                  pending_dispatch_threshold);
+         ret = cmd.submit_and_wait();
++        const double flush_wall_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - flush_start).count();
++        NCNN_LOGE("[NCNN_VK_FLUSH_DONE] layer_idx=%d name=%s trigger=%s submit_wait_wall_ms=%.3f ret=%d",
++                  layer_index, layer->name.c_str(), flush_trigger, flush_wall_ms, ret);
+ 
+ #if NCNN_BENCHMARK
+         std::vector<uint64_t> results(layer_index * 2);
