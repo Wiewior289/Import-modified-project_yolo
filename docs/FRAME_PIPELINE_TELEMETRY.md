@@ -13,10 +13,13 @@ can begin the next frame. The existing single-frame gate remains in the
 synchronous non-mode-8 path.
 
 This is **stage-level frame overlap**, not a nonblocking NCNN Vulkan submit
-API. Preprocessing `submit_and_wait()`, NCNN dispatch-threshold flushes, and
-the final `out0` readback wait remain intact. The change overlaps CPU
-postprocessing of frame N with GPU work for frame N+1; it does not yet overlap
-two inference graphs on the GPU or remove waits inside NCNN.
+API. AHB import, resize/cast, the full NCNN Vulkan graph, and the final
+`out0` download are now recorded through one `VkCompute` context. There is
+no explicit host wait between preprocessing and graph execution. NCNN's
+dispatch-threshold flushes still submit and wait synchronously, and the final
+`out0` readback still requires a fence. CPU DFL/NMS for frame N can overlap
+GPU inference of frame N+1; two GPU inference graphs are not yet in flight at
+the same time.
 
 ## Log groups
 
@@ -39,23 +42,33 @@ Emitted every 30 frames by `Yolo11::detect_ahb()`.
 - `cache_setup`: cache miss work (allocator construction, image import, and
   import-pipeline creation).
 - `preprocess_record`: CPU time recording the AHB import, resize, and packing
-  commands into the preprocessing command buffer.
+  commands into the shared inference command buffer. These commands remain
+  queued for the Extractor graph; they are not submitted as a separate stage.
 - `import_record`, `scale_record`, `cast_record`: sub-times within
   `preprocess_record`; do not add these again to the total.
-- `dispatches`: dispatch workgroup count recorded by preprocessing. It is not
-  a count of frames, dispatch calls, or milliseconds.
-- `preprocess_submit_wait_wall`: wall time of preprocessing
-  `VkCompute::submit_and_wait()`. It is not a pure fence-wait measurement.
-- `preprocess_total`: preprocessing record time plus preprocessing
-  submit-and-wait wall time.
+- `dispatches_at_preprocess_end`: `VkCompute::pending_dispatch_total()`
+  immediately after preprocessing. This is the accumulated **workgroup count**
+  (sum of dispatch X×Y×Z) since the last submit/reset, not a count of frames,
+  dispatch calls, or milliseconds.
+- `preprocess_host_wait`: explicit host wait after preprocessing. It is
+  normally zero in the fused path; the opt-in tensor tap may submit early.
+- `preprocess_total`: preprocessing command-record time plus any explicit
+  preprocessing host wait. In the normal fused path it is effectively the
+  record time.
 - `extractor_setup`: CPU time to construct the NCNN Extractor and attach the
   frame blob/workspace/staging allocators.
 - `extractor_input`: CPU wall time of `ex.input("in0", in_gpu)`, which binds
   the preprocessed Vulkan tensor as the graph input.
-- `infer_extract_wall`: wall time of `ex.extract("out0", out)`. It includes
-  graph traversal/execution, any internal command-buffer submissions and
-  synchronization, and output readback to CPU `ncnn::Mat`. It is not the
-  GPU-only execution time.
+- `infer_record_wall`: wall time of `ex.extract("out0", out_gpu, inference_cmd)`.
+  It includes graph traversal and command recording, plus any synchronous
+  dispatch-threshold flushes that occur during traversal.
+- `final_submit_wait_wall`: wall time of the final submit/fence and CPU
+  post-download path that makes `out0` visible as `ncnn::Mat`. It measures
+  only the final command-buffer chunk; earlier threshold flushes are accounted
+  separately by `NCNN_VK_SYNC`.
+- `infer_extract_wall`: `infer_record_wall + final_submit_wait_wall`. It is
+  the total Extractor-recording and final-output-readback wall interval, but
+  not GPU-only execution time.
 - `dfl_decode`: CPU DFL decode/filter after `out0` is available.
 - `nms`: CPU sort and non-maximum suppression.
 - `post_total`: `dfl_decode + nms`.
@@ -65,9 +78,11 @@ Emitted every 30 frames by `Yolo11::detect_ahb()`.
   wait or scheduler stall.
 
 The GPU time of individual inference layers is logged separately as
-`NCNN_BENCHMARK_GPU`. Preprocessing import/scale/cast GPU durations are not
-yet split into per-operation GPU timestamps in this milestone; those are
-currently covered by the preprocessing submit-and-wait wall interval.
+`NCNN_BENCHMARK_GPU`. Query-pool timestamps are created on the shared
+`inference_cmd` and read only after its final fence. Preprocessing
+import/scale/cast do not currently have their own timestamp pairs; their
+dispatches share the same command context and can be included in threshold
+flushes before the first model layer.
 
 ### Per-layer GPU timing: `NCNN_BENCHMARK_GPU`
 
@@ -128,8 +143,11 @@ reasons:
 
 The log reports the layer index/name, rough score, pending dispatch count,
 threshold, and trigger. `NCNN_VK_FLUSH_DONE` reports the complete
-submit-and-wait transaction wall time. The threshold is deliberately retained;
-this milestone instruments it rather than disabling driver protection.
+submit-and-wait transaction wall time. The threshold is deliberately retained; this milestone instruments it rather
+than disabling driver protection. In the current full-GPU capture, all
+`NCNN_VK_FLUSH` records use `dispatch_threshold`. The older CPU-delegated
+`yolo_layers.txt` capture also has `cpu_layer_download` flushes before
+MatMul 110 and 113.
 
 ### JNI and application timing
 
@@ -194,27 +212,90 @@ sequential portions of the native frame path; the per-layer GPU timestamps and
 Vulkan submit/fence timings occur inside the Extractor interval and must not be
 added to it as if they were extra frame stages.
 
+## What the old and current traces say about waits
+
+The older `yolo_layers.txt` trace is the CPU-delegated baseline. Immediately
+before MatMul 110 it records:
+
+```text
+SYNC_REQUIRED before_layer=110 reason=CPU_FALLBACK_DOWNLOAD
+pending_dispatch=25308 threshold=32768
+fence_wait_ms=21.607
+```
+
+Before MatMul 113 it records another
+`CPU_FALLBACK_DOWNLOAD`, with `pending_dispatch=2553` and
+`fence_wait_ms=1.662`. Those two CPU-island handoffs account for 23.269 ms of
+fence wait in that captured graph, before counting CPU MatMul execution and
+the later upload of the CPU-produced result back into Vulkan. The GPU graph
+cannot continue through the dependent branch until the CPU output tensor
+exists. The same trace also has three separate dispatch-threshold flushes
+with fence waits of 6.866, 14.288, and 7.802 ms.
+
+The current `ncnn_milestone.txt` is a different topology: it contains 174
+`MATMUL_VK_DISPATCH_RECORDED` records and 22,059 per-layer GPU timestamp
+records. Its 609 `NCNN_VK_FLUSH` events all report
+`trigger=dispatch_threshold`; the 783 `NCNN_VK_SYNC` events have mean
+`fence_wait_wall_ms=7.171` ms, median 6.858 ms, p95 12.793 ms, and max
+15.482 ms across the captured run. MatMul 110 averages 878.10 us and MatMul
+113 averages 1,776.51 us across 86 timestamp samples each. These are GPU
+timestamps, not CPU fallback timings.
+
+The distinction matters: the old CPU island creates a genuine GPU→CPU→GPU
+dependency. In the current mode-8 graph, the MatMul layers are GPU dispatched;
+the recorded waits are dispatch-threshold flushes, not waits for CPU MatMul.
+`pending_dispatch_total` is the sum of dispatch workgroup counts
+(`group_count_x * group_count_y * group_count_z)); NCNN compares it with the
+rough-score-derived threshold and resets it after submit/wait. On this Mali
+capture the reported rough score is 7 and the threshold is 32,768.
+
+In upstream `VkCompute::submit_and_wait()`, NCNN acquires a queue, submits
+the command buffer, returns the queue to the pool, and then waits on the
+command's fence. Thus the host thread is waiting for the GPU batch; the queue
+handle itself is not held during the fence wait. The GPU may still experience
+a gap between batches while the host wakes, resets/re-records the next chunk,
+and submits it. The fence-wait duration alone does not prove that such a gap
+exists; queue-submit timestamps or a nonblocking prototype are needed to
+measure it.
+
+The older branch `feat/gpu-cpu-gpu-ring-extractor` preserves a per-frame GPU
+Extractor, seven GPU carry blobs, and per-slot Vulkan allocators across a CPU
+island. It downloads only CPU-island inputs 133/137/136, computes bridge blob
+141 on CPU, then injects blob 141 into the same GPU Extractor for continuation.
+That is the explicit tensor-lifetime solution for a GPU→CPU→GPU graph cut.
+It is not merged into mode 8 because it delegates MatMul to CPU, whereas mode
+8 keeps MatMul 110 and 113 on Vulkan.
+
 ## Current synchronization boundary
 
-The pipeline remains:
+The mode-8 pipeline is now:
 
 ```text
 Camera2 AHB
-  -> Vulkan preprocessing VkCompute
-  -> submit_and_wait
-  -> NCNN Extractor: full Vulkan graph + Vulkan MatMul
-  -> out0 readback to CPU Mat
-  -> DFL decode
-  -> NMS
+  -> one VkCompute:
+       AHB import + Scale + cast
+       + full NCNN Vulkan graph (MatMul 110/113 on Vulkan)
+       + final out0 download
+  -> submit_and_wait / final fence / CPU post-download
+  -> CPU DFL decode + NMS
   -> JNI array copy
   -> telemetry / application output
 ```
 
-The preprocessing wait is still a hard host synchronization boundary. The
-Extractor path also waits as needed before returning `out0`. The next milestone
-can use the collected data to decide which boundary to remove first and then
-introduce per-frame slots/fences without allowing any slot's AHB, VkMat,
-allocator, or output buffers to be reused before completion.
+The preprocessing-to-graph host wait has been removed by passing the same
+`VkCompute` to `Extractor::extract("out0", VkMat&, VkCompute&)`. Internal
+dispatch-threshold submits still wait synchronously, and the final `out0`
+download still waits for its fence. At the application level, two frame slots
+allow CPU postprocessing of frame N to overlap GPU inference of frame N+1.
+A slot's `out0` Mat remains owned until CPU postprocessing completes; the
+GPU allocators and Vulkan command resources are reclaimed only after the
+synchronous final readback has completed.
+
+Removing the internal threshold waits safely requires a separate change to
+NCNN command-context lifetime: each submitted command buffer, its fence,
+descriptor sets, staging/download buffers, and referenced VkMat/image resources
+must remain alive until completion. Do not remove `submit_and_wait()` or call
+`reset()` while those resources are still in flight.
 
 ## Reading the trace
 
