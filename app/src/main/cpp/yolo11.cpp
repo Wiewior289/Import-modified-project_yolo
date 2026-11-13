@@ -1360,7 +1360,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     if (deferred_out0) {
         *deferred_out0 = out;
         if (frame_id > 0 && frame_id % 30 == 0) {
-            const double preprocess_wall_ms = preprocess_record_ms + preprocess_wait_ms;
             const double gpu_stage_wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frame_start).count();
             LOGI("GPU_FULL_FRAME_READY frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
@@ -1370,7 +1369,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                  out.dims, out.w, out.h, out.d, out.c, out.elemsize, out.elempack,
                  preprocess_record_ms, preprocess_wait_ms, infer_extract_ms,
                  gpu_stage_wall_ms, allocator_acquire_ms, cache_lookup_ms, cache_hit ? 1 : 0);
-            (void)preprocess_wall_ms;
         }
         return 0;
     }
@@ -1470,10 +1468,11 @@ int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type
     const int ret = detect_ahb(ahb, 0.f, 0.f, unused_objects, rotate_type,
                                frame_id, image_timestamp_ns, nullptr, &slot.out0);
     if (ret != 0 || slot.out0.empty()) {
+        const int out0_empty = slot.out0.empty() ? 1 : 0;
         slot.out0.release();
         slot.state = AsyncFrameSlot::FREE;
         LOGE("GPU_FULL_FRAME_FAILED frame=%lld slot=%d ret=%d out0_empty=%d",
-             (long long)frame_id, slot_index, ret, slot.out0.empty() ? 1 : 0);
+             (long long)frame_id, slot_index, ret, out0_empty);
         return ret != 0 ? ret : -54;
     }
 
@@ -1493,7 +1492,11 @@ int Yolo11::cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_t
     std::lock_guard<std::mutex> slot_lock(slot.mutex);
 
     if (!model_loaded || compute_mode != YOLO_COMPUTE_MATMUL_VULKAN) return -61;
-    if (slot.state != AsyncFrameSlot::CPU_READY || slot.out0.empty()) return -62;
+    if (slot.state != AsyncFrameSlot::CPU_READY) return -62;
+    if (slot.out0.empty()) {
+        slot.state = AsyncFrameSlot::FREE;
+        return -63;
+    }
 
     slot.state = AsyncFrameSlot::CPU_RUNNING;
     const int64_t frame_id = slot.frame_id;
