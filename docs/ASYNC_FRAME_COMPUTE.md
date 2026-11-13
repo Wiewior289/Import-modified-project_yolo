@@ -36,7 +36,7 @@ The Camera2 `Image` and Java `HardwareBuffer` wrapper remain open from `FullGpuF
 
 ## Dispatch-threshold safety
 
-NCNN internal dispatch-threshold flushes in `NetPrivate::forward_layer()` remain synchronous. Mode 8 raises the workgroup threshold to 512K to avoid the repeated small flushes seen in earlier traces while retaining a finite safety cap. Any remaining flush must be visible through `NCNN_VK_FLUSH`.
+NCNN internal dispatch-threshold flushes in `NetPrivate::forward_layer()` remain synchronous. Mode 8 raises small thresholds to a minimum of 512K to avoid repeated small flushes seen in earlier traces. Existing higher rough-score tiers (for example 1MB) remain unchanged. Any remaining flush must be visible through `NCNN_VK_FLUSH`.
 
 `pending_dispatch_total` is accumulated X×Y×Z workgroup count since the last submit/reset. It is not a dispatch-call count, frame count, or duration. If a graph is split by flushes, each flush reports only its current segment.
 
@@ -79,7 +79,7 @@ The build script previously checked `runtime_sync_timing.patch` but did not appl
 1. Build the pinned NCNN source with the complete patchset and rebuild the APK; do not reuse old Gradle/NDK native outputs.
 2. Confirm `NCNN_VK_ASYNC_SUBMIT` and `NCNN_VK_ASYNC_WAIT` appear.
 3. Confirm layers 110/113 produce `MATMUL_ROUTE`, `MATMUL_VK_DISPATCH_RECORDED`, and GPU timestamp pairs; verify no `NCNN_BENCHMARK_CPU` for the full mode-8 graph.
-4. Check `NCNN_VK_FLUSH` at the selected resolution; compare workgroup count with the 512K cap.
+4. Check `NCNN_VK_FLUSH` at the selected resolution; compare workgroup count with the selected threshold (minimum 512K; higher tiers are preserved).
 5. Compare detections and `out0` against the previous synchronous full-GPU path on identical AHB frames.
 6. Confirm CPU interval N overlaps GPU execution/completion of N+1 and that AHB pins and per-frame allocator ownership remain valid.
 7. Test rotations 1, 3, 6, 8 and resize/no-resize for long enough to detect allocator growth, stale AHB reuse, fence failures and slot starvation.

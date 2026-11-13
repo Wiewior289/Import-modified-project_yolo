@@ -198,7 +198,7 @@ index 66dd737..d2e3f20 100644
          pending_dispatch_threshold = 256 * 1024; // 256K
      }
 +    // Full-GPU mode avoids host fence waits at every small dispatch batch.
-+    // Keep a finite 512K workgroup cap as protection for larger graphs.
++    // Raise small thresholds to at least 512K; preserve any larger rough-score tier.
 +    if (opt.use_vulkan_async && pending_dispatch_threshold < 512 * 1024)
 +        pending_dispatch_threshold = 512 * 1024;
 +
