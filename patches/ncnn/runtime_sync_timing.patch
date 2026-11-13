@@ -1,20 +1,21 @@
 diff --git a/src/command.cpp b/src/command.cpp
-index 49ca3e9..0000000 100644
+index 49ca3e94097a..000000000000 100644
 --- a/src/command.cpp
 +++ b/src/command.cpp
-@@ -7,6 +7,9 @@
+@@ -6,8 +6,11 @@
  #if NCNN_VULKAN
  
  #include "option.h"
  #include "pipeline.h"
- 
++
 +#include <atomic>
 +#include <chrono>
-+
+ 
  namespace ncnn {
  
  class VkComputePrivate
-@@ -1831,8 +1834,25 @@
+@@ -1832,9 +1835,24 @@
+ #endif // NCNN_PLATFORM_API
  
  int VkCompute::submit_and_wait()
  {
@@ -33,12 +34,13 @@ index 49ca3e9..0000000 100644
 +    double post_download_cpu_ms = 0.0;
 +
      //     NCNN_LOGE("submit_and_wait");
- 
 +    const auto delayed_record_replay_start = sync_clock::now();
+ 
      if (!vkdev->info.support_VK_KHR_push_descriptor())
      {
          d->begin_command_buffer();
-@@ -1940,14 +1960,26 @@
+@@ -1932,18 +1950,28 @@
+             }
          }
      }
  
@@ -66,7 +68,9 @@ index 49ca3e9..0000000 100644
          return -1;
      }
  
-@@ -1960,7 +1992,11 @@
+     // submit compute
+@@ -1958,12 +1986,16 @@
+         submitInfo.pCommandBuffers = &d->compute_command_buffer;
          submitInfo.signalSemaphoreCount = 0;
          submitInfo.pSignalSemaphores = 0;
  
@@ -82,7 +86,9 @@ index 49ca3e9..0000000 100644
              vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
              return -1;
          }
-@@ -1971,8 +2007,12 @@
+@@ -1971,17 +2003,22 @@
+     vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
+ 
      // wait
      {
 +        const auto fence_start = sync_clock::now();
@@ -103,7 +109,9 @@ index 49ca3e9..0000000 100644
      for (size_t i = 0; i < d->delayed_records.size(); i++)
      {
          const VkComputePrivate::record& r = d->delayed_records[i];
-@@ -2028,6 +2068,9 @@
+ 
+@@ -2033,11 +2070,24 @@
+             break;
          }
      }
  
@@ -113,7 +121,7 @@ index 49ca3e9..0000000 100644
      d->delayed_records.clear();
  
      d->pending_dispatch_total = 0;
- 
++
 +    const double total_wall_ms = std::chrono::duration<double, std::milli>(
 +        sync_clock::now() - sync_start).count();
 +    NCNN_LOGE("[NCNN_VK_SYNC] seq=%llu result=OK pending_dispatches=%llu delayed_records=%zu download_buffers=%zu "
@@ -123,29 +131,34 @@ index 49ca3e9..0000000 100644
 +              delayed_record_count, download_buffer_count,
 +              delayed_record_replay_ms, command_buffer_end_ms, queue_acquire_ms,
 +              queue_submit_ms, fence_wait_wall_ms, post_download_cpu_ms, total_wall_ms);
-+
+ 
      return 0;
  }
  
 diff --git a/src/net.cpp b/src/net.cpp
-index e03b93b..0000000 100644
+index e03b93bda3dd..000000000000 100644
 --- a/src/net.cpp
 +++ b/src/net.cpp
-@@ -10,6 +10,7 @@
+@@ -10,8 +10,9 @@
  #include <stdarg.h>
  #include <stdint.h>
 +#include <chrono>
  #include <string.h>
  
  #if NCNN_BENCHMARK
-@@ -198,6 +199,7 @@
+ #include "benchmark.h"
+@@ -198,8 +199,9 @@
+ 
      //     NCNN_LOGE("forward_layer %d %d %s", layer->support_vulkan, layer_index, layer->name.c_str());
  
      bool cmd_submit_and_wait = false;
 +    bool cmd_submit_for_cpu_download = false;
  
      // load bottom blobs
-@@ -242,6 +244,7 @@
+     for (size_t i = 0; i < layer->bottoms.size(); i++)
+     {
+@@ -242,8 +244,9 @@
+                     blob_mats_gpu[bottom_blob_index].release();
                  }
  
                  cmd_submit_and_wait = true;
@@ -153,7 +166,8 @@ index e03b93b..0000000 100644
              }
          }
      }
-@@ -267,14 +270,31 @@
+ 
+@@ -266,17 +269,32 @@
      else if (rough_score > 10)
      {
          pending_dispatch_threshold = 256 * 1024; // 256K
