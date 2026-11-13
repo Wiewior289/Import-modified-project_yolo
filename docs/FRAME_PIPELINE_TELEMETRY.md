@@ -76,6 +76,17 @@ These are GPU timestamp intervals around layer dispatches, not CPU wall time.
 They should be summed only for the measured GPU layer set; a sum does not
 include all host-side work, queue gaps, preprocessing, or readback.
 
+If a layer in a Vulkan graph cannot execute on Vulkan and is evaluated by the
+CPU path, the patched NCNN runtime emits:
+
+```text
+[NCNN_BENCHMARK_CPU] idx=... type=... name=... duration=...ms
+```
+
+That is the explicit per-layer CPU fallback record. In the intended mode 8
+full-GPU graph, this log should not appear. MatMul routing is also recorded
+separately through `MATMUL_ROUTE` / `MATMUL_ROUTE_DONE`.
+
 ### Vulkan synchronization: `NCNN_VK_SYNC`
 
 Emitted by the patched `VkCompute::submit_and_wait()` for each successful
