@@ -74,6 +74,28 @@ class Yolo11Ncnn {
     ): Int
 
     /**
+     * Runs the complete Vulkan YOLO graph and retains CPU out0 in a frame slot.
+     * Returns only after NCNN's output readback fence has completed.
+     */
+    external fun FullGpuFrame(
+        hardwareBuffer: HardwareBuffer,
+        slotIndex: Int,
+        rotateType: Int,
+        frameId: Long,
+        imageTimestampNs: Long
+    ): Int
+
+    /**
+     * Runs DFL decode/NMS for the completed full-GPU frame slot.
+     */
+    external fun PostprocessFrame(
+        slotIndex: Int,
+        outBuffer: FloatArray,
+        confThresh: Float,
+        nmsThresh: Float
+    ): Int
+
+    /**
      * Runs the CPU-only suffix (layers 110..256) from the selected frame slot.
      */
     external fun SuffixFrame(
