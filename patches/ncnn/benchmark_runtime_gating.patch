@@ -22,7 +22,7 @@
  } // namespace ncnn
 --- a/src/net.cpp
 +++ b/src/net.cpp
-@@ -145,15 +145,18 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
+@@ -145,15 +145,19 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
  #if NCNN_BENCHMARK
 -    double start = get_current_time();
 -    Mat bottom_blob;
@@ -41,6 +41,7 @@
 +    if (opt.use_benchmark)
 +    {
 +        start = get_current_time();
++        if (layer->one_blob_only)
 +        {
 +            int bottom_blob_index = layer->bottoms[0];
 +            bottom_blob.dims = blob_mats[bottom_blob_index].dims;
@@ -100,7 +101,7 @@
          {
              const int b0 = layer->bottoms.empty() ? -1 : layer->bottoms[0];
              const int b1 = layer->bottoms.size() < 2 ? -1 : layer->bottoms[1];
-@@ -331,9 +339,12 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -331,9 +339,13 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        double start = get_current_time();
 -        Mat bottom_blob;
@@ -114,6 +115,7 @@
 +    if (opt.use_benchmark)
 +    {
 +        start = get_current_time();
++            if (layer->one_blob_only)
 +            {
 +                int bottom_blob_index = layer->bottoms[0];
 +                bottom_blob = blob_mats[bottom_blob_index].shape();
