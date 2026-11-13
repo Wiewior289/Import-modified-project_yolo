@@ -95,6 +95,13 @@ public:
     int cpu_suffix_frame(int slot_index, float conf_thresh, float nms_thresh,
                          std::vector<Object>& objects);
 
+    // Full-GPU mode 8: finish the complete Vulkan graph and read back out0 into
+    // a frame slot. CPU DFL/NMS is deliberately deferred to the CPU worker.
+    int gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
+                       int64_t frame_id, int64_t image_timestamp_ns);
+    int cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_thresh,
+                              std::vector<Object>& objects);
+
     /**
      * Packs detection results into a flat primitive float array for zero-overhead JNI transfer.
      * Layout: [count, zone_id0, class0, score0, norm_x0, norm_y0, norm_w0, norm_h0, zone_id1, ...]
@@ -139,7 +146,8 @@ private:
     int detect_ahb(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                    std::vector<Object>& objects, int rotate_type,
                    int64_t frame_id, int64_t image_timestamp_ns,
-                   AhbCompareSnapshot* snapshot = nullptr);
+                   AhbCompareSnapshot* snapshot = nullptr,
+                   ncnn::Mat* deferred_out0 = nullptr);
     int detect_cpu_or_vulkan(AHardwareBuffer* ahb, float conf_thresh, float nms_thresh,
                              std::vector<Object>& objects, int rotate_type,
                              int64_t frame_id, int64_t image_timestamp_ns,
@@ -159,6 +167,7 @@ private:
         std::mutex mutex;
         State state;
         std::array<ncnn::Mat, 10> boundary;
+        ncnn::Mat out0;
         int64_t frame_id;
         int64_t image_timestamp_ns;
         AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
