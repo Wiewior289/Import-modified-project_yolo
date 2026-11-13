@@ -1040,10 +1040,14 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     return 0;
 }
 
-int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot)
+int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,std::vector<Object>&objects,int rotate_type,int64_t frame_id,int64_t image_timestamp_ns,AhbCompareSnapshot* snapshot,ncnn::Mat* deferred_out0)
 {
-    last_top_score = 0.0f;
-    last_top_class = -1;
+    // In full-GPU asynchronous mode the GPU worker must not touch decoder
+    // state while the CPU worker is decoding the previous frame.
+    if (!deferred_out0) {
+        last_top_score = 0.0f;
+        last_top_class = -1;
+    }
     objects.clear();
     if (!model_loaded) return -1;
     if (!ahb) return -2;
@@ -1353,6 +1357,24 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
         return -11;
     }
 
+    if (deferred_out0) {
+        *deferred_out0 = out;
+        if (frame_id > 0 && frame_id % 30 == 0) {
+            const double preprocess_wall_ms = preprocess_record_ms + preprocess_wait_ms;
+            const double gpu_stage_wall_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - frame_start).count();
+            LOGI("GPU_FULL_FRAME_READY frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
+                 "preprocess_record=%.3fms preprocess_wait=%.3fms infer_extract_wall=%.3fms "
+                 "gpu_stage_wall=%.3fms allocator_acquire=%.3fms cache_lookup=%.3fms cache_hit=%d",
+                 (long long)frame_id, (long long)image_timestamp_ns,
+                 out.dims, out.w, out.h, out.d, out.c, out.elemsize, out.elempack,
+                 preprocess_record_ms, preprocess_wait_ms, infer_extract_ms,
+                 gpu_stage_wall_ms, allocator_acquire_ms, cache_lookup_ms, cache_hit ? 1 : 0);
+            (void)preprocess_wall_ms;
+        }
+        return 0;
+    }
+
     if(frame_id>0&&frame_id%30==0)log_tensor_stats("out0",out,frame_id,image_timestamp_ns);
     auto post_stage_start = std::chrono::steady_clock::now();
     proposal_scratchpad.clear();
@@ -1426,6 +1448,88 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     return 0;
 }
 
+
+int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
+                           int64_t frame_id, int64_t image_timestamp_ns)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -50;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_MATMUL_VULKAN || !vkdev || !scale_layer) return -51;
+    if (!ahb) return -52;
+    if (slot.state != AsyncFrameSlot::FREE) return -53;
+
+    slot.state = AsyncFrameSlot::GPU_RUNNING;
+    slot.frame_id = frame_id;
+    slot.image_timestamp_ns = image_timestamp_ns;
+    slot.out0.release();
+    for (auto& boundary : slot.boundary) boundary.release();
+
+    std::vector<Object> unused_objects;
+    const int ret = detect_ahb(ahb, 0.f, 0.f, unused_objects, rotate_type,
+                               frame_id, image_timestamp_ns, nullptr, &slot.out0);
+    if (ret != 0 || slot.out0.empty()) {
+        slot.out0.release();
+        slot.state = AsyncFrameSlot::FREE;
+        LOGE("GPU_FULL_FRAME_FAILED frame=%lld slot=%d ret=%d out0_empty=%d",
+             (long long)frame_id, slot_index, ret, slot.out0.empty() ? 1 : 0);
+        return ret != 0 ? ret : -54;
+    }
+
+    slot.state = AsyncFrameSlot::CPU_READY;
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        LOGI("GPU_FULL_SLOT_READY frame=%lld slot=%d imageTs=%lld",
+             (long long)frame_id, slot_index, (long long)image_timestamp_ns);
+    }
+    return 0;
+}
+
+int Yolo11::cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_thresh,
+                                  std::vector<Object>& objects)
+{
+    if (slot_index < 0 || slot_index >= static_cast<int>(async_slots.size())) return -60;
+    AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
+    std::lock_guard<std::mutex> slot_lock(slot.mutex);
+
+    if (!model_loaded || compute_mode != YOLO_COMPUTE_MATMUL_VULKAN) return -61;
+    if (slot.state != AsyncFrameSlot::CPU_READY || slot.out0.empty()) return -62;
+
+    slot.state = AsyncFrameSlot::CPU_RUNNING;
+    const int64_t frame_id = slot.frame_id;
+    const int64_t image_timestamp_ns = slot.image_timestamp_ns;
+
+    // This CPU-only stage is serialized by cpuFrameExecutor. The GPU worker
+    // never reads or writes the shared DFL/NMS scratchpads or score fields.
+    last_top_score = 0.0f;
+    last_top_class = -1;
+    objects.clear();
+    const ncnn::Mat out = slot.out0;
+
+    const auto post_start = std::chrono::steady_clock::now();
+    proposal_scratchpad.clear();
+    decode_dfl_and_filter(out, conf_thresh);
+    const double dfl_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - post_start).count();
+
+    const auto nms_start = std::chrono::steady_clock::now();
+    nms_sorted_bboxes(nms_thresh, objects);
+    const double nms_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - nms_start).count();
+
+    if (frame_id > 0 && frame_id % 30 == 0) {
+        log_tensor_stats("async_full_gpu_out0", out, frame_id, image_timestamp_ns);
+        LOGI("CPU_POSTPROCESS_DONE frame=%lld slot=%d dfl_ms=%.3f nms_ms=%.3f post_total_ms=%.3f "
+             "detections=%zu top=%.4f class=%d",
+             (long long)frame_id, slot_index, dfl_ms, nms_ms, dfl_ms + nms_ms,
+             objects.size(), last_top_score, last_top_class);
+    }
+
+    slot.out0.release();
+    for (auto& boundary : slot.boundary) boundary.release();
+    slot.state = AsyncFrameSlot::FREE;
+    return 0;
+}
 
 int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type,
                              int64_t frame_id, int64_t image_timestamp_ns)
