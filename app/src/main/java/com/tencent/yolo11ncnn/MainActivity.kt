@@ -250,7 +250,8 @@ class MainActivity : AppCompatActivity() {
         val modelAtRequest = selectedModelType
         val targetAtRequest = selectedTargetSize
         val computeModeAtRequest = selectedComputeMode
-        val mustDrainAsync = previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC || asyncDrainPending
+        val mustDrainAsync = previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC ||
+            previousMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN || asyncDrainPending
         if (mustDrainAsync) asyncDrainPending = true
 
         isYoloReady.set(false)
