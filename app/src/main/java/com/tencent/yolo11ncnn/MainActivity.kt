@@ -495,6 +495,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun queueAsyncFrame(image: android.media.Image, frameId: Long, imageTimestampNs: Long, rotateType: Int) {
+        val fullGpuMode = selectedComputeMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
         val slot = reserveAsyncSlot()
         if (slot < 0) {
             image.close()
@@ -503,21 +504,24 @@ class MainActivity : AppCompatActivity() {
 
         try {
             gpuFrameExecutor.execute {
-                var prefixRet = -1
+                var gpuStageRet = -1
                 var hwBuffer: HardwareBuffer? = null
+                val gpuStageStartNs = SystemClock.elapsedRealtimeNanos()
                 try {
                     val acquiredBuffer = image.hardwareBuffer
                     hwBuffer = acquiredBuffer
                     if (acquiredBuffer == null) {
-                        prefixRet = -70
+                        gpuStageRet = -70
                     } else {
-                        prefixRet = yoloEngine.PrefixFrame(
-                            acquiredBuffer, slot, rotateType, frameId, imageTimestampNs
-                        )
+                        gpuStageRet = if (fullGpuMode) {
+                            yoloEngine.FullGpuFrame(acquiredBuffer, slot, rotateType, frameId, imageTimestampNs)
+                        } else {
+                            yoloEngine.PrefixFrame(acquiredBuffer, slot, rotateType, frameId, imageTimestampNs)
+                        }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "GPU prefix exception frame=$frameId slot=$slot", e)
-                    prefixRet = -71
+                    Log.e(TAG, "GPU stage exception frame=$frameId slot=$slot fullGpu=$fullGpuMode", e)
+                    gpuStageRet = -71
                 } finally {
                     try {
                         hwBuffer?.close()
@@ -531,8 +535,13 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                if (prefixRet != 0) {
-                    Log.e(TAG, "GPU prefix failed frame=$frameId slot=$slot ret=$prefixRet")
+                val gpuStageWallMs = (SystemClock.elapsedRealtimeNanos() - gpuStageStartNs) / 1_000_000.0
+                if (frameId % 30L == 0L) {
+                    Log.i(TAG, "ASYNC_GPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                        "wall_ms=$gpuStageWallMs ret=$gpuStageRet")
+                }
+                if (gpuStageRet != 0) {
+                    Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
                     asyncSlotBusy.set(slot, 0)
                     return@execute
                 }
@@ -541,15 +550,23 @@ class MainActivity : AppCompatActivity() {
                     cpuFrameExecutor.execute {
                         val output = asyncDetectionBuffers[slot]
                         output.fill(0f)
-                        var suffixRet = -1
+                        var cpuStageRet = -1
+                        val cpuStageStartNs = SystemClock.elapsedRealtimeNanos()
                         try {
-                            suffixRet = yoloEngine.SuffixFrame(
-                                slot, output, confThreshold, nmsThreshold
-                            )
+                            cpuStageRet = if (fullGpuMode) {
+                                yoloEngine.PostprocessFrame(slot, output, confThreshold, nmsThreshold)
+                            } else {
+                                yoloEngine.SuffixFrame(slot, output, confThreshold, nmsThreshold)
+                            }
+                            val cpuStageWallMs = (SystemClock.elapsedRealtimeNanos() - cpuStageStartNs) / 1_000_000.0
                             updateProcessingFps()
-                            val count = suffixRet.coerceAtLeast(0)
-                            val topScore = if (suffixRet >= 0) yoloEngine.GetTopScore() else 0f
-                            val topClass = if (suffixRet >= 0) yoloEngine.GetTopClass() else -1
+                            val count = cpuStageRet.coerceAtLeast(0)
+                            val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
+                            val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
+                            if (frameId % 30L == 0L) {
+                                Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                                    "wall_ms=$cpuStageWallMs ret=$cpuStageRet")
+                            }
 
                             if (frameId % 30L == 0L) {
                                 Log.i(TAG, "ASYNC_FRAME frame=$frameId slot=$slot imageTs=$imageTimestampNs " +
@@ -558,8 +575,8 @@ class MainActivity : AppCompatActivity() {
                                     String.format(java.util.Locale.US, "%.3f", topScore) +
                                     " class=$topClass")
                             }
-                            if (suffixRet < 0) {
-                                Log.e(TAG, "CPU suffix failed frame=$frameId slot=$slot ret=$suffixRet")
+                            if (cpuStageRet < 0) {
+                                Log.e(TAG, "CPU stage failed frame=$frameId slot=$slot ret=$cpuStageRet")
                             }
                             val jsonPayload = buildJson(
                                 count, output, currentFps, topScore, topClass, frameId, imageTimestampNs
@@ -658,7 +675,8 @@ class MainActivity : AppCompatActivity() {
                     reader.acquireLatestImage()?.close()
                     return@setOnImageAvailableListener
                 }
-                if (isProcessingFrame.get()) {
+                val asyncFullGpuMode = selectedComputeMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
+                if (!asyncFullGpuMode && isProcessingFrame.get()) {
                     val dropped = droppedBusyFrames.incrementAndGet()
                     if (dropped % 30L == 0L) {
                         Log.w(TAG, "FRAME_DROP reason=processing_busy total=" + dropped)
@@ -676,6 +694,11 @@ class MainActivity : AppCompatActivity() {
                     180 -> 3
                     270 -> 8
                     else -> 1
+                }
+
+                if (asyncFullGpuMode) {
+                    queueAsyncFrame(image, frameId, imageTimestampNs, rotateType)
+                    return@setOnImageAvailableListener
                 }
 
                 if (!isProcessingFrame.compareAndSet(false, true)) {
