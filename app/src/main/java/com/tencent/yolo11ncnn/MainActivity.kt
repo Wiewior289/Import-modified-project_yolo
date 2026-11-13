@@ -498,8 +498,16 @@ class MainActivity : AppCompatActivity() {
         val fullGpuMode = selectedComputeMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
         val slot = reserveAsyncSlot()
         if (slot < 0) {
+            val dropped = droppedBusyFrames.incrementAndGet()
+            if (dropped % 30L == 0L) {
+                Log.w(TAG, "FRAME_DROP reason=async_slots_busy total=$dropped")
+            }
             image.close()
             return
+        }
+        val queuedAtNs = SystemClock.elapsedRealtimeNanos()
+        if (frameId % 30L == 0L) {
+            Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode queued_ns=$queuedAtNs")
         }
 
         try {
@@ -535,10 +543,11 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                val gpuStageWallMs = (SystemClock.elapsedRealtimeNanos() - gpuStageStartNs) / 1_000_000.0
+                val gpuStageEndNs = SystemClock.elapsedRealtimeNanos()
+                val gpuStageWallMs = (gpuStageEndNs - gpuStageStartNs) / 1_000_000.0
                 if (frameId % 30L == 0L) {
                     Log.i(TAG, "ASYNC_GPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                        "wall_ms=$gpuStageWallMs ret=$gpuStageRet")
+                        "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet")
                 }
                 if (gpuStageRet != 0) {
                     Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
@@ -558,14 +567,15 @@ class MainActivity : AppCompatActivity() {
                             } else {
                                 yoloEngine.SuffixFrame(slot, output, confThreshold, nmsThreshold)
                             }
-                            val cpuStageWallMs = (SystemClock.elapsedRealtimeNanos() - cpuStageStartNs) / 1_000_000.0
+                            val cpuStageEndNs = SystemClock.elapsedRealtimeNanos()
+                            val cpuStageWallMs = (cpuStageEndNs - cpuStageStartNs) / 1_000_000.0
                             updateProcessingFps()
                             val count = cpuStageRet.coerceAtLeast(0)
                             val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
                             val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
                             if (frameId % 30L == 0L) {
                                 Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                                    "wall_ms=$cpuStageWallMs ret=$cpuStageRet")
+                                    "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs ret=$cpuStageRet")
                             }
 
                             if (frameId % 30L == 0L) {
