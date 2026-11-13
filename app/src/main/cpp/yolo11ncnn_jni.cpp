@@ -186,6 +186,43 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_PrefixFrame(
 }
 
 JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_FullGpuFrame(
+    JNIEnv* env, jobject thiz, jobject hardware_buffer_obj,
+    jint slot_index, jint rotate_type, jlong frame_id, jlong image_timestamp_ns)
+{
+    if (!hardware_buffer_obj) return -80;
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -81;
+
+    AHardwareBuffer* ahb = AHardwareBuffer_fromHardwareBuffer(env, hardware_buffer_obj);
+    if (!ahb) return -82;
+
+    AHardwareBuffer_acquire(ahb);
+    const int ret = engine->gpu_full_frame(
+        slot_index, ahb, rotate_type,
+        static_cast<int64_t>(frame_id), static_cast<int64_t>(image_timestamp_ns));
+    AHardwareBuffer_release(ahb);
+    return ret;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_tencent_yolo11ncnn_Yolo11Ncnn_PostprocessFrame(
+    JNIEnv* env, jobject thiz, jint slot_index, jfloatArray out_buffer_obj,
+    jfloat conf_thresh, jfloat nms_thresh)
+{
+    if (!out_buffer_obj) return -90;
+    std::shared_ptr<Yolo11> engine = acquire_engine();
+    if (!engine || !engine->is_ready()) return -91;
+
+    static thread_local std::vector<Object> objects;
+    objects.clear();
+    if (objects.capacity() < 64) objects.reserve(64);
+    const int ret = engine->cpu_postprocess_frame(slot_index, conf_thresh, nms_thresh, objects);
+    if (ret != 0) return ret;
+    return copy_detections(env, out_buffer_obj, *engine, objects);
+}
+
+JNIEXPORT jint JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_SuffixFrame(
     JNIEnv* env, jobject thiz, jint slot_index, jfloatArray out_buffer_obj,
     jfloat conf_thresh, jfloat nms_thresh)
