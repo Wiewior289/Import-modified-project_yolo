@@ -210,7 +210,7 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_WaitGpuFrame(
     JNIEnv* env, jobject thiz, jint slot_index)
 {
     std::shared_ptr<Yolo11> engine = acquire_engine();
-    if (!engine || !engine->is_ready()) return -83;
+    if (!engine) return -83;
     return engine->gpu_wait_frame(slot_index);
 }
 

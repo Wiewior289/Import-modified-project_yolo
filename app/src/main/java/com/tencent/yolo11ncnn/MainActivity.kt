@@ -23,6 +23,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -55,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var backgroundInitExecutor: ExecutorService
     private lateinit var gpuFrameExecutor: ExecutorService
     private lateinit var gpuCompletionExecutor: ExecutorService
+    private val deferredCameraImageReleases = ConcurrentLinkedQueue<() -> Unit>()
     private lateinit var cpuFrameExecutor: ExecutorService
 
     // Camera2 background thread & components
@@ -637,7 +639,15 @@ class MainActivity : AppCompatActivity() {
                             Log.e(TAG, "GPU fence completion exception frame=$frameId slot=$slot", e)
                             waitRet = -72
                         } finally {
-                            releaseCameraImage()
+                            // A successful wait (or -58: fence completed, out0 invalid)
+                            // proves Mali no longer owns this AHB. On other failures,
+                            // keep the Image acquired until native teardown drains VkCompute.
+                            if (waitRet == 0 || waitRet == -58) {
+                                releaseCameraImage()
+                            } else {
+                                deferredCameraImageReleases.add(releaseCameraImage)
+                                Log.w(TAG, "Deferring Camera2 Image release until native teardown frame=$frameId slot=$slot ret=$waitRet")
+                            }
                         }
                         val completionEndNs = SystemClock.elapsedRealtimeNanos()
                         val completionWallMs = (completionEndNs - completionStartNs) / 1_000_000.0
@@ -1130,15 +1140,29 @@ class MainActivity : AppCompatActivity() {
                 return@Thread
             }
 
-            // All four workers have released their acquired Camera2 Images.
+            // Native teardown performs a final fence drain before any deferred
+            // Camera2 Image is released. Do not let ImageReader recycle an AHB
+            // after a failed/ambiguous fence wait.
+            yoloEngine.ClearCache()
+            yoloEngine.Destroy()
+
+            var deferredImageCount = 0
+            while (true) {
+                val release = deferredCameraImageReleases.poll() ?: break
+                try {
+                    release()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Błąd zwalniania odroczonego Camera2 Image", e)
+                }
+                deferredImageCount++
+            }
+            Log.i(TAG, "DEFERRED_CAMERA_IMAGES_RELEASED count=$deferredImageCount")
+
             try {
                 readerToClose?.close()
             } catch (e: Exception) {
                 Log.e(TAG, "Błąd zamykania ImageReader po drenażu", e)
             }
-
-            yoloEngine.ClearCache()
-            yoloEngine.Destroy()
         }.start()
     }
 

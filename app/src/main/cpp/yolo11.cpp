@@ -1674,7 +1674,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
     AsyncFrameSlot& slot = async_slots[static_cast<size_t>(slot_index)];
     std::lock_guard<std::mutex> slot_lock(slot.mutex);
 
-    if (!model_loaded || compute_mode != YOLO_COMPUTE_MATMUL_VULKAN || !vkdev) return -56;
+    if (!vkdev) return -56;
     if (slot.state != AsyncFrameSlot::GPU_SUBMITTED || !slot.gpu_execution ||
         !slot.gpu_execution->command) return -57;
 
@@ -1692,7 +1692,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
     }
 
 #if NCNN_BENCHMARK
-    if (execution.timestamp_queries_ready) {
+    if (execution.timestamp_queries_ready && !net.layers().empty()) {
         std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
         const int query_ret = execution.command->get_query_pool_results(
             0, static_cast<uint32_t>(query_results.size()), query_results);
