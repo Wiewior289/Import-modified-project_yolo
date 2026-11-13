@@ -1090,7 +1090,8 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     double pipeline_create_ms = 0.0;
     double preprocess_record_ms=0.0,preprocess_import_record_ms=0.0,preprocess_scale_record_ms=0.0,preprocess_cast_record_ms=0.0;
     double preprocess_wait_ms=0.0;uint64_t preprocess_dispatches=0;
-    double extractor_setup_ms=0.0,extractor_input_ms=0.0,infer_extract_ms=0.0;
+    double extractor_setup_ms=0.0,extractor_input_ms=0.0;
+    double infer_record_ms=0.0,final_submit_wait_ms=0.0,infer_extract_ms=0.0;
     double dfl_decode_ms = 0.0;
     double nms_ms = 0.0;
     double postprocess_ms = 0.0;
@@ -1253,48 +1254,51 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     execute_ret = -8;
                 } else {
                     ncnn::VkMat in_gpu;
+                    ncnn::VkCompute inference_cmd(vkdev);
+#if NCNN_BENCHMARK
+                    bool timestamp_queries_ready = false;
+                    if (opt.use_benchmark) {
+                        const int query_pool_ret = inference_cmd.create_query_pool(
+                            static_cast<uint32_t>(net.layers().size() * 2));
+                        timestamp_queries_ready = (query_pool_ret == 0);
+                        if (!timestamp_queries_ready) {
+                            LOGE("[NCNN_BENCHMARK] timestamp_queries=DISABLED reason=QUERY_POOL_CREATE_FAILED ret=%d",
+                                 query_pool_ret);
+                        }
+                    }
+#endif
 
                     // AHB import writes FP32. Scale this VkMat in-place to avoid
                     // an additional full-frame FP32 clone/copy in the hot path.
                     // Diagnostic raw-RGB snapshot is recorded before Scale mutates dst.
                     auto t = std::chrono::steady_clock::now();
                     {
-                        ncnn::VkCompute preprocess_cmd(vkdev);
                         t = std::chrono::steady_clock::now();
 
                         auto st=std::chrono::steady_clock::now();
-                        preprocess_cmd.record_import_android_hardware_buffer(entry->pipeline,entry->src,dst);
+                        inference_cmd.record_import_android_hardware_buffer(entry->pipeline,entry->src,dst);
                         preprocess_import_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                         if (snapshot) {
-                            preprocess_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
+                            inference_cmd.record_clone(dst,snapshot->rgb_0_255,opt);
                         }
                         st=std::chrono::steady_clock::now();
-                        execute_ret=scale_layer?scale_layer->forward_inplace(dst,preprocess_cmd,opt):-9;
+                        execute_ret=scale_layer?scale_layer->forward_inplace(dst,inference_cmd,opt):-9;
                         preprocess_scale_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                         if(execute_ret==0){
                             const int pack=1,cast=(opt.use_fp16_storage||opt.use_fp16_packed)?2:0;
                             st=std::chrono::steady_clock::now();
-                            vkdev->convert_packing(dst,in_gpu,pack,cast,preprocess_cmd,opt);
+                            vkdev->convert_packing(dst,in_gpu,pack,cast,inference_cmd,opt);
                             preprocess_cast_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-st).count();
                             if (snapshot) {
-                                preprocess_cmd.record_clone(dst,snapshot->input_after_norm,opt);
-                                preprocess_cmd.record_clone(in_gpu,snapshot->input_after_cast,opt);
+                                inference_cmd.record_clone(dst,snapshot->input_after_norm,opt);
+                                inference_cmd.record_clone(in_gpu,snapshot->input_after_cast,opt);
                             }
                         }
                         preprocess_record_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
-                        preprocess_dispatches=preprocess_cmd.pending_dispatch_total();
-
-                        if (execute_ret == 0) {
-                            t = std::chrono::steady_clock::now();
-                            execute_ret = preprocess_cmd.submit_and_wait();
-                            preprocess_wait_ms = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - t).count();
-                            if (execute_ret != 0) {
-                                LOGE("Preprocess submit_and_wait failed: %d", execute_ret);
-                                execute_ret = -10;
-                            }
-                        }
-                    } // Preprocess queue is complete; descriptors below do not read tensor memory.
+                        preprocess_dispatches=inference_cmd.pending_dispatch_total();
+                        // No submit here: the full graph and final out0 download are
+                        // recorded into this same VkCompute command context.
+                    } // Preprocess commands remain recorded for the YOLO graph.
                     if(frame_id>0&&frame_id%30==0){
                         log_vkmat("ahb_scaled_0_1_inplace",dst,frame_id,image_timestamp_ns);
                         log_vkmat("ncnn_input_after_cast",in_gpu,frame_id,image_timestamp_ns);
@@ -1307,21 +1311,27 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     const bool do_tap=(tap_mode==1&&!one_shot_latched)||(tap_mode==2&&frame_id>0&&frame_id%30==0);
                     if(tap_mode==1&&do_tap)one_shot_latched=true;
                     if(do_tap){
-                        ncnn::Mat tap_scaled,tap_input;ncnn::VkCompute tap_cmd(vkdev);
+                        ncnn::Mat tap_scaled,tap_input;
                         const auto ts0=std::chrono::steady_clock::now();
-                        tap_cmd.record_clone(dst,tap_scaled,opt);tap_cmd.record_clone(in_gpu,tap_input,opt);
-                        uint64_t d=tap_cmd.pending_dispatch_total();int rc=tap_cmd.submit_and_wait();
-                        double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-ts0).count();
+                        inference_cmd.record_clone(dst,tap_scaled,opt);
+                        inference_cmd.record_clone(in_gpu,tap_input,opt);
+                        const uint64_t d=inference_cmd.pending_dispatch_total();
+                        int rc=inference_cmd.submit_and_wait();
+                        if (rc == 0) rc = inference_cmd.reset();
+                        const double ms=std::chrono::duration<double,std::milli>(
+                            std::chrono::steady_clock::now()-ts0).count();
                         LOGI("TENSOR_TAP frame=%lld imageTs=%lld mode=%d ret=%d dispatches=%llu wall=%.3fms PERTURBS_PIPELINE=1",
-                             (long long)frame_id,(long long)image_timestamp_ns,tap_mode,rc,(unsigned long long)d,ms);
-                        if(rc==0){log_tensor_stats("ahb_scaled_0_1_snapshot",tap_scaled,frame_id,image_timestamp_ns);
-                            log_tensor_stats("ncnn_input_snapshot",tap_input,frame_id,image_timestamp_ns);}
+                             (long long)frame_id,(long long)image_timestamp_ns,tap_mode,rc,
+                             (unsigned long long)d,ms);
+                        if(rc==0){
+                            log_tensor_stats("ahb_scaled_0_1_snapshot",tap_scaled,frame_id,image_timestamp_ns);
+                            log_tensor_stats("ncnn_input_snapshot",tap_input,frame_id,image_timestamp_ns);
+                        }
+                        if (rc != 0) execute_ret = -10;
                     }
 
-                    // Stage 2: use NCNN's high-level CPU extraction path.
-                    // This is the last known-good path used before the diagnostic
-                    // VkMat/manual-download change. Extractor handles GPU output
-                    // conversion, packing and readback for ncnn::Mat.
+                    // Append the full YOLO graph to the same VkCompute that recorded AHB import,
+                    // Scale and cast. Only the final out0 readback needs host visibility.
                     if (execute_ret == 0) {
                         t=std::chrono::steady_clock::now();
                         ncnn::Extractor ex = net.create_extractor();
@@ -1335,11 +1345,65 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                         const int in_ret=ex.input("in0",in_gpu);
                         extractor_input_ms=std::chrono::duration<double,std::milli>(
                             std::chrono::steady_clock::now()-t).count();
-                        if(in_ret!=0){LOGE("Extractor::input(in0,VkMat) failed frame=%lld ret=%d",(long long)frame_id,in_ret);execute_ret=-12;}
-                        else{t=std::chrono::steady_clock::now();execute_ret=ex.extract("out0",out);
-                            infer_extract_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();}
-                        if(execute_ret!=0){LOGE("Extractor input/extract failed frame=%lld ret=%d",(long long)frame_id,execute_ret);execute_ret=-11;}
-                        else {
+                        if(in_ret!=0){
+                            LOGE("Extractor::input(in0,VkMat) failed frame=%lld ret=%d",
+                                 (long long)frame_id,in_ret);
+                            execute_ret=-12;
+                        } else {
+                            ncnn::VkMat out_gpu;
+                            t=std::chrono::steady_clock::now();
+                            execute_ret=ex.extract("out0",out_gpu,inference_cmd);
+                            infer_record_ms=std::chrono::duration<double,std::milli>(
+                                std::chrono::steady_clock::now()-t).count();
+                            if (execute_ret == 0 && out_gpu.empty()) {
+                                LOGE("Extractor::extract(out0,VkMat) returned empty GPU tensor frame=%lld",
+                                     (long long)frame_id);
+                                execute_ret=-13;
+                            }
+                            if (execute_ret == 0) {
+                                inference_cmd.record_download(out_gpu,out,opt);
+                                t=std::chrono::steady_clock::now();
+                                execute_ret=inference_cmd.submit_and_wait();
+                                final_submit_wait_ms=std::chrono::duration<double,std::milli>(
+                                    std::chrono::steady_clock::now()-t).count();
+                                infer_extract_ms=infer_record_ms+final_submit_wait_ms;
+                                if (execute_ret != 0) {
+                                    LOGE("Combined AHB+YOLO VkCompute submit_and_wait failed frame=%lld ret=%d",
+                                         (long long)frame_id,execute_ret);
+                                }
+                            }
+#if NCNN_BENCHMARK
+                            if (timestamp_queries_ready && execute_ret == 0) {
+                                std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
+                                const int query_ret = inference_cmd.get_query_pool_results(
+                                    0, static_cast<uint32_t>(query_results.size()), query_results);
+                                if (query_ret < 0) {
+                                    LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_FAILED ret=%d", query_ret);
+                                } else {
+                                    size_t available_pairs = 0;
+                                    for (size_t i = 0; i < net.layers().size(); ++i) {
+                                        const uint64_t q_start = query_results[i * 2];
+                                        const uint64_t q_end = query_results[i * 2 + 1];
+                                        if (q_start == 0 || q_end == 0 || q_end < q_start) continue;
+                                        ++available_pairs;
+                                        const double duration_us =
+                                            (q_end - q_start) * vkdev->info.timestamp_period() / 1000.0;
+                                        LOGI("[NCNN_BENCHMARK_GPU] idx=%zu type=%-16s name=%-30s duration=%.2lfus",
+                                             i, net.layers()[i]->type.c_str(),
+                                             net.layers()[i]->name.c_str(), duration_us);
+                                    }
+                                    LOGI("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
+                                         available_pairs, net.layers().size(), query_ret == 1 ? 1 : 0);
+                                }
+                            }
+#endif
+                        }
+
+                        if (execute_ret != 0) {
+                            LOGE("Extractor input/extract failed frame=%lld ret=%d",
+                                 (long long)frame_id,execute_ret);
+                            execute_ret=-11;
+                        } else {
                             LOGD("Tensor CPU extracted dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
                                  out.dims, out.w, out.h, out.c, out.elemsize, out.elempack);
                         }
@@ -1363,11 +1427,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
             const double gpu_stage_wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frame_start).count();
             LOGI("GPU_FULL_FRAME_READY frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
-                 "preprocess_record=%.3fms preprocess_wait=%.3fms infer_extract_wall=%.3fms "
+                 "preprocess_record=%.3fms preprocess_wait=%.3fms infer_record=%.3fms final_submit_wait=%.3fms infer_extract_wall=%.3fms "
                  "gpu_stage_wall=%.3fms allocator_acquire=%.3fms cache_lookup=%.3fms cache_hit=%d",
                  (long long)frame_id, (long long)image_timestamp_ns,
                  out.dims, out.w, out.h, out.d, out.c, out.elemsize, out.elempack,
-                 preprocess_record_ms, preprocess_wait_ms, infer_extract_ms,
+                 preprocess_record_ms, preprocess_wait_ms, infer_record_ms, final_submit_wait_ms, infer_extract_ms,
                  gpu_stage_wall_ms, allocator_acquire_ms, cache_lookup_ms, cache_hit ? 1 : 0);
         }
         return 0;
@@ -1388,7 +1452,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     postprocess_ms = dfl_decode_ms + nms_ms;
 
     const double preprocess_total_ms = preprocess_record_ms + preprocess_wait_ms;
-    const double infer_total_ms = infer_extract_ms; // Extractor wall time includes GPU execution, sync and output readback.
+    const double infer_total_ms = infer_record_ms + final_submit_wait_ms;
     const double cache_setup_ms = allocator_create_ms + image_import_ms + pipeline_create_ms;
     const double frame_total_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - frame_start).count();
@@ -1411,15 +1475,15 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
 
         LOGI("PipelineStages frame=%lld imageTs=%lld allocator_acquire=%.3fms cache_lookup=%.3fms cache_setup=%.3fms "
              "preprocess_record=%.3fms import_record=%.3fms scale_record=%.3fms cast_record=%.3fms "
-             "dispatches=%llu preprocess_submit_wait_wall=%.3fms preprocess_total=%.3fms "
-             "extractor_setup=%.3fms extractor_input=%.3fms infer_extract_wall=%.3fms "
+             "dispatches_at_preprocess_end=%llu preprocess_host_wait=%.3fms preprocess_total=%.3fms "
+             "extractor_setup=%.3fms extractor_input=%.3fms infer_record_wall=%.3fms final_submit_wait_wall=%.3fms infer_extract_wall=%.3fms "
              "dfl_decode=%.3fms nms=%.3fms post_total=%.3fms "
              "unaccounted_wall=%.3fms native_frame_total=%.3fms",
              (long long)frame_id,(long long)image_timestamp_ns,
              allocator_acquire_ms,cache_lookup_ms,cache_setup_ms,
              preprocess_record_ms,preprocess_import_record_ms,preprocess_scale_record_ms,preprocess_cast_record_ms,
              (unsigned long long)preprocess_dispatches,preprocess_wait_ms,preprocess_total_ms,
-             extractor_setup_ms,extractor_input_ms,infer_total_ms,
+             extractor_setup_ms,extractor_input_ms,infer_record_ms,final_submit_wait_ms,infer_total_ms,
              dfl_decode_ms,nms_ms,postprocess_ms,unaccounted_wall_ms,frame_total_ms);
 
         LOGI("Tensor out0 frame=%lld imageTs=%lld dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d proposals=%zu detections=%zu top=%.3f cls=%d",
