@@ -36,24 +36,24 @@
 -        bottom_blob.c = blob_mats[bottom_blob_index].c;
 -        bottom_blob.elempack = blob_mats[bottom_blob_index].elempack;
 -        bottom_blob.elemsize = blob_mats[bottom_blob_index].elemsize;
++    double start = 0;
++    Mat bottom_blob;
 +    if (opt.use_benchmark)
 +    {
-+    double start = get_current_time();
-+    Mat bottom_blob;
-+    if (layer->one_blob_only)
-+    {
-+        int bottom_blob_index = layer->bottoms[0];
-+        bottom_blob.dims = blob_mats[bottom_blob_index].dims;
-+        bottom_blob.w = blob_mats[bottom_blob_index].w;
-+        bottom_blob.h = blob_mats[bottom_blob_index].h;
-+        bottom_blob.d = blob_mats[bottom_blob_index].d;
-+        bottom_blob.c = blob_mats[bottom_blob_index].c;
-+        bottom_blob.elempack = blob_mats[bottom_blob_index].elempack;
-+        bottom_blob.elemsize = blob_mats[bottom_blob_index].elemsize;
-+    }
++        start = get_current_time();
++        {
++            int bottom_blob_index = layer->bottoms[0];
++            bottom_blob.dims = blob_mats[bottom_blob_index].dims;
++            bottom_blob.w = blob_mats[bottom_blob_index].w;
++            bottom_blob.h = blob_mats[bottom_blob_index].h;
++            bottom_blob.d = blob_mats[bottom_blob_index].d;
++            bottom_blob.c = blob_mats[bottom_blob_index].c;
++            bottom_blob.elempack = blob_mats[bottom_blob_index].elempack;
++            bottom_blob.elemsize = blob_mats[bottom_blob_index].elemsize;
++        }
      }
  #endif
-@@ -178,12 +172,15 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
+@@ -178,12 +174,15 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, const Option& opt) const
  #if NCNN_BENCHMARK
 -    double end = get_current_time();
 -    if (layer->one_blob_only)
@@ -66,16 +66,16 @@
 -        benchmark(layer, start, end);
 +    if (opt.use_benchmark)
 +    {
-+    double end = get_current_time();
-+    if (layer->one_blob_only)
-+    {
-+        int top_blob_index = layer->tops[0];
-+        benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
-+    }
-+    else
-+    {
-+        benchmark(layer, start, end);
-+    }
++        double end = get_current_time();
++        if (layer->one_blob_only)
++        {
++            int top_blob_index = layer->tops[0];
++            benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
++        }
++        else
++        {
++            benchmark(layer, start, end);
++        }
      }
  #endif
 @@ -296,4 +299,4 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
@@ -100,7 +100,7 @@
          {
              const int b0 = layer->bottoms.empty() ? -1 : layer->bottoms[0];
              const int b1 = layer->bottoms.size() < 2 ? -1 : layer->bottoms[1];
-@@ -331,9 +337,12 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -331,9 +339,12 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        double start = get_current_time();
 -        Mat bottom_blob;
@@ -109,18 +109,18 @@
 -            int bottom_blob_index = layer->bottoms[0];
 -            bottom_blob = blob_mats[bottom_blob_index].shape();
 -        }
++    double start = 0;
++    Mat bottom_blob;
 +    if (opt.use_benchmark)
 +    {
-+        double start = get_current_time();
-+        Mat bottom_blob;
-+        if (layer->one_blob_only)
-+        {
-+            int bottom_blob_index = layer->bottoms[0];
-+            bottom_blob = blob_mats[bottom_blob_index].shape();
-+        }
++        start = get_current_time();
++            {
++                int bottom_blob_index = layer->bottoms[0];
++                bottom_blob = blob_mats[bottom_blob_index].shape();
++            }
 +    }
  #endif
-@@ -359,12 +357,15 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
+@@ -359,12 +361,15 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
  #if NCNN_BENCHMARK
 -        double end = get_current_time();
 -        if (layer->one_blob_only)
@@ -134,16 +134,16 @@
 -        }
 +    if (opt.use_benchmark)
 +    {
-+        double end = get_current_time();
-+        if (layer->one_blob_only)
-+        {
-+            int top_blob_index = layer->tops[0];
-+            benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
-+        }
-+        else
-+        {
-+            benchmark(layer, start, end);
-+        }
++            double end = get_current_time();
++            if (layer->one_blob_only)
++            {
++                int top_blob_index = layer->tops[0];
++                benchmark(layer, bottom_blob, blob_mats[top_blob_index], start, end);
++            }
++            else
++            {
++                benchmark(layer, start, end);
++            }
 +    }
  #endif
 @@ -361,3 +367,3 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std::vector<VkMat>& blob_mats_gpu, VkCompute& cmd, const Option& opt) const
