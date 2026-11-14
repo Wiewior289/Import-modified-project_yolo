@@ -76,7 +76,7 @@ public:
      * Initializes NCNN, Vulkan compute engine, Mali-G72 shader optimizations,
      * and loads model weights from Android assets.
      */
-    int load(AAssetManager* mgr, const char* modeltype, int target_size,
+    int load(AAssetManager* mgr, const char* modeltype, int model_input_size,
              int requested_compute_mode = YOLO_COMPUTE_VULKAN_AHB);
 
     /**
@@ -125,8 +125,8 @@ public:
     /**
      * Returns configured model target resolution.
      */
-    int get_target_width() const { return target_w; }
-    int get_target_height() const { return target_h; }
+    int get_target_width() const { return model_input_size; }
+    int get_target_height() const { return model_input_size; }
     bool is_ready() const { return model_loaded; }
 
 private:
@@ -159,7 +159,7 @@ private:
                              std::vector<Object>& objects, int rotate_type,
                              int64_t frame_id, int64_t image_timestamp_ns,
                              AhbCompareSnapshot* snapshot = nullptr);
-    void generate_grids_and_stride(int target_w, int target_h);
+    void generate_grids_and_stride(int model_input_size);
     void decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh);
     void nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output);
 
@@ -230,8 +230,7 @@ private:
     std::vector<int> nms_indices_scratchpad;
 
     // Model configurations
-    int target_w;
-    int target_h;
+    int model_input_size;
     int num_classes;
     bool model_loaded;
     bool cpu_net_loaded;

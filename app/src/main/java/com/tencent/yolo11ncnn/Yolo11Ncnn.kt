@@ -41,7 +41,7 @@ class Yolo11Ncnn {
     external fun Init(
         mgr: AssetManager,
         modelTypeIndex: Int,
-        targetSize: Int,
+        modelInputSize: Int,
         computeMode: Int
     ): Boolean
 

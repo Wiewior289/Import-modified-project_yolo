@@ -64,15 +64,33 @@ The tracked instrumentation provides direct runtime evidence:
 
 The build script previously checked `runtime_sync_timing.patch` but did not apply it, while including it in `PATCHSET_SHA`. It now applies that patch and then `async_vk_submit.patch`; the patchset hash includes both.
 
+## Model input resolution contract
+
+`modelInputSize` is the single model-resolution setting in Kotlin. The same value is passed through `Yolo11Ncnn.Init()` and JNI as `model_input_size`, stored once in `Yolo11`, and reused for AHB preprocessing output, NCNN input dimensions, parser grid generation, DFL coordinate clipping and detection normalization. The supported square sizes remain 320..480 in steps of 32. The parser grid is built from that same value with strides 8, 16 and 32; for 480×480 this gives 4,725 anchors.
+
+The Camera2 YUV output is a separate source stream (`cameraSourceSize`), not the model tensor size. Its selection is now based on the chosen `modelInputSize` instead of a fixed 320×320 area target. The importer still resizes the source AHardwareBuffer to the one canonical model input size before inference. The log `CAMERA2_STREAM_CONFIG` prints both dimensions so a HAL-supported source size is not mistaken for the parser input.
+
 ## Runtime telemetry
 
-- `ASYNC_GPU_SUBMIT_DONE`: CPU recording and queue-submit interval, not GPU execution time.
+- `ASYNC_FRAME_QUEUED`: admitted frame, camera callback time, queue time and source dimensions.
+- `ASYNC_GPU_SUBMIT_BEGIN/DONE`: GPU submit executor start/end, including executor queue delay. This is host-side recording and queue-submit time, not GPU execution time.
+- `ASYNC_GPU_WAIT_BEGIN/ASYNC_GPU_COMPLETE_DONE`: completion executor start/end around native fence wait, deferred readback and resource release; includes completion-executor queue delay.
+- `ASYNC_CPU_STAGE_BEGIN/DONE`: CPU postprocess executor start/end, including CPU executor queue delay.
+- `ASYNC_FRAME_SLOT_RELEASE`: end-to-end host time from frame admission until the frame slot becomes reusable.
 - `NCNN_VK_ASYNC_SUBMIT`: command-buffer replay/end, queue acquisition and queue-submit timing.
 - `NCNN_VK_ASYNC_WAIT`: fence wait and deferred CPU readback/cast timing.
 - `ASYNC_GPU_COMPLETE_DONE`: completion worker interval including fence wait and resource release.
 - `ASYNC_CPU_STAGE_DONE`: DFL/NMS interval.
 - `FRAME_ALLOCATORS_ACQUIRED/RECLAIM`: per-frame allocator leases.
 - `AHB_CACHE_PIN/UNPIN`: AHB import lifetime pin count.
+
+## Reading N/N+1 overlap
+
+The Kotlin `start_ns`/`end_ns` fields use `SystemClock.elapsedRealtimeNanos()` and are comparable across the three executors. If the interval for `ASYNC_GPU_SUBMIT_BEGIN/DONE` of frame N+1 intersects the interval `ASYNC_GPU_WAIT_BEGIN/ASYNC_GPU_COMPLETE_DONE` of frame N, the host submitted N+1 while N's fence was still pending. If CPU stage N intersects submit or wait activity for N+1, the CPU postprocess is overlapping the next frame's host/GPU work. `executor_queue_wait_ms` / `completion_queue_wait_ms` / `queue_wait_ms` separate worker backlog from the stage's own duration.
+
+This establishes host-side N/N+1 pipelining and queue submission before N completes. It does not mean two inference command buffers execute simultaneously: submissions on the same Vulkan queue remain ordered.
+
+In full-GPU mode 8, runtime per-layer benchmarking is disabled (`net.opt.use_benchmark=false`). This suppresses per-layer CPU/GPU timings, MatMul route/dispatch traces and timestamp-query allocation/readback. Compare/control modes retain their benchmark switch. The build may keep `NCNN_BENCHMARK=ON`; the instrumentation is simply inactive in mode 8.
 
 ## Validation gates
 

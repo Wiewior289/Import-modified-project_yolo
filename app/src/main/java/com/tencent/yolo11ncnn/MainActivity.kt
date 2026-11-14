@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicLong
  * Runtime path for this milestone: Vulkan + Camera2 AHardwareBuffer + Vulkan MatMul.
  * Camera2 AHB is imported into Vulkan; the complete NCNN model graph runs on GPU.
  * out0 is read back to CPU for DFL decode, NMS and dashboard telemetry.
- * Frame submission is still serialized here; multi-frame GPU pipelining is a later step.
+ * Submit, fence wait and CPU postprocess use dedicated serial executors; host stages can overlap across frames.
+ * Vulkan queue execution remains ordered; this is host-side pipelining, not parallel GPU queues.
  * ============================================================================
  */
 class MainActivity : AppCompatActivity() {
@@ -49,7 +50,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var modeGeneration: Long = 0L
     private var modelSelectorInitialized = false
     @Volatile private var selectedModelType: Int = Yolo11Ncnn.MODEL_YOLO11N
-    @Volatile private var selectedTargetSize: Int = TARGET_SIZE_MIN
+    @Volatile private var modelInputSize: Int = MODEL_INPUT_SIZE_MIN
     @Volatile private var asyncDrainPending: Boolean = false
     private var selectableModelTypes: List<Int> = listOf(Yolo11Ncnn.MODEL_YOLO11N)
     private lateinit var telemetryServer: TelemetryServer
@@ -173,16 +174,16 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 12, 0, 0)
         }
         val resolutionValue = TextView(this).apply {
-            text = selectedTargetSize.toString() + " x " + selectedTargetSize
+            text = modelInputSize.toString() + " x " + modelInputSize
             textSize = 14f
         }
         val resolutionSeekBar = SeekBar(this).apply {
-            max = (TARGET_SIZE_MAX - TARGET_SIZE_MIN) / TARGET_SIZE_STEP
-            progress = (selectedTargetSize - TARGET_SIZE_MIN) / TARGET_SIZE_STEP
+            max = (MODEL_INPUT_SIZE_MAX - MODEL_INPUT_SIZE_MIN) / MODEL_INPUT_SIZE_STEP
+            progress = (modelInputSize - MODEL_INPUT_SIZE_MIN) / MODEL_INPUT_SIZE_STEP
         }
         resolutionSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                val previewSize = TARGET_SIZE_MIN + progress * TARGET_SIZE_STEP
+                val previewSize = MODEL_INPUT_SIZE_MIN + progress * MODEL_INPUT_SIZE_STEP
                 resolutionValue.text = previewSize.toString() + " x " + previewSize
             }
 
@@ -190,8 +191,8 @@ class MainActivity : AppCompatActivity() {
 
             override fun onStopTrackingTouch(seekBar: SeekBar?) {
                 val progress = seekBar?.progress ?: return
-                val newSize = TARGET_SIZE_MIN + progress * TARGET_SIZE_STEP
-                switchTargetSize(newSize)
+                val newSize = MODEL_INPUT_SIZE_MIN + progress * MODEL_INPUT_SIZE_STEP
+                switchModelInputSize(newSize)
             }
         })
 
@@ -240,19 +241,19 @@ class MainActivity : AppCompatActivity() {
         reinitializePipeline("MODEL_SWITCH", previousMode)
     }
 
-    private fun switchTargetSize(newSize: Int) {
-        if (newSize < TARGET_SIZE_MIN || newSize > TARGET_SIZE_MAX ||
-            (newSize - TARGET_SIZE_MIN) % TARGET_SIZE_STEP != 0 ||
-            newSize == selectedTargetSize) return
+    private fun switchModelInputSize(newSize: Int) {
+        if (newSize < MODEL_INPUT_SIZE_MIN || newSize > MODEL_INPUT_SIZE_MAX ||
+            (newSize - MODEL_INPUT_SIZE_MIN) % MODEL_INPUT_SIZE_STEP != 0 ||
+            newSize == modelInputSize) return
         val previousMode = selectedComputeMode
-        selectedTargetSize = newSize
+        modelInputSize = newSize
         reinitializePipeline("INPUT_SIZE_SWITCH", previousMode)
     }
 
     private fun reinitializePipeline(reason: String, previousMode: Int) {
         val generation = ++modeGeneration
         val modelAtRequest = selectedModelType
-        val targetAtRequest = selectedTargetSize
+        val modelInputSizeAtRequest = modelInputSize
         val computeModeAtRequest = selectedComputeMode
         val mustDrainAsync = previousMode == Yolo11Ncnn.COMPUTE_VULKAN_AHB_ASYNC ||
             previousMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN || asyncDrainPending
@@ -263,7 +264,7 @@ class MainActivity : AppCompatActivity() {
         closeCameraForModeSwitch()
 
         val configLabel = modelLabel(modelAtRequest) + " / " +
-            targetAtRequest + "x" + targetAtRequest + " / " + computeModeLabel(computeModeAtRequest)
+            modelInputSizeAtRequest + "x" + modelInputSizeAtRequest + " / " + computeModeLabel(computeModeAtRequest)
         telemetryServer.broadcastStatus("COMPUTE_MODE_SWITCH", reason + ": " + configLabel)
 
         val enqueueReinitialization = {
@@ -278,7 +279,7 @@ class MainActivity : AppCompatActivity() {
 
                 val startedAt = SystemClock.elapsedRealtime()
                 val initialized = try {
-                    yoloEngine.Init(assets, modelAtRequest, targetAtRequest, computeModeAtRequest)
+                    yoloEngine.Init(assets, modelAtRequest, modelInputSizeAtRequest, computeModeAtRequest)
                 } catch (e: Exception) {
                     Log.e(TAG, "Błąd inicjalizacji " + configLabel, e)
                     false
@@ -358,11 +359,11 @@ class MainActivity : AppCompatActivity() {
     private fun launchAsyncPipeline() {
         val modeAtStart = selectedComputeMode
         val modelAtStart = selectedModelType
-        val targetSizeAtStart = selectedTargetSize
+        val modelInputSizeAtStart = modelInputSize
         val generationAtStart = modeGeneration
         backgroundInitExecutor.execute {
             Log.i(TAG, "Ładowanie " + modelLabel(modelAtStart) + " input=" +
-                targetSizeAtStart + "x" + targetSizeAtStart + " backend=" +
+                modelInputSizeAtStart + "x" + modelInputSizeAtStart + " backend=" +
                 computeModeLabel(modeAtStart) + " w tle...")
             telemetryServer.broadcastStatus(
                 "INIT_YOLO",
@@ -371,7 +372,7 @@ class MainActivity : AppCompatActivity() {
 
             val startTime = SystemClock.elapsedRealtime()
             val initSuccess = try {
-                yoloEngine.Init(assets, modelAtStart, targetSizeAtStart, modeAtStart)
+                yoloEngine.Init(assets, modelAtStart, modelInputSizeAtStart, modeAtStart)
             } catch (e: Exception) {
                 Log.e(TAG, "Błąd podczas init backendu " + computeModeLabel(modeAtStart), e)
                 false
@@ -381,13 +382,13 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (generationAtStart != modeGeneration) return@runOnUiThread
                 if (initSuccess) {
-                    Log.i(TAG, modelLabel(modelAtStart) + " input=" + targetSizeAtStart +
+                    Log.i(TAG, modelLabel(modelAtStart) + " input=" + modelInputSizeAtStart +
                         " backend=" + computeModeLabel(modeAtStart) + " Init sukces w " + loadDuration + "ms")
                     isYoloReady.set(true)
                     telemetryServer.broadcastStatus(
                         "YOLO_READY",
-                        modelLabel(modelAtStart) + " " + targetSizeAtStart + "x" +
-                            targetSizeAtStart + " / " + computeModeLabel(modeAtStart) +
+                        modelLabel(modelAtStart) + " " + modelInputSizeAtStart + "x" +
+                            modelInputSizeAtStart + " / " + computeModeLabel(modeAtStart) +
                             " gotowy (" + loadDuration + "ms)"
                     )
                     startCamera2()
@@ -501,7 +502,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun queueAsyncFrame(image: android.media.Image, frameId: Long, imageTimestampNs: Long, rotateType: Int) {
+    private fun queueAsyncFrame(image: android.media.Image, frameId: Long, imageTimestampNs: Long, rotateType: Int, cameraCallbackNs: Long) {
         val fullGpuMode = selectedComputeMode == Yolo11Ncnn.COMPUTE_MATMUL_VULKAN
         val slot = reserveAsyncSlot()
         if (slot < 0) {
@@ -514,18 +515,23 @@ class MainActivity : AppCompatActivity() {
         }
 
         val queuedAtNs = SystemClock.elapsedRealtimeNanos()
-        if (frameId % 30L == 0L) {
-            Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode queued_ns=$queuedAtNs")
-        }
+        Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+            "callback_ns=$cameraCallbackNs queued_ns=$queuedAtNs " +
+            "callback_to_queue_ms=${(queuedAtNs - cameraCallbackNs) / 1_000_000.0} " +
+            "camera=${image.width}x${image.height} tid=${android.os.Process.myTid()}")
 
         // CPU postprocessing is queued only after the GPU fence has completed.
         val enqueueCpuStage: () -> Unit = {
+            val cpuQueuedAtNs = SystemClock.elapsedRealtimeNanos()
             try {
                 cpuFrameExecutor.execute cpuTask@ {
                     val output = asyncDetectionBuffers[slot]
                     output.fill(0f)
                     var cpuStageRet = -1
                     val cpuStageStartNs = SystemClock.elapsedRealtimeNanos()
+                    Log.i(TAG, "ASYNC_CPU_STAGE_BEGIN frame=$frameId slot=$slot " +
+                        "start_ns=$cpuStageStartNs queue_wait_ms=${(cpuStageStartNs - cpuQueuedAtNs) / 1_000_000.0} " +
+                        "tid=${android.os.Process.myTid()}")
                     try {
                         cpuStageRet = if (fullGpuMode) {
                             yoloEngine.PostprocessFrame(slot, output, confThreshold, nmsThreshold)
@@ -538,10 +544,10 @@ class MainActivity : AppCompatActivity() {
                         val count = cpuStageRet.coerceAtLeast(0)
                         val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
                         val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
-                        if (frameId % 30L == 0L) {
-                            Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                                "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs ret=$cpuStageRet")
-                        }
+                        Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                            "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs " +
+                            "queue_wait_ms=${(cpuStageStartNs - cpuQueuedAtNs) / 1_000_000.0} " +
+                            "ret=$cpuStageRet detections=$count tid=${android.os.Process.myTid()}")
                         if (frameId % 30L == 0L) {
                             Log.i(TAG, "ASYNC_FRAME frame=$frameId slot=$slot imageTs=$imageTimestampNs " +
                                 "FPS=" + String.format(java.util.Locale.US, "%.1f", currentFps) +
@@ -564,7 +570,11 @@ class MainActivity : AppCompatActivity() {
                     } catch (e: Exception) {
                         Log.e(TAG, "CPU suffix exception frame=$frameId slot=$slot", e)
                     } finally {
+                        val slotReleasedNs = SystemClock.elapsedRealtimeNanos()
                         asyncSlotBusy.set(slot, 0)
+                        Log.i(TAG, "ASYNC_FRAME_SLOT_RELEASE frame=$frameId slot=$slot " +
+                            "released_ns=$slotReleasedNs queue_to_release_ms=${(slotReleasedNs - queuedAtNs) / 1_000_000.0} " +
+                            "tid=${android.os.Process.myTid()}")
                     }
                 }
             } catch (e: Exception) {
@@ -573,6 +583,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        val gpuTaskQueuedNs = SystemClock.elapsedRealtimeNanos()
         try {
             gpuFrameExecutor.execute gpuTask@ {
                 var gpuStageRet = -1
@@ -595,6 +606,10 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val gpuStageStartNs = SystemClock.elapsedRealtimeNanos()
+                Log.i(TAG, "ASYNC_GPU_SUBMIT_BEGIN frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                    "start_ns=$gpuStageStartNs executor_queue_wait_ms=${(gpuStageStartNs - gpuTaskQueuedNs) / 1_000_000.0} " +
+                    "frame_queue_wait_ms=${(gpuTaskQueuedNs - queuedAtNs) / 1_000_000.0} " +
+                    "tid=${android.os.Process.myTid()}")
                 try {
                     val acquiredBuffer = image.hardwareBuffer
                     hwBuffer = acquiredBuffer
@@ -619,10 +634,9 @@ class MainActivity : AppCompatActivity() {
 
                 val gpuStageEndNs = SystemClock.elapsedRealtimeNanos()
                 val gpuStageWallMs = (gpuStageEndNs - gpuStageStartNs) / 1_000_000.0
-                if (frameId % 30L == 0L) {
-                    Log.i(TAG, "ASYNC_GPU_SUBMIT_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                        "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet")
-                }
+                Log.i(TAG, "ASYNC_GPU_SUBMIT_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                    "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet " +
+                    "tid=${android.os.Process.myTid()}")
                 if (gpuStageRet != 0) {
                     Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
                     asyncSlotBusy.set(slot, 0)
@@ -630,8 +644,12 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (fullGpuMode) {
+                    val completionQueuedNs = SystemClock.elapsedRealtimeNanos()
                     val completionTask: () -> Unit = completionTask@{
                         val completionStartNs = SystemClock.elapsedRealtimeNanos()
+                        Log.i(TAG, "ASYNC_GPU_WAIT_BEGIN frame=$frameId slot=$slot " +
+                            "start_ns=$completionStartNs completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
+                            "tid=${android.os.Process.myTid()}")
                         var waitRet = -1
                         try {
                             waitRet = yoloEngine.WaitGpuFrame(slot)
@@ -651,10 +669,10 @@ class MainActivity : AppCompatActivity() {
                         }
                         val completionEndNs = SystemClock.elapsedRealtimeNanos()
                         val completionWallMs = (completionEndNs - completionStartNs) / 1_000_000.0
-                        if (frameId % 30L == 0L) {
-                            Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot " +
-                                "start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs ret=$waitRet")
-                        }
+                        Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot " +
+                            "start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs " +
+                            "completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
+                            "ret=$waitRet tid=${android.os.Process.myTid()}")
                         if (waitRet != 0) {
                             Log.e(TAG, "GPU fence completion failed frame=$frameId slot=$slot ret=$waitRet; slot retained")
                             isYoloReady.set(false)
@@ -725,27 +743,30 @@ class MainActivity : AppCompatActivity() {
             // Prefer a square stream; otherwise choose the closest aspect ratio and
             // report the mismatch instead of assuming 320x320 is supported by the HAL.
             val usableSizes = yuvSizes.filter { minOf(it.width, it.height) >= 240 }.ifEmpty { yuvSizes }
-            val inputSize = usableSizes.minByOrNull { size ->
+            val desiredModelArea = modelInputSize.toLong() * modelInputSize.toLong()
+            val cameraSourceSize = usableSizes.minByOrNull { size ->
                 val aspectPenalty = kotlin.math.abs(size.width.toDouble() / size.height.toDouble() - 1.0) * 10000.0
-                val areaPenalty = kotlin.math.abs(size.width * size.height - 320 * 320).toDouble() / 1000.0
+                val cameraArea = size.width.toLong() * size.height.toLong()
+                val areaPenalty = kotlin.math.abs(cameraArea - desiredModelArea).toDouble() / 1000.0
                 aspectPenalty + areaPenalty
             } ?: run {
                 telemetryServer.broadcastStatus("ERROR_CAMERA_SIZE", "Nie udało się wybrać rozmiaru YUV")
                 return
             }
 
-            val inputAspect = inputSize.width.toDouble() / inputSize.height.toDouble()
-            Log.i(TAG, "Camera2 YUV input=" + inputSize.width + "x" + inputSize.height + ", aspect=" + inputAspect)
+            val inputAspect = cameraSourceSize.width.toDouble() / cameraSourceSize.height.toDouble()
+            Log.i(TAG, "CAMERA2_STREAM_CONFIG model_input=${modelInputSize}x${modelInputSize} " +
+                "camera_source=${cameraSourceSize.width}x${cameraSourceSize.height} aspect=$inputAspect")
             if (kotlin.math.abs(inputAspect - 1.0) > 0.02) {
                 telemetryServer.broadcastStatus(
                     "WARN_CAMERA_ASPECT",
-                    "Strumień kamery nie jest kwadratowy (" + inputSize.width + "x" + inputSize.height + "); preprocess do 320x320 może zmieniać proporcje."
+                    "Strumień kamery nie jest kwadratowy (" + cameraSourceSize.width + "x" + cameraSourceSize.height + "); preprocess do " + modelInputSize + "x" + modelInputSize + " może zmieniać proporcje."
                 )
             }
 
             // Android 10+ ImageReader overload requests GPU sampling and CPU read access.
             imageReader = ImageReader.newInstance(
-                inputSize.width, inputSize.height, ImageFormat.YUV_420_888, 3,
+                cameraSourceSize.width, cameraSourceSize.height, ImageFormat.YUV_420_888, 3,
                 HardwareBuffer.USAGE_CPU_READ_OFTEN or HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
             )
 
@@ -777,7 +798,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (asyncFullGpuMode) {
-                    queueAsyncFrame(image, frameId, imageTimestampNs, rotateType)
+                    queueAsyncFrame(image, frameId, imageTimestampNs, rotateType, callbackStartNs)
                     return@setOnImageAvailableListener
                 }
 
@@ -1168,9 +1189,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "Mower_Vision_Core"
-        private const val TARGET_SIZE_MIN = 320
-        private const val TARGET_SIZE_MAX = 480
-        private const val TARGET_SIZE_STEP = 32
+        private const val MODEL_INPUT_SIZE_MIN = 320
+        private const val MODEL_INPUT_SIZE_MAX = 480
+        private const val MODEL_INPUT_SIZE_STEP = 32
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(
             Manifest.permission.CAMERA,

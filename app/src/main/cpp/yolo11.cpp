@@ -243,7 +243,7 @@ Yolo11::Yolo11()
     : vkdev(nullptr), scale_layer(nullptr), ahb_cache_clock(0),
       ahb_cache_hits(0), ahb_cache_misses(0), ahb_cache_evictions(0),
       ahb_cache_rotate_rebuilds(0), ahb_compare_samples_done(0),
-      target_w(320), target_h(320), num_classes(80),
+      model_input_size(320), num_classes(80),
       model_loaded(false), cpu_net_loaded(false), use_vulkan_compute(true), compute_mode(YOLO_COMPUTE_VULKAN_AHB),
       last_top_score(0.0f), last_top_class(-1)
 {
@@ -317,14 +317,14 @@ void Yolo11::clear_ahb_cache()
     ahb_compare_samples_done = 0;
 }
 
-int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int requested_compute_mode)
+int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size, int requested_compute_mode)
 {
     if (!mgr || !modeltype) {
         LOGE("Invalid AssetManager or modeltype pointer");
         return -1;
     }
-    if (target_size < 320 || target_size > 480 || (target_size % 32) != 0) {
-        LOGE("Unsupported target size %d; expected 320..480 in steps of 32", target_size);
+    if (model_input_size < 320 || model_input_size > 480 || (model_input_size % 32) != 0) {
+        LOGE("Unsupported model input size %d; expected 320..480 in steps of 32", model_input_size);
         return -4;
     }
 
@@ -361,8 +361,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
         slot.image_timestamp_ns = 0;
     }
 
-    target_w = target_size;
-    target_h = target_size;
+    model_input_size = model_input_size;
+    model_input_size = model_input_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
         requested_compute_mode > YOLO_COMPUTE_MATMUL_VULKAN) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
@@ -413,8 +413,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     net.opt.num_threads         = 4;
     const bool runtime_benchmark =
         compute_mode == YOLO_COMPUTE_MATMUL_VULKAN_COMPARE ||
-        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU ||
-        compute_mode == YOLO_COMPUTE_MATMUL_VULKAN;
+        compute_mode == YOLO_COMPUTE_VULKAN_AHB_MATMUL_CPU;
     net.opt.use_benchmark = runtime_benchmark;
     net.opt.use_vulkan_async = (compute_mode == YOLO_COMPUTE_MATMUL_VULKAN);
     LOGI("NCNN_BENCHMARK_RUNTIME enabled=%d mode=%d", runtime_benchmark ? 1 : 0, compute_mode);
@@ -426,8 +425,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     snprintf(parampath, sizeof(parampath), "yolo11%s.param", modeltype);
     snprintf(binpath, sizeof(binpath), "yolo11%s.bin", modeltype);
 
-    LOGI("Loading YOLO11: %s, %s (target_size: %dx%d, compute_mode=%d)",
-         parampath, binpath, target_w, target_h, compute_mode);
+    LOGI("Loading YOLO11: %s, %s (model_input_size: %dx%d, compute_mode=%d)",
+         parampath, binpath, model_input_size, model_input_size, compute_mode);
 
     int ret_param = net.load_param(mgr, parampath);
     if (ret_param != 0) {
@@ -719,11 +718,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
                 layer->support_vulkan = false;
             }
 
-            LOGI("MATMUL_CONFIG idx=%zu name=%s requested=%s support_before=%d support_after=%d",
-                 i, layer->name.c_str(), request_gpu_matmul ? "VULKAN" : "CPU",
-                 support_before, layer->support_vulkan ? 1 : 0);
-
-            if (request_gpu_matmul && !layer->support_vulkan) {
+                    if (request_gpu_matmul && !layer->support_vulkan) {
                 LOGE("MatMul Vulkan requested but Layer_final has no active Vulkan implementation idx=%zu name=%s",
                      i, layer->name.c_str());
                 return -23;
@@ -766,9 +761,22 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     }
     LOGI("NCNN_RUNTIME_PLACEMENT_NOTE: static layer capability is not proof of runtime execution, VkMat/Mat copies or synchronization.");
 
-    generate_grids_and_stride(target_w, target_h);
+    generate_grids_and_stride(model_input_size);
 
     const size_t total_anchors = grid_strides.size();
+    const int parser_strides[3] = {8, 16, 32};
+    size_t expected_anchors = 0;
+    for (int stride : parser_strides) {
+        const size_t grid_side = static_cast<size_t>(model_input_size / stride);
+        expected_anchors += grid_side * grid_side;
+    }
+    if (total_anchors != expected_anchors) {
+        LOGE("Parser grid mismatch model_input_size=%d expected_anchors=%zu actual_anchors=%zu",
+             model_input_size, expected_anchors, total_anchors);
+        return -6;
+    }
+    LOGI("MODEL_INPUT_CONTRACT model_input_size=%dx%d parser_strides=8,16,32 anchors=%zu features=%d",
+         model_input_size, model_input_size, total_anchors, 64 + num_classes);
     proposal_scratchpad.reserve(total_anchors);
     candidates_scratchpad.reserve(256);
     nms_indices_scratchpad.reserve(256);
@@ -778,27 +786,29 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int target_size, int
     return 0;
 }
 
-void Yolo11::generate_grids_and_stride(int target_w, int target_h)
+void Yolo11::generate_grids_and_stride(int input_size)
 {
     grid_strides.clear();
     const int strides[3] = {8, 16, 32};
 
     size_t total_count = 0;
-    for (int s : strides) {
-        int gw = (target_w + s - 1) / s;
-        int gh = (target_h + s - 1) / s;
-        total_count += static_cast<size_t>(gw * gh);
+    for (int stride : strides) {
+        if (input_size <= 0 || (input_size % stride) != 0) {
+            LOGE("Model input size=%d is not divisible by parser stride=%d", input_size, stride);
+            return;
+        }
+        const int grid_side = input_size / stride;
+        total_count += static_cast<size_t>(grid_side) * static_cast<size_t>(grid_side);
     }
     grid_strides.reserve(total_count);
 
     for (int stride : strides) {
-        int num_grid_x = target_w / stride;
-        int num_grid_y = target_h / stride;
-        for (int g1 = 0; g1 < num_grid_y; g1++) {
-            for (int g0 = 0; g0 < num_grid_x; g0++) {
+        const int grid_side = input_size / stride;
+        for (int grid_y = 0; grid_y < grid_side; grid_y++) {
+            for (int grid_x = 0; grid_x < grid_side; grid_x++) {
                 GridAndStride gs;
-                gs.grid0 = g0;
-                gs.grid1 = g1;
+                gs.grid0 = grid_x;
+                gs.grid1 = grid_y;
                 gs.stride = stride;
                 grid_strides.push_back(gs);
             }
@@ -911,7 +921,7 @@ int Yolo11::detect_cpu_or_vulkan(AHardwareBuffer* ahb,float conf_thresh,float nm
 
     ncnn::Mat input = ncnn::Mat::from_pixels_resize(
         rgb_data, ncnn::Mat::PIXEL_RGB, static_cast<int>(rotated_w),
-        static_cast<int>(rotated_h), target_w, target_h);
+        static_cast<int>(rotated_h), model_input_size, model_input_size);
     if (input.empty()) {
         LOGE("CPU YUV preprocess produced an empty NCNN Mat");
         return -8;
@@ -1035,7 +1045,7 @@ int Yolo11::detect_ahb_compare(AHardwareBuffer* ahb,float conf_thresh,float nms_
     LOGI("%s_BEGIN sample=%u frame=%lld ts=%lld source=%ux%u target=%dx%d stride=%u format=0x%x usage=0x%llx rotate=%d paths=AHB_VULKAN,CPU_YUV_CPU,CPU_YUV_VULKAN",
          compare_tag,
          sample_number,(long long)frame_id,(long long)image_timestamp_ns,
-         frame_desc.width,frame_desc.height,target_w,target_h,frame_desc.stride,frame_desc.format,
+         frame_desc.width,frame_desc.height,model_input_size,model_input_size,frame_desc.stride,frame_desc.format,
          (unsigned long long)frame_desc.usage,rotate_type);
 
     compute_mode=YOLO_COMPUTE_VULKAN_AHB;
@@ -1261,7 +1271,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             t = std::chrono::steady_clock::now();
                             const int pr = entry->pipeline->create(
                                 entry->allocator, 1, rotate_type,
-                                target_w, target_h, pipeline_opt);
+                                model_input_size, model_input_size, pipeline_opt);
                             pipeline_create_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t).count();
 
@@ -1325,7 +1335,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                 entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
                 const int pr = entry->pipeline
                     ? entry->pipeline->create(entry->allocator, 1, rotate_type,
-                                              target_w, target_h, pipeline_opt)
+                                              model_input_size, model_input_size, pipeline_opt)
                     : -1;
                 pipeline_create_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t).count();
@@ -1342,7 +1352,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
 
             if (execute_ret == 0) {
                 ncnn::VkMat dst;
-                dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);
+                dst.create(model_input_size, model_input_size, 3, (size_t)4u, 1, blob_allocator);
                 if (dst.empty()) {
                     execute_ret = -8;
                 } else {
@@ -1614,7 +1624,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
             const Object& obj = objects[i];
             LOGD("det[%zu] cls=%d score=%.3f xywh=(%.4f,%.4f,%.4f,%.4f) zone=%d",
                  i, obj.label, obj.prob,
-                 obj.x / target_w, obj.y / target_h, obj.w / target_w, obj.h / target_h,
+                 obj.x / model_input_size, obj.y / model_input_size, obj.w / model_input_size, obj.h / model_input_size,
                  obj.zone_id);
         }
     }
@@ -1902,7 +1912,7 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
                             pipeline_opt.use_fp16_storage = false;
                             pipeline_opt.use_fp16_packed = false;
                             const int pipeline_ret = entry->pipeline->create(
-                                entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt);
+                                entry->allocator, 1, rotate_type, model_input_size, model_input_size, pipeline_opt);
                             if (pipeline_ret != 0) {
                                 destroy_ahb_cache_entry(entry);
                                 entry = nullptr;
@@ -1931,7 +1941,7 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
             pipeline_opt.use_fp16_packed = false;
             entry->pipeline = new (std::nothrow) ncnn::ImportAndroidHardwareBufferPipeline(vkdev);
             const int pipeline_ret = entry->pipeline
-                ? entry->pipeline->create(entry->allocator, 1, rotate_type, target_w, target_h, pipeline_opt)
+                ? entry->pipeline->create(entry->allocator, 1, rotate_type, model_input_size, model_input_size, pipeline_opt)
                 : -1;
             if (pipeline_ret != 0) {
                 delete entry->pipeline;
@@ -1945,7 +1955,7 @@ int Yolo11::gpu_prefix_frame(int slot_index, AHardwareBuffer* ahb, int rotate_ty
 
         if (execute_ret == 0 && entry && entry->pipeline) {
             ncnn::VkMat dst;
-            dst.create(target_w, target_h, 3, (size_t)4u, 1, blob_allocator);
+            dst.create(model_input_size, model_input_size, 3, (size_t)4u, 1, blob_allocator);
             if (dst.empty()) {
                 execute_ret = -31;
             } else {
@@ -2119,8 +2129,8 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
 
     const int cls_count = out_flat.w - 64;
     if (cls_count != num_classes || total_anchors != static_cast<int>(grid_strides.size())) {
-        LOGE("Unexpected YOLO output layout: features=%d expected=%d anchors=%d expected=%zu",
-             out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
+        LOGE("Unexpected YOLO output layout model_input_size=%d: features=%d expected=%d anchors=%d expected=%zu",
+             model_input_size, out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
         return;
     }
 
@@ -2183,10 +2193,10 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         const float grid0  = static_cast<float>(grid_strides[i].grid0);
         const float grid1  = static_cast<float>(grid_strides[i].grid1);
 
-        float x0 = std::max(0.0f, std::min(static_cast<float>(target_w), (grid0 + 0.5f - pred_ltrb[0]) * stride));
-        float y0 = std::max(0.0f, std::min(static_cast<float>(target_h), (grid1 + 0.5f - pred_ltrb[1]) * stride));
-        float x1 = std::max(0.0f, std::min(static_cast<float>(target_w), (grid0 + 0.5f + pred_ltrb[2]) * stride));
-        float y1 = std::max(0.0f, std::min(static_cast<float>(target_h), (grid1 + 0.5f + pred_ltrb[3]) * stride));
+        float x0 = std::max(0.0f, std::min(static_cast<float>(model_input_size), (grid0 + 0.5f - pred_ltrb[0]) * stride));
+        float y0 = std::max(0.0f, std::min(static_cast<float>(model_input_size), (grid1 + 0.5f - pred_ltrb[1]) * stride));
+        float x1 = std::max(0.0f, std::min(static_cast<float>(model_input_size), (grid0 + 0.5f + pred_ltrb[2]) * stride));
+        float y1 = std::max(0.0f, std::min(static_cast<float>(model_input_size), (grid1 + 0.5f + pred_ltrb[3]) * stride));
 
         float bw = std::max(0.0f, x1 - x0);
         float bh = std::max(0.0f, y1 - y0);
@@ -2266,7 +2276,7 @@ void Yolo11::nms_sorted_bboxes(float nms_thresh, std::vector<Object>& output)
 
     for (size_t i = 0; i < candidates_scratchpad.size(); i++) {
         Object obj = candidates_scratchpad[i];
-        const float norm_bottom_y = (obj.y + obj.h) / static_cast<float>(target_h);
+        const float norm_bottom_y = (obj.y + obj.h) / static_cast<float>(model_input_size);
         if (norm_bottom_y > 0.70f) obj.zone_id = ZONE_NEAR;
         else if (norm_bottom_y >= 0.35f) obj.zone_id = ZONE_MID;
         else obj.zone_id = ZONE_FAR;
@@ -2289,8 +2299,8 @@ int Yolo11::pack_detections_flat(const std::vector<Object>& objects, float* out_
 
     out_buffer[0] = static_cast<float>(count);
 
-    const float inv_w = 1.0f / static_cast<float>(target_w);
-    const float inv_h = 1.0f / static_cast<float>(target_h);
+    const float inv_w = 1.0f / static_cast<float>(model_input_size);
+    const float inv_h = 1.0f / static_cast<float>(model_input_size);
 
     for (int i = 0; i < count; i++) {
         const int base = 1 + (i * 7);

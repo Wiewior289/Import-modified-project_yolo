@@ -85,13 +85,13 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved)
 JNIEXPORT jboolean JNICALL
 Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
     JNIEnv* env, jobject thiz, jobject asset_manager,
-    jint model_type_index, jint target_size, jint compute_mode)
+    jint model_type_index, jint model_input_size, jint compute_mode)
 {
     AAssetManager* mgr = AAssetManager_fromJava(env, asset_manager);
     const char* modeltype = model_type_index == 1 ? "s" : (model_type_index == 2 ? "m" : "n");
 
     std::shared_ptr<Yolo11> engine = std::make_shared<Yolo11>();
-    const int ret = engine->load(mgr, modeltype, target_size, static_cast<int>(compute_mode));
+    const int ret = engine->load(mgr, modeltype, model_input_size, static_cast<int>(compute_mode));
     if (ret != 0) {
         LOGE("YOLO11 init failed with error code: %d", ret);
         return JNI_FALSE;
@@ -101,8 +101,8 @@ Java_com_tencent_yolo11ncnn_Yolo11Ncnn_Init(
         std::lock_guard<std::mutex> lock(g_lock);
         g_yolo = engine;
     }
-    LOGI("YOLO11 initialized (model=yolo11%s size=%d compute_mode=%d)",
-         modeltype, target_size, static_cast<int>(compute_mode));
+    LOGI("YOLO11 initialized (model=yolo11%s model_input_size=%d compute_mode=%d)",
+         modeltype, model_input_size, static_cast<int>(compute_mode));
     return JNI_TRUE;
 }
 
