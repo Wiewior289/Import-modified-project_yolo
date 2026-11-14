@@ -2098,13 +2098,50 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         return;
     }
 
+    // NCNN may keep a 2D output packed along its height dimension.
+    // For example, 320x320 has 2,100 anchors, so pack4 is represented as
+    // h=525, elempack=4. The DFL parser consumes one scalar feature row per
+    // anchor and therefore must see pack1 before reading rows or validating h.
+    ncnn::Mat unpacked_blob;
+    const ncnn::Mat* scalar_blob = &out_blob;
+    if (out_blob.elempack != 1) {
+        ncnn::Option unpack_opt = net.opt;
+        unpack_opt.use_vulkan_compute = false;
+        unpack_opt.use_fp16_storage = false;
+        unpack_opt.use_fp16_packed = false;
+        unpack_opt.use_packing_layout = false;
+        ncnn::convert_packing(out_blob, unpacked_blob, 1, unpack_opt);
+        if (unpacked_blob.empty() || unpacked_blob.elempack != 1) {
+            LOGE("YOLO output pack normalization failed: dims=%d w=%d h=%d c=%d elemsize=%zu elempack=%d",
+                 out_blob.dims, out_blob.w, out_blob.h, out_blob.c,
+                 out_blob.elemsize, out_blob.elempack);
+            return;
+        }
+        scalar_blob = &unpacked_blob;
+
+        static std::atomic<bool> pack_normalization_logged(false);
+        if (!pack_normalization_logged.exchange(true)) {
+            LOGI("YOLO_OUTPUT_PACK_NORMALIZED model_input_size=%d raw_dims=%d raw_shape=%d,%d,%d,%d raw_elemsize=%zu raw_pack=%d normalized_dims=%d normalized_shape=%d,%d,%d,%d normalized_elemsize=%zu normalized_pack=%d",
+                 model_input_size, out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c,
+                 out_blob.elemsize, out_blob.elempack,
+                 unpacked_blob.dims, unpacked_blob.w, unpacked_blob.h, unpacked_blob.d, unpacked_blob.c,
+                 unpacked_blob.elemsize, unpacked_blob.elempack);
+        }
+    }
+
+    if (scalar_blob->elemsize != sizeof(float)) {
+        LOGE("Unsupported YOLO output scalar type: elemsize=%zu elempack=%d; parser requires FP32",
+             scalar_blob->elemsize, scalar_blob->elempack);
+        return;
+    }
+
     ncnn::Mat out_flat;
-    if (out_blob.dims == 3) {
-        if (out_blob.c == 1) out_flat = out_blob.reshape(out_blob.w, out_blob.h);
-        else if (out_blob.w == 1) out_flat = out_blob.reshape(out_blob.h, out_blob.c);
-        else out_flat = out_blob.reshape(out_blob.w * out_blob.h, out_blob.c);
+    if (scalar_blob->dims == 3) {
+        if (scalar_blob->c == 1) out_flat = scalar_blob->reshape(scalar_blob->w, scalar_blob->h);
+        else if (scalar_blob->w == 1) out_flat = scalar_blob->reshape(scalar_blob->h, scalar_blob->c);
+        else out_flat = scalar_blob->reshape(scalar_blob->w * scalar_blob->h, scalar_blob->c);
     } else {
-        out_flat = out_blob;
+        out_flat = *scalar_blob;
     }
 
     if (out_flat.w > out_flat.h && out_flat.h >= 68) {
