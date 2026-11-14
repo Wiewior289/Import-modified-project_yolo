@@ -20,18 +20,18 @@ index 49ca3e9..a8b0d10 100644
 @@ -4,1 +4,2 @@
  #include "command.h"
 +#include <time.h>
-@@ -186,0 +187,3 @@
+@@ -186,0 +188,3 @@
 +    bool async_submit;
 +    bool submitted;
 +    bool needs_reset;
-@@ -195,3 +198,6 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
+@@ -195,3 +199,6 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
      compute_command_fence = 0;
  
      pending_dispatch_total = 0;
 +    async_submit = false;
 +    submitted = false;
 +    needs_reset = false;
-@@ -208,2 +214,13 @@ VkComputePrivate::~VkComputePrivate()
+@@ -208,2 +215,13 @@ VkComputePrivate::~VkComputePrivate()
  {
 +    // Safety net only. Correct callers must use wait() so deferred readbacks
 +    // are materialized before the VkCompute and its allocators are destroyed.
@@ -45,13 +45,13 @@ index 49ca3e9..a8b0d10 100644
 +    }
 +
      for (size_t i = 0; i < image_blocks_to_destroy.size(); i++)
-@@ -1833,2 +1848,5 @@ int VkCompute::submit_and_wait()
+@@ -1833,2 +1849,5 @@ int VkCompute::submit_and_wait()
  {
 +    if (d->submitted || d->needs_reset)
 +        return -1;
 +
      using sync_clock = std::chrono::steady_clock;
-@@ -1999,5 +2017,19 @@ int VkCompute::submit_and_wait()
+@@ -1999,5 +2018,19 @@ int VkCompute::submit_and_wait()
  
      vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
  
@@ -71,7 +71,7 @@ index 49ca3e9..a8b0d10 100644
 +
      // wait
      {
-@@ -2041,5 +2071,94 @@ int VkCompute::submit_and_wait()
+@@ -2041,5 +2072,107 @@ int VkCompute::submit_and_wait()
      return 0;
  }
  
@@ -179,7 +179,7 @@ index 49ca3e9..a8b0d10 100644
 +        NCNN_LOGE("[NCNN_VK_ASYNC] reset rejected while GPU work is pending");
 +        return -1;
 +    }
-@@ -2167,0 +2168,1 @@
+@@ -2167,0 +2182,1 @@
 +    d->needs_reset = false;
 diff --git a/src/option.h b/src/option.h
 index 49ca3e9..af6d4f1 100644
