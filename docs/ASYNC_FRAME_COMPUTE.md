@@ -90,7 +90,7 @@ The Kotlin `start_ns`/`end_ns` fields use `SystemClock.elapsedRealtimeNanos()` a
 
 This establishes host-side N/N+1 pipelining and queue submission before N completes. It does not mean two inference command buffers execute simultaneously: submissions on the same Vulkan queue remain ordered.
 
-In full-GPU mode 8, runtime per-layer benchmarking is disabled (`net.opt.use_benchmark=false`). This suppresses per-layer CPU/GPU timings, MatMul route/dispatch traces and timestamp-query allocation/readback. Compare/control modes retain their benchmark switch. The build may keep `NCNN_BENCHMARK=ON`; the instrumentation is simply inactive in mode 8.
+In full-GPU mode 8, runtime per-layer benchmarking is disabled (`net.opt.use_benchmark=false`). This suppresses per-layer CPU/GPU timings, MatMul shader dispatch details and timestamp-query allocation/readback. The low-volume `[MATMUL_ROUTE]` marker remains active for the MatMul layers, so runtime Vulkan-vs-CPU route selection can still be checked without collecting a timing line for every model layer. Compare/control modes retain their benchmark switch. The build may keep `NCNN_BENCHMARK=ON`; detailed profiling is simply inactive in mode 8.
 
 ## Validation gates
 

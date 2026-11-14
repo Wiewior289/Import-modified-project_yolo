@@ -361,8 +361,7 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size
         slot.image_timestamp_ns = 0;
     }
 
-    model_input_size = model_input_size;
-    model_input_size = model_input_size;
+    this->model_input_size = model_input_size;
     if (requested_compute_mode < YOLO_COMPUTE_CPU ||
         requested_compute_mode > YOLO_COMPUTE_MATMUL_VULKAN) {
         LOGE("Invalid compute mode: %d", requested_compute_mode);
