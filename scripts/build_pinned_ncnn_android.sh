@@ -93,7 +93,6 @@ git -C "${SOURCE_DIR}" apply --check "${PATCH_SYNC}"
 git -C "${SOURCE_DIR}" apply "${PATCH_SYNC}"
 git -C "${SOURCE_DIR}" apply --check "${PATCH_ASYNC}"
 git -C "${SOURCE_DIR}" apply "${PATCH_ASYNC}"
-git -C "${SOURCE_DIR}" apply "${PATCH_SYNC}"
 
 PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" "${PATCH_ASYNC}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
