@@ -86,16 +86,16 @@ The Camera2 YUV output is a separate source stream (`cameraSourceSize`), not the
 
 ## Reading N/N+1 overlap
 
-The Kotlin `start_ns`/`end_ns` fields use `SystemClock.elapsedRealtimeNanos()` and are comparable across the three executors. If the interval for `ASYNC_GPU_SUBMIT_BEGIN/DONE` of frame N+1 intersects the interval `ASYNC_GPU_WAIT_BEGIN/ASYNC_GPU_COMPLETE_DONE` of frame N, the host submitted N+1 while N's fence was still pending. If CPU stage N intersects submit or wait activity for N+1, the CPU postprocess is overlapping the next frame's host/GPU work. `executor_queue_wait_ms` / `completion_queue_wait_ms` / `queue_wait_ms` separate worker backlog from the stage's own duration.
+The Kotlin `start_ns`/`end_ns` fields use `SystemClock.elapsedRealtimeNanos()`. The native markers `NCNN_VK_FENCE_WAIT_BEGIN/END` use `clock_gettime(CLOCK_BOOTTIME)`, the same Android boot-time clock domain. Compare the interval `NCNN_VK_FENCE_WAIT_BEGIN(frame=N)` → `NCNN_VK_FENCE_WAIT_END(frame=N)` with `ASYNC_GPU_SUBMIT_BEGIN/DONE(frame=N+1)`. If N+1's host submit interval overlaps N's exact fence-wait interval, or its submit completes before N's fence end, then N's Vulkan submission was still incomplete when the host submitted N+1. `ASYNC_GPU_WAIT_BEGIN/ASYNC_GPU_COMPLETE_DONE` remains the wider JNI wait/readback/resource-release interval; it is not the exact fence interval. `ASYNC_CPU_STAGE_BEGIN/DONE` gives the CPU postprocess interval, while `executor_queue_wait_ms` / `completion_queue_wait_ms` / `queue_wait_ms` separate worker backlog from stage duration.
 
-This establishes host-side N/N+1 pipelining and queue submission before N completes. It does not mean two inference command buffers execute simultaneously: submissions on the same Vulkan queue remain ordered.
+This establishes host-side N/N+1 pipelining and queue submission before N completes. An unsignaled fence means N has not completed; it does not prove the GPU was continuously executing instructions at every instant. It does not mean two inference command buffers execute simultaneously: submissions on the same Vulkan queue remain ordered.
 
 In full-GPU mode 8, runtime per-layer benchmarking is disabled (`net.opt.use_benchmark=false`). This suppresses per-layer CPU/GPU timings, MatMul shader dispatch details and timestamp-query allocation/readback. The low-volume `[MATMUL_ROUTE]` marker remains active for the MatMul layers, so runtime Vulkan-vs-CPU route selection can still be checked without collecting a timing line for every model layer. Compare/control modes retain their benchmark switch. The build may keep `NCNN_BENCHMARK=ON`; detailed profiling is simply inactive in mode 8.
 
 ## Validation gates
 
 1. Build the pinned NCNN source with the complete patchset and rebuild the APK; do not reuse old Gradle/NDK native outputs.
-2. Confirm `NCNN_VK_ASYNC_SUBMIT` and `NCNN_VK_ASYNC_WAIT` appear.
+2. Confirm `NCNN_VK_ASYNC_SUBMIT`, `NCNN_VK_FENCE_WAIT_BEGIN/END` and `NCNN_VK_ASYNC_WAIT` appear; each fence marker must carry the same frame ID and a nonzero ordered time interval.
 3. Confirm layers 110/113 produce `MATMUL_ROUTE`, `MATMUL_VK_DISPATCH_RECORDED`, and GPU timestamp pairs; verify no `NCNN_BENCHMARK_CPU` for the full mode-8 graph.
 4. Check `NCNN_VK_FLUSH` at the selected resolution; compare workgroup count with the selected threshold (minimum 512K; higher tiers are preserved).
 5. Compare detections and `out0` against the previous synchronous full-GPU path on identical AHB frames.

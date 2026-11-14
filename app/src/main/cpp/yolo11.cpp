@@ -1691,7 +1691,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
     const int64_t frame_id = slot.frame_id;
     const int64_t image_timestamp_ns = slot.image_timestamp_ns;
     const auto wait_start = std::chrono::steady_clock::now();
-    const int wait_ret = execution.command->wait();
+    const int wait_ret = execution.command->wait(static_cast<unsigned long long>(frame_id));
     const double wait_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
     if (wait_ret != 0) {

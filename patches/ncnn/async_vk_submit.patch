@@ -8,7 +8,7 @@ index 49ca3e9..a7f12d1 100644
 +    // Split queue submission from fence completion. Keep this VkCompute and
 +    // every referenced tensor/allocator alive until wait() returns success.
 +    int submit();
-+    int wait();
++    int wait(unsigned long long frame_id);
 +
      int submit_and_wait();
  
@@ -17,6 +17,9 @@ diff --git a/src/command.cpp b/src/command.cpp
 index 49ca3e9..a8b0d10 100644
 --- a/src/command.cpp
 +++ b/src/command.cpp
+@@ -4,1 +4,2 @@
+ #include "command.h"
++#include <time.h>
 @@ -186,0 +187,3 @@
 +    bool async_submit;
 +    bool submitted;
@@ -82,7 +85,7 @@ index 49ca3e9..a8b0d10 100644
 +    return ret;
 +}
 +
-+int VkCompute::wait()
++int VkCompute::wait(unsigned long long frame_id)
 +{
 +    if (!d->submitted)
 +    {
@@ -92,10 +95,23 @@ index 49ca3e9..a8b0d10 100644
 +    using async_clock = std::chrono::steady_clock;
 +    const auto wait_start = async_clock::now();
 +    const auto fence_start = async_clock::now();
++    const auto boottime_ns = []() -> unsigned long long {
++        struct timespec ts;
++        if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
++        return static_cast<unsigned long long>(ts.tv_sec) * 1000000000ULL +
++               static_cast<unsigned long long>(ts.tv_nsec);
++    };
++    const unsigned long long fence_start_ns = boottime_ns();
++    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_BEGIN] frame=%llu start_ns=%llu",
++              frame_id, fence_start_ns);
 +    VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence,
 +                                   VK_TRUE, (uint64_t)-1);
++    const unsigned long long fence_end_ns = boottime_ns();
 +    const double fence_wait_wall_ms = std::chrono::duration<double, std::milli>(
 +        async_clock::now() - fence_start).count();
++    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_END] frame=%llu start_ns=%llu end_ns=%llu "
++              "wall_ms=%.3f vk_result=%d",
++              frame_id, fence_start_ns, fence_end_ns, fence_wait_wall_ms, ret);
 +    if (ret != VK_SUCCESS)
 +    {
 +        NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] vkWaitForFences failed %d", ret);
