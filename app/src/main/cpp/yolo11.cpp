@@ -1152,7 +1152,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
     const auto allocator_acquire_start = std::chrono::steady_clock::now();
     ncnn::VkAllocator* blob_allocator = vkdev->acquire_blob_allocator();
     ncnn::VkAllocator* staging_allocator = vkdev->acquire_staging_allocator();
-    if (frame_id % 30 == 0) {
+    if (frame_id > 0) {
         LOGI("FRAME_ALLOCATORS_ACQUIRED frame=%lld blob=%p staging=%p",
              (long long)frame_id, static_cast<void*>(blob_allocator),
              static_cast<void*>(staging_allocator));
@@ -1474,7 +1474,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                     pending_exec->cache_entry = entry;
                                     const uint32_t in_flight_after =
                                         entry->in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
-                                    if (frame_id % 30 == 0) {
+                                    if (frame_id > 0) {
                                         LOGI("AHB_CACHE_PIN frame=%lld ptr=%p in_flight=%u",
                                              (long long)frame_id, static_cast<void*>(ahb), in_flight_after);
                                     }
@@ -1634,7 +1634,7 @@ int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type
     }
 
     slot.state = AsyncFrameSlot::GPU_SUBMITTED;
-    if (frame_id > 0 && frame_id % 30 == 0) {
+    if (frame_id > 0) {
         LOGI("GPU_FULL_SLOT_SUBMITTED frame=%lld slot=%d imageTs=%lld",
              (long long)frame_id, slot_index, (long long)image_timestamp_ns);
     }
@@ -1675,7 +1675,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
     execution.ahb_scaled.release();
     execution.command.reset();
 
-    if (frame_id % 30 == 0) {
+    if (frame_id > 0) {
         LOGI("FRAME_ALLOCATORS_RECLAIM frame=%lld blob=%p staging=%p",
              (long long)frame_id, static_cast<void*>(blob_allocator),
              static_cast<void*>(staging_allocator));
@@ -1687,7 +1687,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
         if (before == 0) {
             LOGE("AHB_CACHE_UNPIN_UNDERFLOW frame=%lld ptr=%p",
                  (long long)frame_id, static_cast<void*>(cache_entry->ahb));
-        } else if (frame_id % 30 == 0) {
+        } else if (frame_id > 0) {
             LOGI("AHB_CACHE_UNPIN frame=%lld ptr=%p in_flight=%u",
                  (long long)frame_id, static_cast<void*>(cache_entry->ahb), before - 1);
         }
@@ -1703,7 +1703,7 @@ int Yolo11::gpu_wait_frame(int slot_index)
     }
 
     slot.state = AsyncFrameSlot::CPU_READY;
-    if (frame_id > 0 && frame_id % 30 == 0) {
+    if (frame_id > 0) {
         LOGI("GPU_FENCE_COMPLETE frame=%lld slot=%d imageTs=%lld wait_wall=%.3fms out0_bytes=%zu",
              (long long)frame_id, slot_index, (long long)image_timestamp_ns,
              wait_wall_ms, slot.out0.total() * slot.out0.elemsize);
