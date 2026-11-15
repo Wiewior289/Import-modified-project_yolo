@@ -1358,18 +1358,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     ncnn::VkMat in_gpu;
                     std::unique_ptr<ncnn::VkCompute> inference_cmd_owner(new ncnn::VkCompute(vkdev));
                     ncnn::VkCompute& inference_cmd = *inference_cmd_owner;
-                    bool timestamp_queries_ready = false;
-#if NCNN_BENCHMARK
-                    if (opt.use_benchmark) {
-                        const int query_pool_ret = inference_cmd.create_query_pool(
-                            static_cast<uint32_t>(net.layers().size() * 2));
-                        timestamp_queries_ready = (query_pool_ret == 0);
-                        if (!timestamp_queries_ready) {
-                            LOGE("[NCNN_BENCHMARK] timestamp_queries=DISABLED reason=QUERY_POOL_CREATE_FAILED ret=%d",
-                                 query_pool_ret);
-                        }
-                    }
-#endif
 
                     // AHB import writes FP32. Scale this VkMat in-place to avoid
                     // an additional full-frame FP32 clone/copy in the hot path.
@@ -1484,7 +1472,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                     pending_exec->blob_allocator = blob_allocator;
                                     pending_exec->staging_allocator = staging_allocator;
                                     pending_exec->cache_entry = entry;
-                                    pending_exec->timestamp_queries_ready = timestamp_queries_ready;
                                     const uint32_t in_flight_after =
                                         entry->in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
                                     if (frame_id % 30 == 0) {
@@ -1495,31 +1482,6 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                     async_resources_transferred = true;
                                 }
                             }
-#if NCNN_BENCHMARK
-                            if (timestamp_queries_ready && execute_ret == 0 && !async_submit) {
-                                std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
-                                const int query_ret = inference_cmd.get_query_pool_results(
-                                    0, static_cast<uint32_t>(query_results.size()), query_results);
-                                if (query_ret < 0) {
-                                    LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_FAILED ret=%d", query_ret);
-                                } else {
-                                    size_t available_pairs = 0;
-                                    for (size_t i = 0; i < net.layers().size(); ++i) {
-                                        const uint64_t q_start = query_results[i * 2];
-                                        const uint64_t q_end = query_results[i * 2 + 1];
-                                        if (q_start == 0 || q_end == 0 || q_end < q_start) continue;
-                                        ++available_pairs;
-                                        const double duration_us =
-                                            (q_end - q_start) * vkdev->info.timestamp_period() / 1000.0;
-                                        LOGI("[NCNN_BENCHMARK_GPU] idx=%zu type=%-16s name=%-30s duration=%.2lfus",
-                                             i, net.layers()[i]->type.c_str(),
-                                             net.layers()[i]->name.c_str(), duration_us);
-                                    }
-                                    LOGI("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
-                                         available_pairs, net.layers().size(), query_ret == 1 ? 1 : 0);
-                                }
-                            }
-#endif
                         }
 
                         if (execute_ret != 0) {
@@ -1551,13 +1513,15 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
 
     if (deferred_out0) {
         *deferred_out0 = out;
-        if (frame_id > 0 && frame_id % 30 == 0) {
+        if (frame_id > 0) {
             const double gpu_stage_wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - frame_start).count();
-            LOGI("GPU_FULL_FRAME_SUBMITTED frame=%lld imageTs=%lld out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
+            LOGI("GPU_FULL_FRAME_SUBMITTED frame=%lld imageTs=%lld input_size=%dx%d parser_expected_anchors=%zu "
+                 "out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d "
                  "preprocess_record=%.3fms preprocess_wait=%.3fms infer_record=%.3fms submit_wall=%.3fms infer_record_submit_wall=%.3fms "
                  "gpu_record_submit_wall=%.3fms allocator_acquire=%.3fms cache_lookup=%.3fms cache_hit=%d",
                  (long long)frame_id, (long long)image_timestamp_ns,
+                 model_input_size, model_input_size, grid_strides.size(),
                  out.dims, out.w, out.h, out.d, out.c, out.elemsize, out.elempack,
                  preprocess_record_ms, preprocess_wait_ms, infer_record_ms, final_submit_wait_ms, infer_extract_ms,
                  gpu_stage_wall_ms, allocator_acquire_ms, cache_lookup_ms, cache_hit ? 1 : 0);
@@ -1700,31 +1664,6 @@ int Yolo11::gpu_wait_frame(int slot_index)
         return wait_ret;
     }
 
-#if NCNN_BENCHMARK
-    if (execution.timestamp_queries_ready && !net.layers().empty()) {
-        std::vector<uint64_t> query_results(net.layers().size() * 2, 0);
-        const int query_ret = execution.command->get_query_pool_results(
-            0, static_cast<uint32_t>(query_results.size()), query_results);
-        if (query_ret < 0) {
-            LOGE("[NCNN_BENCHMARK] timestamp_queries=READ_FAILED ret=%d", query_ret);
-        } else {
-            size_t available_pairs = 0;
-            for (size_t i = 0; i < net.layers().size(); ++i) {
-                const uint64_t q_start = query_results[i * 2];
-                const uint64_t q_end = query_results[i * 2 + 1];
-                if (q_start == 0 || q_end == 0 || q_end < q_start) continue;
-                ++available_pairs;
-                const double duration_us =
-                    (q_end - q_start) * vkdev->info.timestamp_period() / 1000.0;
-                LOGI("[NCNN_BENCHMARK_GPU] idx=%zu type=%-16s name=%-30s duration=%.2lfus",
-                     i, net.layers()[i]->type.c_str(),
-                     net.layers()[i]->name.c_str(), duration_us);
-            }
-            LOGI("[NCNN_BENCHMARK] timestamp_queries=READ_OK available_layer_pairs=%zu total_layers=%zu partial=%d",
-                 available_pairs, net.layers().size(), query_ret == 1 ? 1 : 0);
-        }
-    }
-#endif
 
     ncnn::VkAllocator* blob_allocator = execution.blob_allocator;
     ncnn::VkAllocator* staging_allocator = execution.staging_allocator;
@@ -2165,8 +2104,12 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
 
     const int cls_count = out_flat.w - 64;
     if (cls_count != num_classes || total_anchors != static_cast<int>(grid_strides.size())) {
-        LOGE("Unexpected YOLO output layout model_input_size=%d: features=%d expected=%d anchors=%d expected=%zu",
-             model_input_size, out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
+        LOGE("PARSER_SHAPE_MISMATCH input_size=%dx%d raw_out=%d:%d,%d,%d,%d pack=%d normalized_out=%d:%d,%d,%d,%d "
+             "features=%d expected_features=%d anchors=%d expected_anchors=%zu",
+             model_input_size, model_input_size,
+             out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c, out_blob.elempack,
+             scalar_blob->dims, scalar_blob->w, scalar_blob->h, scalar_blob->d, scalar_blob->c,
+             out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
         return;
     }
 
