@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicIntegerArray
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * ============================================================================
@@ -81,6 +82,8 @@ class MainActivity : AppCompatActivity() {
     private val isCameraRunning = AtomicBoolean(false)
     private val isProcessingFrame = AtomicBoolean(false)
     private val droppedBusyFrames = AtomicLong(0L)
+    // Successful Vulkan submissions whose fences have not completed yet.
+    private val gpuFramesAwaitingFence = AtomicInteger(0)
 
     private var frameSequence: Long = 0L
     private var fpsWindowStartMs: Long = 0L
@@ -518,6 +521,7 @@ class MainActivity : AppCompatActivity() {
         Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
             "callback_ns=$cameraCallbackNs queued_ns=$queuedAtNs " +
             "callback_to_queue_ms=${(queuedAtNs - cameraCallbackNs) / 1_000_000.0} " +
+            "model_input=${modelInputSize}x${modelInputSize} busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
             "camera=${image.width}x${image.height} tid=${android.os.Process.myTid()}")
 
         // CPU postprocessing is queued only after the GPU fence has completed.
@@ -609,7 +613,7 @@ class MainActivity : AppCompatActivity() {
                 Log.i(TAG, "ASYNC_GPU_SUBMIT_BEGIN frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
                     "start_ns=$gpuStageStartNs executor_queue_wait_ms=${(gpuStageStartNs - gpuTaskQueuedNs) / 1_000_000.0} " +
                     "frame_queue_wait_ms=${(gpuTaskQueuedNs - queuedAtNs) / 1_000_000.0} " +
-                    "tid=${android.os.Process.myTid()}")
+                    "gpu_inflight_before_submit=${gpuFramesAwaitingFence.get()} tid=${android.os.Process.myTid()}")
                 try {
                     val acquiredBuffer = image.hardwareBuffer
                     hwBuffer = acquiredBuffer
@@ -632,11 +636,16 @@ class MainActivity : AppCompatActivity() {
                     if (!deferImageRelease) releaseCameraImage()
                 }
 
+                val gpuInFlightAfterSubmit = if (fullGpuMode && gpuStageRet == 0) {
+                    gpuFramesAwaitingFence.incrementAndGet()
+                } else {
+                    gpuFramesAwaitingFence.get()
+                }
                 val gpuStageEndNs = SystemClock.elapsedRealtimeNanos()
                 val gpuStageWallMs = (gpuStageEndNs - gpuStageStartNs) / 1_000_000.0
                 Log.i(TAG, "ASYNC_GPU_SUBMIT_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
                     "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet " +
-                    "tid=${android.os.Process.myTid()}")
+                    "gpu_inflight_after_submit=$gpuInFlightAfterSubmit tid=${android.os.Process.myTid()}")
                 if (gpuStageRet != 0) {
                     Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
                     asyncSlotBusy.set(slot, 0)
@@ -649,7 +658,7 @@ class MainActivity : AppCompatActivity() {
                         val completionStartNs = SystemClock.elapsedRealtimeNanos()
                         Log.i(TAG, "ASYNC_GPU_WAIT_BEGIN frame=$frameId slot=$slot " +
                             "start_ns=$completionStartNs completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
-                            "tid=${android.os.Process.myTid()}")
+                            "gpu_inflight_before_wait=${gpuFramesAwaitingFence.get()} tid=${android.os.Process.myTid()}")
                         var waitRet = -1
                         try {
                             waitRet = yoloEngine.WaitGpuFrame(slot)
@@ -667,12 +676,17 @@ class MainActivity : AppCompatActivity() {
                                 Log.w(TAG, "Deferring Camera2 Image release until native teardown frame=$frameId slot=$slot ret=$waitRet")
                             }
                         }
+                        val gpuInFlightAfterWait = if (waitRet == 0 || waitRet == -58) {
+                            gpuFramesAwaitingFence.decrementAndGet()
+                        } else {
+                            gpuFramesAwaitingFence.get()
+                        }
                         val completionEndNs = SystemClock.elapsedRealtimeNanos()
                         val completionWallMs = (completionEndNs - completionStartNs) / 1_000_000.0
                         Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot " +
                             "start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs " +
                             "completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
-                            "ret=$waitRet tid=${android.os.Process.myTid()}")
+                            "gpu_inflight_after_wait=$gpuInFlightAfterWait ret=$waitRet tid=${android.os.Process.myTid()}")
                         if (waitRet != 0) {
                             Log.e(TAG, "GPU fence completion failed frame=$frameId slot=$slot ret=$waitRet; slot retained")
                             isYoloReady.set(false)
