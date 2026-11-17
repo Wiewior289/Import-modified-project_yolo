@@ -1456,7 +1456,27 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                 execute_ret=-13;
                             }
                             if (execute_ret == 0) {
-                                inference_cmd.record_download(out_gpu,out,opt);
+                                if (frame_id > 0 && frame_id % 30 == 0) {
+                                    log_vkmat("out0_gpu_before_readback", out_gpu, frame_id, image_timestamp_ns);
+                                    const size_t scalar_bytes = out_gpu.elempack > 0
+                                        ? out_gpu.elemsize / static_cast<size_t>(out_gpu.elempack) : 0;
+                                    LOGI("OUT0_READBACK_SOURCE frame=%lld scalar_bytes=%zu payload_bytes=%zu "
+                                         "pack=%d vk_device_type=%d fp16_storage=%d fp16_packed=%d",
+                                         (long long)frame_id, scalar_bytes,
+                                         out_gpu.total() * out_gpu.elemsize, out_gpu.elempack,
+                                         vkdev->info.type(), opt.use_fp16_storage ? 1 : 0,
+                                         opt.use_fp16_packed ? 1 : 0);
+                                }
+
+                                // Preserve the model's native output scalar type on the CPU.
+                                // On Mali, record_download() otherwise expands FP16 to FP32,
+                                // doubling readback traffic and allocating a second full tensor.
+                                // Packing is retained; the DFL parser reads NCNN's 2D packed
+                                // anchor layout directly without a CPU unpack copy.
+                                ncnn::Option download_opt = opt;
+                                download_opt.use_fp16_storage = false;
+                                download_opt.use_fp16_packed = false;
+                                inference_cmd.record_download(out_gpu, out, download_opt);
                                 t=std::chrono::steady_clock::now();
                                 execute_ret = async_submit ? inference_cmd.submit() : inference_cmd.submit_and_wait();
                                 final_submit_wait_ms=std::chrono::duration<double,std::milli>(
@@ -2043,13 +2063,21 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         return;
     }
 
-    // NCNN may keep a 2D output packed along its height dimension.
-    // For example, 320x320 has 2,100 anchors, so pack4 is represented as
-    // h=525, elempack=4. The DFL parser consumes one scalar feature row per
-    // anchor and therefore must see pack1 before reading rows or validating h.
+    // NCNN dims=2 packing stores consecutive anchor rows in elempack lanes.
+    // Directly address that layout to avoid materializing a full pack4 -> pack1
+    // CPU tensor before DFL. This path also reads FP16 output without expanding
+    // the complete tensor to FP32.
+    const size_t raw_scalar_bytes = out_blob.elempack > 0
+        ? out_blob.elemsize / static_cast<size_t>(out_blob.elempack) : 0;
+    const bool direct_2d = out_blob.dims == 2 &&
+                           out_blob.elempack > 0 &&
+                           out_blob.elemsize % static_cast<size_t>(out_blob.elempack) == 0 &&
+                           (raw_scalar_bytes == 2 || raw_scalar_bytes == 4) &&
+                           out_blob.w >= 68;
+
     ncnn::Mat unpacked_blob;
     const ncnn::Mat* scalar_blob = &out_blob;
-    if (out_blob.elempack != 1) {
+    if (!direct_2d && out_blob.elempack != 1) {
         ncnn::Option unpack_opt = net.opt;
         unpack_opt.use_vulkan_compute = false;
         unpack_opt.use_fp16_storage = false;
@@ -2063,24 +2091,12 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
             return;
         }
         scalar_blob = &unpacked_blob;
-
-        LOGI("YOLO_OUTPUT_PACK_NORMALIZED model_input=%dx%d raw_dims=%d raw_shape=%d,%d,%d,%d raw_elemsize=%zu raw_pack=%d "
-             "normalized_dims=%d normalized_shape=%d,%d,%d,%d normalized_elemsize=%zu normalized_pack=%d",
-             model_input_size, model_input_size,
-             out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c,
-             out_blob.elemsize, out_blob.elempack,
-             unpacked_blob.dims, unpacked_blob.w, unpacked_blob.h, unpacked_blob.d, unpacked_blob.c,
-             unpacked_blob.elemsize, unpacked_blob.elempack);
-    }
-
-    if (scalar_blob->elemsize != sizeof(float)) {
-        LOGE("Unsupported YOLO output scalar type: elemsize=%zu elempack=%d; parser requires FP32",
-             scalar_blob->elemsize, scalar_blob->elempack);
-        return;
     }
 
     ncnn::Mat out_flat;
-    if (scalar_blob->dims == 3) {
+    if (direct_2d) {
+        out_flat = out_blob;
+    } else if (scalar_blob->dims == 3) {
         if (scalar_blob->c == 1) out_flat = scalar_blob->reshape(scalar_blob->w, scalar_blob->h);
         else if (scalar_blob->w == 1) out_flat = scalar_blob->reshape(scalar_blob->h, scalar_blob->c);
         else out_flat = scalar_blob->reshape(scalar_blob->w * scalar_blob->h, scalar_blob->c);
@@ -2088,26 +2104,68 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         out_flat = *scalar_blob;
     }
 
-    if (out_flat.w > out_flat.h && out_flat.h >= 68) {
+    if (!direct_2d && out_flat.w > out_flat.h && out_flat.h >= 68) {
         ncnn::Mat out_t;
-        out_t.create(out_flat.h, out_flat.w, (size_t)4u);
+        out_t.create(out_flat.h, out_flat.w, out_flat.elemsize);
         for (int r = 0; r < out_flat.h; r++) {
-            const float* src_row = out_flat.row(r);
+            const unsigned char* src_row = reinterpret_cast<const unsigned char*>(out_flat.row(r));
             for (int c = 0; c < out_flat.w; c++) {
-                out_t.row(c)[r] = src_row[c];
+                unsigned char* dst = reinterpret_cast<unsigned char*>(out_t.row(c)) +
+                                     static_cast<size_t>(r) * out_flat.elemsize;
+                const unsigned char* src = src_row + static_cast<size_t>(c) * out_flat.elemsize;
+                std::memcpy(dst, src, out_flat.elemsize);
             }
         }
         out_flat = out_t;
     }
 
-    const int total_anchors = out_flat.h;
+    const size_t scalar_bytes = direct_2d ? raw_scalar_bytes :
+        (out_flat.elempack > 0 ? out_flat.elemsize / static_cast<size_t>(out_flat.elempack) : 0);
+    if (!direct_2d && out_flat.elempack != 1) {
+        LOGE("Unsupported YOLO output packing after normalization: pack=%d", out_flat.elempack);
+        return;
+    }
+    if (scalar_bytes != 2 && scalar_bytes != 4) {
+        LOGE("Unsupported YOLO output scalar type: scalar_bytes=%zu elemsize=%zu elempack=%d; expected FP16/FP32",
+             scalar_bytes, out_flat.elemsize, out_flat.elempack);
+        return;
+    }
+
+    const int feature_count = direct_2d ? out_blob.w : out_flat.w;
+    const int total_anchors = direct_2d ? out_blob.h * out_blob.elempack : out_flat.h;
+    const auto read_scalar = [scalar_bytes](const unsigned char* ptr) -> float {
+        if (scalar_bytes == 4) {
+            float value;
+            std::memcpy(&value, ptr, sizeof(value));
+            return value;
+        }
+        uint16_t half;
+        std::memcpy(&half, ptr, sizeof(half));
+        return half_to_float(half);
+    };
+    const auto read_feature = [&](int anchor, int feature) -> float {
+        const unsigned char* ptr = nullptr;
+        if (direct_2d) {
+            const size_t pack = static_cast<size_t>(out_blob.elempack);
+            const size_t packed_anchor = static_cast<size_t>(anchor) / pack;
+            const size_t lane = static_cast<size_t>(anchor) % pack;
+            ptr = static_cast<const unsigned char*>(out_blob.data) +
+                  packed_anchor * static_cast<size_t>(out_blob.w) * out_blob.elemsize +
+                  static_cast<size_t>(feature) * out_blob.elemsize +
+                  lane * scalar_bytes;
+        } else {
+            ptr = reinterpret_cast<const unsigned char*>(out_flat.row(anchor)) +
+                  static_cast<size_t>(feature) * scalar_bytes;
+        }
+        return read_scalar(ptr);
+    };
     size_t expected_anchors = 0;
     const int parser_strides[3] = {8, 16, 32};
     for (int stride : parser_strides) {
         const size_t side = static_cast<size_t>(model_input_size / stride);
         expected_anchors += side * side;
     }
-    const int cls_count = out_flat.w - 64;
+    const int cls_count = feature_count - 64;
     const bool grid_ok = grid_strides.size() == expected_anchors;
     const bool features_ok = cls_count == num_classes;
     const bool anchors_ok = total_anchors == static_cast<int>(expected_anchors) &&
@@ -2128,14 +2186,13 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
     }
 
     for (int i = 0; i < total_anchors; i++) {
-        const float* feat_ptr = out_flat.row(i);
-        const float* cls_ptr = feat_ptr + 64;
+        // Read scalar output elements lazily; FP16 values are converted only when used.
 
         int best_class_id = -1;
         float best_score = -1.0f;
 
         for (int c = 0; c < cls_count; c++) {
-            float logit = cls_ptr[c];
+            float logit = read_feature(i, 64 + c);
             if (!std::isfinite(logit)) continue;
             float score = 1.0f / (1.0f + std::exp(-logit));
             if (score > best_score) {
@@ -2156,19 +2213,18 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         float pred_ltrb[4];
         bool valid_dfl = true;
         for (int k = 0; k < 4; k++) {
-            const float* dfl_reg = feat_ptr + (k * REG_MAX);
-
-            float max_val = dfl_reg[0];
+            float max_val = read_feature(i, k * REG_MAX);
             if (!std::isfinite(max_val)) { valid_dfl = false; break; }
             for (int j = 1; j < REG_MAX; j++) {
-                if (!std::isfinite(dfl_reg[j])) { valid_dfl = false; break; }
-                if (dfl_reg[j] > max_val) max_val = dfl_reg[j];
+                const float value = read_feature(i, k * REG_MAX + j);
+                if (!std::isfinite(value)) { valid_dfl = false; break; }
+                if (value > max_val) max_val = value;
             }
             if (!valid_dfl) break;
 
             float sum_exp = 0.0f;
             for (int j = 0; j < REG_MAX; j++) {
-                dfl_distribution_scratchpad[j] = std::exp(dfl_reg[j] - max_val);
+                dfl_distribution_scratchpad[j] = std::exp(read_feature(i, k * REG_MAX + j) - max_val);
                 sum_exp += dfl_distribution_scratchpad[j];
             }
 
