@@ -24,6 +24,7 @@ index 49ca3e9..a8b0d10 100644
 +    bool async_submit;
 +    bool submitted;
 +    bool needs_reset;
++    unsigned long long async_submission_id;
 @@ -195,3 +199,6 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
      compute_command_fence = 0;
  
@@ -31,6 +32,7 @@ index 49ca3e9..a8b0d10 100644
 +    async_submit = false;
 +    submitted = false;
 +    needs_reset = false;
++    async_submission_id = 0;
 @@ -208,2 +215,13 @@ VkComputePrivate::~VkComputePrivate()
  {
 +    // Safety net only. Correct callers must use wait() so deferred readbacks
@@ -59,6 +61,7 @@ index 49ca3e9..a8b0d10 100644
 +    {
 +        d->submitted = true;
 +        d->needs_reset = true;
++        d->async_submission_id = sync_id;
 +        NCNN_LOGE("[NCNN_VK_ASYNC_SUBMIT] seq=%llu pending_dispatches=%llu delayed_records=%zu "
 +                  "download_buffers=%zu delayed_record_replay_ms=%.3f command_buffer_end_ms=%.3f "
 +                  "queue_acquire_ms=%.3f queue_submit_ms=%.3f",
@@ -102,8 +105,8 @@ index 49ca3e9..a8b0d10 100644
 +               static_cast<unsigned long long>(ts.tv_nsec);
 +    };
 +    const unsigned long long fence_start_ns = boottime_ns();
-+    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_BEGIN] frame=%llu start_ns=%llu",
-+              frame_id, fence_start_ns);
++    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_BEGIN] frame=%llu submit_seq=%llu start_ns=%llu",
++              frame_id, d->async_submission_id, fence_start_ns);
 +    VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence,
 +                                   VK_TRUE, (uint64_t)-1);
 +    const unsigned long long fence_end_ns = boottime_ns();
@@ -118,6 +121,14 @@ index 49ca3e9..a8b0d10 100644
 +        return -1;
 +    }
 +    const auto post_start = async_clock::now();
++    double invalidate_cpu_ms = 0.0;
++    double memcpy_cpu_ms = 0.0;
++    double fp16_cast_cpu_ms = 0.0;
++    double bf16_cast_cpu_ms = 0.0;
++    size_t post_download_records = 0;
++    size_t post_fp16_cast_records = 0;
++    size_t post_bf16_cast_records = 0;
++    size_t readback_bytes = 0;
 +    for (size_t i = 0; i < d->delayed_records.size(); i++)
 +    {
 +        const VkComputePrivate::record& r = d->delayed_records[i];
@@ -125,35 +136,52 @@ index 49ca3e9..a8b0d10 100644
 +        {
 +        case VkComputePrivate::record::TYPE_post_download:
 +        {
++            post_download_records++;
 +            const VkMat& src = d->download_post_buffers[r.post_download.download_post_buffer_mat_offset];
 +            Mat& dst = d->download_post_mats_fp16[r.post_download.download_post_mat_fp16_offset];
++            const auto invalidate_start = async_clock::now();
 +            src.allocator->invalidate(src.data);
++            invalidate_cpu_ms += std::chrono::duration<double, std::milli>(
++                async_clock::now() - invalidate_start).count();
++            const auto memcpy_start = async_clock::now();
 +            for (int b = 0; b < dst.n; b++)
 +            {
 +                const VkMat src_b = src.batch(b);
 +                Mat dst_b = dst.batch(b);
-+                memcpy(dst_b.data, src_b.mapped_ptr(), dst_b.total() * dst_b.elemsize);
++                const size_t bytes = dst_b.total() * dst_b.elemsize;
++                memcpy(dst_b.data, src_b.mapped_ptr(), bytes);
++                readback_bytes += bytes;
 +            }
++            memcpy_cpu_ms += std::chrono::duration<double, std::milli>(
++                async_clock::now() - memcpy_start).count();
 +            break;
 +        }
 +        case VkComputePrivate::record::TYPE_post_cast_float16_to_float32:
 +        {
++            post_fp16_cast_records++;
 +            const Mat& src = d->download_post_mats_fp16[r.post_cast_float16_to_float32.download_post_mat_fp16_offset];
 +            Mat& dst = d->download_post_mats[r.post_cast_float16_to_float32.download_post_mat_offset];
 +            Option opt;
 +            opt.num_threads = r.post_cast_float16_to_float32.num_threads;
 +            opt.blob_allocator = dst.allocator;
++            const auto cast_start = async_clock::now();
 +            ncnn::cast_float16_to_float32(src, dst, opt);
++            fp16_cast_cpu_ms += std::chrono::duration<double, std::milli>(
++                async_clock::now() - cast_start).count();
 +            break;
 +        }
 +        case VkComputePrivate::record::TYPE_post_cast_bfloat16_to_float32:
 +        {
++            post_bf16_cast_records++;
 +            const Mat& src = d->download_post_mats_fp16[r.post_cast_bfloat16_to_float32.download_post_mat_bf16_offset];
 +            Mat& dst = d->download_post_mats[r.post_cast_bfloat16_to_float32.download_post_mat_offset];
 +            Option opt;
 +            opt.num_threads = r.post_cast_bfloat16_to_float32.num_threads;
 +            opt.blob_allocator = dst.allocator;
++            const auto cast_start = async_clock::now();
 +            ncnn::cast_bfloat16_to_float32(src, dst, opt);
++            bf16_cast_cpu_ms += std::chrono::duration<double, std::milli>(
++                async_clock::now() - cast_start).count();
 +            break;
 +        }
 +        default:
@@ -167,8 +195,15 @@ index 49ca3e9..a8b0d10 100644
 +    d->submitted = false;
 +    const double total_wall_ms = std::chrono::duration<double, std::milli>(
 +        async_clock::now() - wait_start).count();
-+    NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] result=OK fence_wait_wall_ms=%.3f post_download_cpu_ms=%.3f total_wall_ms=%.3f",
-+              fence_wait_wall_ms, post_download_cpu_ms, total_wall_ms);
++    NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] frame=%llu submit_seq=%llu result=OK "
++              "fence_wait_wall_ms=%.3f post_download_cpu_ms=%.3f "
++              "invalidate_cpu_ms=%.3f memcpy_cpu_ms=%.3f fp16_cast_cpu_ms=%.3f bf16_cast_cpu_ms=%.3f "
++              "download_records=%zu fp16_cast_records=%zu bf16_cast_records=%zu readback_bytes=%zu total_wall_ms=%.3f",
++              frame_id, d->async_submission_id, fence_wait_wall_ms, post_download_cpu_ms,
++              invalidate_cpu_ms, memcpy_cpu_ms, fp16_cast_cpu_ms, bf16_cast_cpu_ms,
++              post_download_records, post_fp16_cast_records, post_bf16_cast_records,
++              readback_bytes, total_wall_ms);
++    d->async_submission_id = 0;
 +    return 0;
 +}
 +
