@@ -17,15 +17,15 @@ diff --git a/src/command.cpp b/src/command.cpp
 index 49ca3e9..a8b0d10 100644
 --- a/src/command.cpp
 +++ b/src/command.cpp
-@@ -4,1 +4,2 @@
+@@ -4 +4,2 @@
  #include "command.h"
 +#include <time.h>
-@@ -186,0 +188,3 @@
+@@ -186,0 +188,4 @@
 +    bool async_submit;
 +    bool submitted;
 +    bool needs_reset;
 +    unsigned long long async_submission_id;
-@@ -195,3 +199,6 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
+@@ -195,3 +199,7 @@ VkComputePrivate::VkComputePrivate(const VulkanDevice* _vkdev)
      compute_command_fence = 0;
  
      pending_dispatch_total = 0;
@@ -53,7 +53,7 @@ index 49ca3e9..a8b0d10 100644
 +        return -1;
 +
      using sync_clock = std::chrono::steady_clock;
-@@ -1999,5 +2018,19 @@ int VkCompute::submit_and_wait()
+@@ -1999,5 +2018,20 @@ int VkCompute::submit_and_wait()
  
      vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
  
@@ -74,7 +74,7 @@ index 49ca3e9..a8b0d10 100644
 +
      // wait
      {
-@@ -2041,5 +2072,107 @@ int VkCompute::submit_and_wait()
+@@ -2041,5 +2072,139 @@ int VkCompute::submit_and_wait()
      return 0;
  }
  
@@ -214,7 +214,7 @@ index 49ca3e9..a8b0d10 100644
 +        NCNN_LOGE("[NCNN_VK_ASYNC] reset rejected while GPU work is pending");
 +        return -1;
 +    }
-@@ -2167,0 +2182,1 @@
+@@ -2167,0 +2182 @@
 +    d->needs_reset = false;
 diff --git a/src/option.h b/src/option.h
 index 49ca3e9..af6d4f1 100644
