@@ -74,7 +74,7 @@ index 49ca3e9..a8b0d10 100644
 +
      // wait
      {
-@@ -2041,5 +2072,139 @@ int VkCompute::submit_and_wait()
+@@ -2041,5 +2072,147 @@ int VkCompute::submit_and_wait()
      return 0;
  }
  
@@ -105,16 +105,25 @@ index 49ca3e9..a8b0d10 100644
 +               static_cast<unsigned long long>(ts.tv_nsec);
 +    };
 +    const unsigned long long fence_start_ns = boottime_ns();
-+    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_BEGIN] frame=%llu submit_seq=%llu start_ns=%llu",
-+              frame_id, d->async_submission_id, fence_start_ns);
++    // Non-blocking snapshot: was this submission already complete when the
++    // single completion worker reached it, or is GPU work still outstanding?
++    const VkResult fence_status_at_wait_enter =
++        vkGetFenceStatus(vkdev->vkdevice(), d->compute_command_fence);
++    const int fence_ready_at_wait_enter =
++        fence_status_at_wait_enter == VK_SUCCESS ? 1 : 0;
++    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_BEGIN] frame=%llu submit_seq=%llu start_ns=%llu "
++              "fence_ready=%d fence_status=%d",
++              frame_id, d->async_submission_id, fence_start_ns,
++              fence_ready_at_wait_enter, fence_status_at_wait_enter);
 +    VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence,
 +                                   VK_TRUE, (uint64_t)-1);
 +    const unsigned long long fence_end_ns = boottime_ns();
 +    const double fence_wait_wall_ms = std::chrono::duration<double, std::milli>(
 +        async_clock::now() - fence_start).count();
 +    NCNN_LOGE("[NCNN_VK_FENCE_WAIT_END] frame=%llu start_ns=%llu end_ns=%llu "
-+              "wall_ms=%.3f vk_result=%d",
-+              frame_id, fence_start_ns, fence_end_ns, fence_wait_wall_ms, ret);
++              "wall_ms=%.3f vk_result=%d fence_ready_at_wait_enter=%d fence_status=%d",
++              frame_id, fence_start_ns, fence_end_ns, fence_wait_wall_ms, ret,
++              fence_ready_at_wait_enter, fence_status_at_wait_enter);
 +    if (ret != VK_SUCCESS)
 +    {
 +        NCNN_LOGE("[NCNN_VK_ASYNC_WAIT] vkWaitForFences failed %d", ret);
@@ -214,7 +223,7 @@ index 49ca3e9..a8b0d10 100644
 +        NCNN_LOGE("[NCNN_VK_ASYNC] reset rejected while GPU work is pending");
 +        return -1;
 +    }
-@@ -2167,0 +2182 @@
+@@ -2167,0 +2190 @@
 +    d->needs_reset = false;
 diff --git a/src/option.h b/src/option.h
 index 49ca3e9..af6d4f1 100644
