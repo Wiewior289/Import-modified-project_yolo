@@ -1474,8 +1474,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                 // Packing is retained; the DFL parser reads NCNN's 2D packed
                                 // anchor layout directly without a CPU unpack copy.
                                 ncnn::Option download_opt = opt;
-                                download_opt.use_fp16_storage = false;
-                                download_opt.use_fp16_packed = false;
+                                if (async_submit) {
+                                    download_opt.use_fp16_storage = false;
+                                    download_opt.use_fp16_packed = false;
+                                }
                                 inference_cmd.record_download(out_gpu, out, download_opt);
                                 t=std::chrono::steady_clock::now();
                                 execute_ret = async_submit ? inference_cmd.submit() : inference_cmd.submit_and_wait();
@@ -2073,7 +2075,7 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
                            out_blob.elempack > 0 &&
                            out_blob.elemsize % static_cast<size_t>(out_blob.elempack) == 0 &&
                            (raw_scalar_bytes == 2 || raw_scalar_bytes == 4) &&
-                           out_blob.w >= 68;
+                           out_blob.w == (64 + num_classes);
 
     ncnn::Mat unpacked_blob;
     const ncnn::Mat* scalar_blob = &out_blob;
