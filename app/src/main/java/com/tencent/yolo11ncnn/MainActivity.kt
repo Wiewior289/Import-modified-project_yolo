@@ -240,6 +240,15 @@ class MainActivity : AppCompatActivity() {
     private fun switchModelType(newModelType: Int) {
         if (!selectableModelTypes.contains(newModelType) || newModelType == selectedModelType) return
         val previousMode = selectedComputeMode
+        val requestNs = SystemClock.elapsedRealtimeNanos()
+        val requestGeneration = modeGeneration + 1L
+        Log.i(TAG, "MODEL_CONFIG_REQUEST generation=" + requestGeneration +
+            " reason=MODEL_SWITCH request_ns=" + requestNs +
+            " old_model=" + modelLabel(selectedModelType) +
+            " new_model=" + modelLabel(newModelType) +
+            " input=" + modelInputSize + "x" + modelInputSize +
+            " backend=" + computeModeLabel(previousMode) +
+            " tid=" + android.os.Process.myTid())
         selectedModelType = newModelType
         reinitializePipeline("MODEL_SWITCH", previousMode)
     }
@@ -249,6 +258,15 @@ class MainActivity : AppCompatActivity() {
             (newSize - MODEL_INPUT_SIZE_MIN) % MODEL_INPUT_SIZE_STEP != 0 ||
             newSize == modelInputSize) return
         val previousMode = selectedComputeMode
+        val requestNs = SystemClock.elapsedRealtimeNanos()
+        val requestGeneration = modeGeneration + 1L
+        Log.i(TAG, "MODEL_CONFIG_REQUEST generation=" + requestGeneration +
+            " reason=INPUT_SIZE_SWITCH request_ns=" + requestNs +
+            " model=" + modelLabel(selectedModelType) +
+            " old_input=" + modelInputSize + "x" + modelInputSize +
+            " new_input=" + newSize + "x" + newSize +
+            " backend=" + computeModeLabel(previousMode) +
+            " tid=" + android.os.Process.myTid())
         modelInputSize = newSize
         reinitializePipeline("INPUT_SIZE_SWITCH", previousMode)
     }
