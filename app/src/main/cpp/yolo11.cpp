@@ -1641,6 +1641,7 @@ int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type
     slot.state = AsyncFrameSlot::GPU_RUNNING;
     slot.frame_id = frame_id;
     slot.image_timestamp_ns = image_timestamp_ns;
+    slot.submit_done_steady_ns = 0;
     slot.out0.release();
     for (auto& boundary : slot.boundary) boundary.release();
 
@@ -1657,10 +1658,14 @@ int Yolo11::gpu_full_frame(int slot_index, AHardwareBuffer* ahb, int rotate_type
         return ret != 0 ? ret : -54;
     }
 
+    slot.submit_done_steady_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     slot.state = AsyncFrameSlot::GPU_SUBMITTED;
     if (frame_id > 0) {
-        LOGI("GPU_FULL_SLOT_SUBMITTED frame=%lld slot=%d imageTs=%lld",
-             (long long)frame_id, slot_index, (long long)image_timestamp_ns);
+        LOGI("GPU_FULL_SLOT_SUBMITTED frame=%lld slot=%d imageTs=%lld submit_done_steady_ns=%llu",
+             (long long)frame_id, slot_index, (long long)image_timestamp_ns,
+             (unsigned long long)slot.submit_done_steady_ns);
     }
     return 0;
 }
@@ -1679,6 +1684,20 @@ int Yolo11::gpu_wait_frame(int slot_index)
     const int64_t frame_id = slot.frame_id;
     const int64_t image_timestamp_ns = slot.image_timestamp_ns;
     const auto wait_start = std::chrono::steady_clock::now();
+    const uint64_t wait_begin_steady_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            wait_start.time_since_epoch()).count());
+    const double submit_to_wait_begin_ms = slot.submit_done_steady_ns > 0 &&
+        wait_begin_steady_ns >= slot.submit_done_steady_ns
+        ? static_cast<double>(wait_begin_steady_ns - slot.submit_done_steady_ns) / 1000000.0
+        : -1.0;
+    if (frame_id > 0) {
+        LOGI("GPU_WAIT_SCHEDULING frame=%lld slot=%d submit_done_steady_ns=%llu wait_begin_steady_ns=%llu "
+             "submit_to_wait_begin_ms=%.3f",
+             (long long)frame_id, slot_index,
+             (unsigned long long)slot.submit_done_steady_ns,
+             (unsigned long long)wait_begin_steady_ns, submit_to_wait_begin_ms);
+    }
     const int wait_ret = execution.command->wait(static_cast<unsigned long long>(frame_id));
     const double wait_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - wait_start).count();
