@@ -207,7 +207,8 @@ private:
         std::unique_ptr<AsyncGpuExecution> gpu_execution;
         int64_t frame_id;
         int64_t image_timestamp_ns;
-        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0) {}
+        uint64_t submit_done_steady_ns;
+        AsyncFrameSlot() : state(FREE), frame_id(0), image_timestamp_ns(0), submit_done_steady_ns(0) {}
     };
     std::array<AsyncFrameSlot, 2> async_slots;
 
