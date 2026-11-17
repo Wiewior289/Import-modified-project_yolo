@@ -776,6 +776,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size
     }
     LOGI("MODEL_INPUT_CONTRACT model_input_size=%dx%d parser_strides=8,16,32 anchors=%zu features=%d",
          model_input_size, model_input_size, total_anchors, 64 + num_classes);
+    LOGI("MODEL_CONFIG_READY model=yolo11%s input=%dx%d grid_anchors=%zu output_features=%d output_xywh=normalized_by_model_input",
+         modeltype, model_input_size, model_input_size, total_anchors, 64 + num_classes);
     proposal_scratchpad.reserve(total_anchors);
     candidates_scratchpad.reserve(256);
     nms_indices_scratchpad.reserve(256);
@@ -1704,9 +1706,13 @@ int Yolo11::gpu_wait_frame(int slot_index)
 
     slot.state = AsyncFrameSlot::CPU_READY;
     if (frame_id > 0) {
-        LOGI("GPU_FENCE_COMPLETE frame=%lld slot=%d imageTs=%lld wait_wall=%.3fms out0_bytes=%zu",
+        LOGI("GPU_FENCE_COMPLETE frame=%lld slot=%d imageTs=%lld wait_wall=%.3fms out0_bytes=%zu "
+             "out0_dims=%d shape=%d,%d,%d,%d elemsize=%zu pack=%d model_input=%dx%d parser_grid_anchors=%zu",
              (long long)frame_id, slot_index, (long long)image_timestamp_ns,
-             wait_wall_ms, slot.out0.total() * slot.out0.elemsize);
+             wait_wall_ms, slot.out0.total() * slot.out0.elemsize,
+             slot.out0.dims, slot.out0.w, slot.out0.h, slot.out0.d, slot.out0.c,
+             slot.out0.elemsize, slot.out0.elempack,
+             model_input_size, model_input_size, grid_strides.size());
     }
     return 0;
 }
@@ -1747,11 +1753,11 @@ int Yolo11::cpu_postprocess_frame(int slot_index, float conf_thresh, float nms_t
     const double nms_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - nms_start).count();
 
-    if (frame_id > 0 && frame_id % 30 == 0) {
-        log_tensor_stats("async_full_gpu_out0", out, frame_id, image_timestamp_ns);
-        LOGI("CPU_POSTPROCESS_DONE frame=%lld slot=%d dfl_ms=%.3f nms_ms=%.3f post_total_ms=%.3f "
+    if (frame_id > 0) {
+        LOGI("CPU_POSTPROCESS_DONE frame=%lld slot=%d model_input=%dx%d dfl_ms=%.3f nms_ms=%.3f post_total_ms=%.3f "
              "detections=%zu top=%.4f class=%d",
-             (long long)frame_id, slot_index, dfl_ms, nms_ms, dfl_ms + nms_ms,
+             (long long)frame_id, slot_index, model_input_size, model_input_size,
+             dfl_ms, nms_ms, dfl_ms + nms_ms,
              objects.size(), last_top_score, last_top_class);
     }
 
@@ -2058,14 +2064,13 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         }
         scalar_blob = &unpacked_blob;
 
-        static std::atomic<bool> pack_normalization_logged(false);
-        if (!pack_normalization_logged.exchange(true)) {
-            LOGI("YOLO_OUTPUT_PACK_NORMALIZED model_input_size=%d raw_dims=%d raw_shape=%d,%d,%d,%d raw_elemsize=%zu raw_pack=%d normalized_dims=%d normalized_shape=%d,%d,%d,%d normalized_elemsize=%zu normalized_pack=%d",
-                 model_input_size, out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c,
-                 out_blob.elemsize, out_blob.elempack,
-                 unpacked_blob.dims, unpacked_blob.w, unpacked_blob.h, unpacked_blob.d, unpacked_blob.c,
-                 unpacked_blob.elemsize, unpacked_blob.elempack);
-        }
+        LOGI("YOLO_OUTPUT_PACK_NORMALIZED model_input=%dx%d raw_dims=%d raw_shape=%d,%d,%d,%d raw_elemsize=%zu raw_pack=%d "
+             "normalized_dims=%d normalized_shape=%d,%d,%d,%d normalized_elemsize=%zu normalized_pack=%d",
+             model_input_size, model_input_size,
+             out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c,
+             out_blob.elemsize, out_blob.elempack,
+             unpacked_blob.dims, unpacked_blob.w, unpacked_blob.h, unpacked_blob.d, unpacked_blob.c,
+             unpacked_blob.elemsize, unpacked_blob.elempack);
     }
 
     if (scalar_blob->elemsize != sizeof(float)) {
@@ -2096,20 +2101,29 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
     }
 
     const int total_anchors = out_flat.h;
-    if (total_anchors <= 0 || out_flat.w < 68) {
-        LOGW("decode_dfl_and_filter: invalid shape out_flat(w=%d, h=%d, dims=%d)",
-             out_flat.w, out_flat.h, out_flat.dims);
-        return;
+    size_t expected_anchors = 0;
+    const int parser_strides[3] = {8, 16, 32};
+    for (int stride : parser_strides) {
+        const size_t side = static_cast<size_t>(model_input_size / stride);
+        expected_anchors += side * side;
     }
-
     const int cls_count = out_flat.w - 64;
-    if (cls_count != num_classes || total_anchors != static_cast<int>(grid_strides.size())) {
-        LOGE("PARSER_SHAPE_MISMATCH input_size=%dx%d raw_out=%d:%d,%d,%d,%d pack=%d normalized_out=%d:%d,%d,%d,%d "
-             "features=%d expected_features=%d anchors=%d expected_anchors=%zu",
-             model_input_size, model_input_size,
-             out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c, out_blob.elempack,
+    const bool grid_ok = grid_strides.size() == expected_anchors;
+    const bool features_ok = cls_count == num_classes;
+    const bool anchors_ok = total_anchors == static_cast<int>(expected_anchors) &&
+                            total_anchors == static_cast<int>(grid_strides.size());
+    if (total_anchors <= 0 || out_flat.w < 68 || !grid_ok || !features_ok || !anchors_ok) {
+        LOGE("PARSER_SHAPE_MISMATCH input_size=%dx%d grid=%zu expected_grid=%zu "
+             "raw_out=%d:%d,%d,%d,%d es=%zu pack=%d normalized_out=%d:%d,%d,%d,%d es=%zu pack=%d "
+             "flat=%dx%d features=%d expected_features=%d anchors=%d expected_anchors=%zu "
+             "grid_ok=%d features_ok=%d anchors_ok=%d",
+             model_input_size, model_input_size, grid_strides.size(), expected_anchors,
+             out_blob.dims, out_blob.w, out_blob.h, out_blob.d, out_blob.c,
+             out_blob.elemsize, out_blob.elempack,
              scalar_blob->dims, scalar_blob->w, scalar_blob->h, scalar_blob->d, scalar_blob->c,
-             out_flat.w, 64 + num_classes, total_anchors, grid_strides.size());
+             scalar_blob->elemsize, scalar_blob->elempack,
+             out_flat.w, out_flat.h, cls_count, num_classes, total_anchors, expected_anchors,
+             grid_ok ? 1 : 0, features_ok ? 1 : 0, anchors_ok ? 1 : 0);
         return;
     }
 
