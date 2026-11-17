@@ -1018,7 +1018,7 @@ class MainActivity : AppCompatActivity() {
                         session.setRepeatingRequest(captureRequestBuilder.build(),sensorTraceCallback,cameraHandler)
                         isCameraRunning.set(true)
                         Log.i(TAG, "CAMERA_STREAM_READY model_input=" + modelInputSize + "x" + modelInputSize +
-                            " camera_source=" + cameraSourceSize.width + "x" + cameraSourceSize.height +
+                            " camera_source=" + imageReader?.width + "x" + imageReader?.height +
                             " reader_max_images=3 generation=" + modeGeneration)
                         Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
                         telemetryServer.broadcastStatus("STREAMING", "Camera2 → " + computeModeLabel(selectedComputeMode) + "; wyniki modelu są odczytywane do CPU")
