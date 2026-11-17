@@ -268,6 +268,11 @@ class MainActivity : AppCompatActivity() {
 
         val configLabel = modelLabel(modelAtRequest) + " / " +
             modelInputSizeAtRequest + "x" + modelInputSizeAtRequest + " / " + computeModeLabel(computeModeAtRequest)
+        val configStartNs = SystemClock.elapsedRealtimeNanos()
+        Log.i(TAG, "MODEL_CONFIG_SWITCH generation=" + generation + " reason=" + reason +
+            " model=" + modelLabel(modelAtRequest) +
+            " input=" + modelInputSizeAtRequest + "x" + modelInputSizeAtRequest +
+            " backend=" + computeModeLabel(computeModeAtRequest) + " start_ns=" + configStartNs)
         telemetryServer.broadcastStatus("COMPUTE_MODE_SWITCH", reason + ": " + configLabel)
 
         val enqueueReinitialization = {
@@ -296,6 +301,12 @@ class MainActivity : AppCompatActivity() {
                     imageReader?.close()
                     imageReader = null
                     if (initialized) {
+                        val readyNs = SystemClock.elapsedRealtimeNanos()
+                        Log.i(TAG, "MODEL_CONFIG_READY generation=" + generation + " reason=" + reason +
+                            " model=" + modelLabel(modelAtRequest) +
+                            " input=" + modelInputSizeAtRequest + "x" + modelInputSizeAtRequest +
+                            " backend=" + computeModeLabel(computeModeAtRequest) +
+                            " start_ns=" + configStartNs + " ready_ns=" + readyNs + " init_ms=" + durationMs)
                         isYoloReady.set(true)
                         Log.i(TAG, configLabel + " gotowy w " + durationMs + "ms")
                         telemetryServer.broadcastStatus(
@@ -365,6 +376,11 @@ class MainActivity : AppCompatActivity() {
         val modelInputSizeAtStart = modelInputSize
         val generationAtStart = modeGeneration
         backgroundInitExecutor.execute {
+            val configStartNs = SystemClock.elapsedRealtimeNanos()
+            Log.i(TAG, "MODEL_CONFIG_LOAD_BEGIN generation=" + generationAtStart +
+                " model=" + modelLabel(modelAtStart) +
+                " input=" + modelInputSizeAtStart + "x" + modelInputSizeAtStart +
+                " backend=" + computeModeLabel(modeAtStart) + " start_ns=" + configStartNs)
             Log.i(TAG, "Ładowanie " + modelLabel(modelAtStart) + " input=" +
                 modelInputSizeAtStart + "x" + modelInputSizeAtStart + " backend=" +
                 computeModeLabel(modeAtStart) + " w tle...")
@@ -385,6 +401,12 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (generationAtStart != modeGeneration) return@runOnUiThread
                 if (initSuccess) {
+                    val readyNs = SystemClock.elapsedRealtimeNanos()
+                    Log.i(TAG, "MODEL_CONFIG_READY generation=" + generationAtStart +
+                        " model=" + modelLabel(modelAtStart) +
+                        " input=" + modelInputSizeAtStart + "x" + modelInputSizeAtStart +
+                        " backend=" + computeModeLabel(modeAtStart) +
+                        " start_ns=" + configStartNs + " ready_ns=" + readyNs + " init_ms=" + loadDuration)
                     Log.i(TAG, modelLabel(modelAtStart) + " input=" + modelInputSizeAtStart +
                         " backend=" + computeModeLabel(modeAtStart) + " Init sukces w " + loadDuration + "ms")
                     isYoloReady.set(true)
@@ -518,10 +540,14 @@ class MainActivity : AppCompatActivity() {
         }
 
         val queuedAtNs = SystemClock.elapsedRealtimeNanos()
+        val frameModel = modelLabel(selectedModelType)
+        val frameInputSize = modelInputSize
+        val frameGeneration = modeGeneration
         Log.i(TAG, "ASYNC_FRAME_QUEUED frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
             "callback_ns=$cameraCallbackNs queued_ns=$queuedAtNs " +
             "callback_to_queue_ms=${(queuedAtNs - cameraCallbackNs) / 1_000_000.0} " +
-            "model_input=${modelInputSize}x${modelInputSize} busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
+            "model=" + frameModel + " model_input=" + frameInputSize + "x" + frameInputSize +
+            " generation=" + frameGeneration + " busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
             "camera=${image.width}x${image.height} tid=${android.os.Process.myTid()}")
 
         // CPU postprocessing is queued only after the GPU fence has completed.
@@ -533,8 +559,9 @@ class MainActivity : AppCompatActivity() {
                     output.fill(0f)
                     var cpuStageRet = -1
                     val cpuStageStartNs = SystemClock.elapsedRealtimeNanos()
-                    Log.i(TAG, "ASYNC_CPU_STAGE_BEGIN frame=$frameId slot=$slot " +
-                        "start_ns=$cpuStageStartNs queue_wait_ms=${(cpuStageStartNs - cpuQueuedAtNs) / 1_000_000.0} " +
+                    Log.i(TAG, "ASYNC_CPU_STAGE_BEGIN frame=$frameId slot=$slot model=" + frameModel +
+                        " input=" + frameInputSize + "x" + frameInputSize + " generation=" + frameGeneration +
+                        " start_ns=$cpuStageStartNs queue_wait_ms=${(cpuStageStartNs - cpuQueuedAtNs) / 1_000_000.0} " +
                         "tid=${android.os.Process.myTid()}")
                     try {
                         cpuStageRet = if (fullGpuMode) {
@@ -549,7 +576,9 @@ class MainActivity : AppCompatActivity() {
                         val topScore = if (cpuStageRet >= 0) yoloEngine.GetTopScore() else 0f
                         val topClass = if (cpuStageRet >= 0) yoloEngine.GetTopClass() else -1
                         Log.i(TAG, "ASYNC_CPU_STAGE_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
-                            "start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs " +
+                            "model=" + frameModel + " input=" + frameInputSize + "x" + frameInputSize +
+                            " generation=" + frameGeneration +
+                            " start_ns=$cpuStageStartNs end_ns=$cpuStageEndNs wall_ms=$cpuStageWallMs " +
                             "queue_wait_ms=${(cpuStageStartNs - cpuQueuedAtNs) / 1_000_000.0} " +
                             "ret=$cpuStageRet detections=$count tid=${android.os.Process.myTid()}")
                         if (frameId % 30L == 0L) {
@@ -611,9 +640,12 @@ class MainActivity : AppCompatActivity() {
 
                 val gpuStageStartNs = SystemClock.elapsedRealtimeNanos()
                 Log.i(TAG, "ASYNC_GPU_SUBMIT_BEGIN frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                    "model=" + frameModel + " input=" + frameInputSize + "x" + frameInputSize +
+                    " generation=" + frameGeneration +
                     "start_ns=$gpuStageStartNs executor_queue_wait_ms=${(gpuStageStartNs - gpuTaskQueuedNs) / 1_000_000.0} " +
                     "frame_queue_wait_ms=${(gpuTaskQueuedNs - queuedAtNs) / 1_000_000.0} " +
-                    "gpu_inflight_before_submit=${gpuFramesAwaitingFence.get()} tid=${android.os.Process.myTid()}")
+                    "gpu_inflight_before_submit=${gpuFramesAwaitingFence.get()} busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
+                    "tid=${android.os.Process.myTid()}")
                 try {
                     val acquiredBuffer = image.hardwareBuffer
                     hwBuffer = acquiredBuffer
@@ -644,8 +676,11 @@ class MainActivity : AppCompatActivity() {
                 val gpuStageEndNs = SystemClock.elapsedRealtimeNanos()
                 val gpuStageWallMs = (gpuStageEndNs - gpuStageStartNs) / 1_000_000.0
                 Log.i(TAG, "ASYNC_GPU_SUBMIT_DONE frame=$frameId slot=$slot fullGpu=$fullGpuMode " +
+                    "model=" + frameModel + " input=" + frameInputSize + "x" + frameInputSize +
+                    " generation=" + frameGeneration +
                     "start_ns=$gpuStageStartNs end_ns=$gpuStageEndNs wall_ms=$gpuStageWallMs ret=$gpuStageRet " +
-                    "gpu_inflight_after_submit=$gpuInFlightAfterSubmit tid=${android.os.Process.myTid()}")
+                    "gpu_inflight_after_submit=$gpuInFlightAfterSubmit busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
+                    "tid=${android.os.Process.myTid()}")
                 if (gpuStageRet != 0) {
                     Log.e(TAG, "GPU stage failed frame=$frameId slot=$slot ret=$gpuStageRet")
                     asyncSlotBusy.set(slot, 0)
@@ -656,9 +691,11 @@ class MainActivity : AppCompatActivity() {
                     val completionQueuedNs = SystemClock.elapsedRealtimeNanos()
                     val completionTask: () -> Unit = completionTask@{
                         val completionStartNs = SystemClock.elapsedRealtimeNanos()
-                        Log.i(TAG, "ASYNC_GPU_WAIT_BEGIN frame=$frameId slot=$slot " +
-                            "start_ns=$completionStartNs completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
-                            "gpu_inflight_before_wait=${gpuFramesAwaitingFence.get()} tid=${android.os.Process.myTid()}")
+                        Log.i(TAG, "ASYNC_GPU_WAIT_BEGIN frame=$frameId slot=$slot model=" + frameModel +
+                            " input=" + frameInputSize + "x" + frameInputSize + " generation=" + frameGeneration +
+                            " start_ns=$completionStartNs completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
+                            "gpu_inflight_before_wait=${gpuFramesAwaitingFence.get()} busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
+                            "tid=${android.os.Process.myTid()}")
                         var waitRet = -1
                         try {
                             waitRet = yoloEngine.WaitGpuFrame(slot)
@@ -683,10 +720,12 @@ class MainActivity : AppCompatActivity() {
                         }
                         val completionEndNs = SystemClock.elapsedRealtimeNanos()
                         val completionWallMs = (completionEndNs - completionStartNs) / 1_000_000.0
-                        Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot " +
-                            "start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs " +
+                        Log.i(TAG, "ASYNC_GPU_COMPLETE_DONE frame=$frameId slot=$slot model=" + frameModel +
+                            " input=" + frameInputSize + "x" + frameInputSize + " generation=" + frameGeneration +
+                            " start_ns=$completionStartNs end_ns=$completionEndNs wall_ms=$completionWallMs " +
                             "completion_queue_wait_ms=${(completionStartNs - completionQueuedNs) / 1_000_000.0} " +
-                            "gpu_inflight_after_wait=$gpuInFlightAfterWait ret=$waitRet tid=${android.os.Process.myTid()}")
+                            "gpu_inflight_after_wait=$gpuInFlightAfterWait busy_slots=${asyncSlotBusy.get(0) + asyncSlotBusy.get(1)} " +
+                            "ret=$waitRet tid=${android.os.Process.myTid()}")
                         if (waitRet != 0) {
                             Log.e(TAG, "GPU fence completion failed frame=$frameId slot=$slot ret=$waitRet; slot retained")
                             isYoloReady.set(false)
@@ -978,6 +1017,9 @@ class MainActivity : AppCompatActivity() {
                         }
                         session.setRepeatingRequest(captureRequestBuilder.build(),sensorTraceCallback,cameraHandler)
                         isCameraRunning.set(true)
+                        Log.i(TAG, "CAMERA_STREAM_READY model_input=" + modelInputSize + "x" + modelInputSize +
+                            " camera_source=" + cameraSourceSize.width + "x" + cameraSourceSize.height +
+                            " reader_max_images=3 generation=" + modeGeneration)
                         Log.i(TAG, "Camera2 sesja skonfigurowana pomyślnie")
                         telemetryServer.broadcastStatus("STREAMING", "Camera2 → " + computeModeLabel(selectedComputeMode) + "; wyniki modelu są odczytywane do CPU")
                     } catch (e: CameraAccessException) {
