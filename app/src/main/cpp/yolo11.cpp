@@ -2215,18 +2215,19 @@ void Yolo11::decode_dfl_and_filter(const ncnn::Mat& out_blob, float conf_thresh)
         float pred_ltrb[4];
         bool valid_dfl = true;
         for (int k = 0; k < 4; k++) {
-            float max_val = read_feature(i, k * REG_MAX);
-            if (!std::isfinite(max_val)) { valid_dfl = false; break; }
-            for (int j = 1; j < REG_MAX; j++) {
+            float max_val = -std::numeric_limits<float>::infinity();
+            for (int j = 0; j < REG_MAX; j++) {
                 const float value = read_feature(i, k * REG_MAX + j);
                 if (!std::isfinite(value)) { valid_dfl = false; break; }
+                dfl_distribution_scratchpad[j] = value;
                 if (value > max_val) max_val = value;
             }
             if (!valid_dfl) break;
 
+            // Reuse the 16-value scratchpad: do not fetch and convert FP16 values twice.
             float sum_exp = 0.0f;
             for (int j = 0; j < REG_MAX; j++) {
-                dfl_distribution_scratchpad[j] = std::exp(read_feature(i, k * REG_MAX + j) - max_val);
+                dfl_distribution_scratchpad[j] = std::exp(dfl_distribution_scratchpad[j] - max_val);
                 sum_exp += dfl_distribution_scratchpad[j];
             }
 
