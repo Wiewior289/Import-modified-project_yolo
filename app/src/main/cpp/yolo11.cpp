@@ -66,6 +66,50 @@ static void log_vkmat(const char*name,const ncnn::VkMat&m,int64_t frame,int64_t 
  (const void*)m.data,(const void*)m.allocator,m.buffer_offset(),m.buffer_capacity());
 }
 
+#if NCNN_BENCHMARK
+static void log_gpu_layer_benchmark(ncnn::VkCompute& command, const ncnn::Net& network,
+                                    int64_t frame_id, const char* completion_phase)
+{
+    const auto& layers = network.layers();
+    const size_t query_count = layers.size() * 2;
+    std::vector<uint64_t> timestamps(query_count, 0);
+    const int query_ret = command.get_query_pool_results(0, static_cast<uint32_t>(query_count), timestamps);
+    if (query_ret < 0) {
+        LOGE("NCNN_BENCHMARK_GPU_READ_FAILED frame=%lld phase=%s ret=%d query_count=%zu",
+             (long long)frame_id, completion_phase, query_ret, query_count);
+        return;
+    }
+
+    size_t available_pairs = 0;
+    size_t incomplete_pairs = 0;
+    double total_gpu_us = 0.0;
+    const double timestamp_period_ns = network.vulkan_device()->info.timestamp_period();
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const uint64_t start = timestamps[i * 2];
+        const uint64_t end = timestamps[i * 2 + 1];
+        if (start == 0 || end == 0 || end < start) {
+            if (start != 0 || end != 0) ++incomplete_pairs;
+            continue;
+        }
+
+        const double duration_us = static_cast<double>(end - start) * timestamp_period_ns / 1000.0;
+        total_gpu_us += duration_us;
+        ++available_pairs;
+        const ncnn::Layer* layer = layers[i];
+        if (!layer) continue;
+        LOGI("[NCNN_BENCHMARK_GPU] frame=%lld phase=%s idx=%zu type=%s name=%s duration=%.2lfus",
+             (long long)frame_id, completion_phase, i, layer->type.c_str(),
+             layer->name.c_str(), duration_us);
+    }
+
+    LOGI("[NCNN_BENCHMARK_GPU_SUMMARY] frame=%lld phase=%s layers=%zu timed=%zu incomplete=%zu "
+         "partial=%d total_layer_gpu_us=%.2lf timestamp_period_ns=%.6f",
+         (long long)frame_id, completion_phase, layers.size(), available_pairs, incomplete_pairs,
+         query_ret == 1 ? 1 : 0, total_gpu_us, timestamp_period_ns);
+}
+#endif // NCNN_BENCHMARK
+
+
 struct CompareStats {
     bool valid = false;
     size_t count = 0, finite = 0, nonfinite = 0;
@@ -1370,6 +1414,19 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                     ncnn::VkMat in_gpu;
                     std::unique_ptr<ncnn::VkCompute> inference_cmd_owner(new ncnn::VkCompute(vkdev));
                     ncnn::VkCompute& inference_cmd = *inference_cmd_owner;
+                    bool layer_gpu_query_pool_ready = false;
+#if NCNN_BENCHMARK
+                    if (opt.use_benchmark) {
+                        const size_t layer_query_count = net.layers().size() * 2;
+                        const int query_pool_ret = layer_query_count <= UINT32_MAX
+                            ? inference_cmd.create_query_pool(static_cast<uint32_t>(layer_query_count))
+                            : -1;
+                        layer_gpu_query_pool_ready = query_pool_ret == 0;
+                        LOGI("NCNN_BENCHMARK_GPU_POOL frame=%lld enabled=1 ret=%d ready=%d queries=%zu",
+                             (long long)frame_id, query_pool_ret,
+                             layer_gpu_query_pool_ready ? 1 : 0, layer_query_count);
+                    }
+#endif
 
                     // AHB import writes FP32. Scale this VkMat in-place to avoid
                     // an additional full-frame FP32 clone/copy in the hot path.
@@ -1494,6 +1551,11 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                 final_submit_wait_ms=std::chrono::duration<double,std::milli>(
                                     std::chrono::steady_clock::now()-t).count();
                                 infer_extract_ms=infer_record_ms+final_submit_wait_ms;
+#if NCNN_BENCHMARK
+                                if (execute_ret == 0 && !async_submit && layer_gpu_query_pool_ready) {
+                                    log_gpu_layer_benchmark(inference_cmd, net, frame_id, "SYNC_FINAL_SUBMIT");
+                                }
+#endif
                                 if (execute_ret != 0) {
                                     LOGE("Combined AHB+YOLO VkCompute submit failed frame=%lld ret=%d",
                                          (long long)frame_id,execute_ret);
@@ -1506,6 +1568,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                     pending_exec->blob_allocator = blob_allocator;
                                     pending_exec->staging_allocator = staging_allocator;
                                     pending_exec->cache_entry = entry;
+                                    pending_exec->layer_benchmark_enabled = layer_gpu_query_pool_ready;
                                     const uint32_t in_flight_after =
                                         entry->in_flight.fetch_add(1, std::memory_order_acq_rel) + 1;
                                     if (frame_id > 0) {
@@ -1717,6 +1780,13 @@ int Yolo11::gpu_wait_frame(int slot_index)
         return wait_ret;
     }
 
+#if NCNN_BENCHMARK
+    // Read timestamp queries only after the async fence has completed. The same
+    // VkCompute owns the query pool from graph recording through this wait.
+    if (execution.layer_benchmark_enabled) {
+        log_gpu_layer_benchmark(*execution.command, net, frame_id, "ASYNC_FENCE_COMPLETE");
+    }
+#endif
 
     ncnn::VkAllocator* blob_allocator = execution.blob_allocator;
     ncnn::VkAllocator* staging_allocator = execution.staging_allocator;
