@@ -74,7 +74,7 @@ index 49ca3e9..a8b0d10 100644
 +
      // wait
      {
-@@ -2041,5 +2072,147 @@ int VkCompute::submit_and_wait()
+@@ -2041,5 +2072,148 @@ int VkCompute::submit_and_wait()
      return 0;
  }
  
@@ -223,7 +223,7 @@ index 49ca3e9..a8b0d10 100644
 +        NCNN_LOGE("[NCNN_VK_ASYNC] reset rejected while GPU work is pending");
 +        return -1;
 +    }
-@@ -2167,0 +2190 @@
+@@ -2167,0 +2341 @@
 +    d->needs_reset = false;
 diff --git a/src/option.h b/src/option.h
 index 49ca3e9..af6d4f1 100644
