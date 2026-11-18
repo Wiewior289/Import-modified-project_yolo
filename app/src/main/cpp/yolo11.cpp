@@ -32,6 +32,36 @@
 namespace {
 static int tensor_tap_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.tensor_tap",v)>0?std::atoi(v):0;}
 static int fp32_arithmetic_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.fp32_arithmetic",v)>0?std::atoi(v):0;}
+static std::vector<int> fp32_layers_property()
+{
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.yolo11.fp32_layers", value) <= 0 || value[0] == '\0')
+        return {};
+
+    std::vector<int> indices;
+    char* saveptr = nullptr;
+    for (char* token = std::strtok_r(value, ",", &saveptr);
+         token != nullptr;
+         token = std::strtok_r(nullptr, ",", &saveptr))
+    {
+        char* end = nullptr;
+        const long parsed = std::strtol(token, &end, 10);
+        while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+            ++end;
+
+        if (end == token || (end && *end != '\0') || parsed < 0 ||
+            parsed > std::numeric_limits<int>::max())
+        {
+            LOGW("FP32_LAYER_CONFIG invalid_token='%s' property_ignored_for_token=1", token);
+            continue;
+        }
+
+        const int index = static_cast<int>(parsed);
+        if (std::find(indices.begin(), indices.end(), index) == indices.end())
+            indices.push_back(index);
+    }
+    return indices;
+}
 static int layer_benchmark_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.layer_benchmark",v)>0?std::atoi(v):0;}
 static float half_to_float(uint16_t h){
  const uint32_t sign=(uint32_t)(h&0x8000u)<<16;uint32_t exp=(h>>10)&31u,m=h&1023u,bits=0;
@@ -480,6 +510,48 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size
     if (ret_param != 0) {
         LOGE("Failed to load param: %s (code %d)", parampath, ret_param);
         return -2;
+    }
+
+    // Apply per-layer FP32 arithmetic before load_model() creates Vulkan pipelines.
+    // featmask bit 0 disables FP16 arithmetic while preserving packed/storage settings.
+    const std::vector<int> fp32_layer_indices = fp32_layers_property();
+    if (!fp32_layer_indices.empty())
+    {
+        if (!use_vulkan_compute)
+        {
+            LOGW("FP32_LAYER_CONFIG ignored: Vulkan compute is disabled");
+        }
+        else if (force_fp32_arithmetic)
+        {
+            LOGW("FP32_LAYER_CONFIG list is redundant: global FP32 arithmetic is already enabled");
+        }
+        else
+        {
+            const auto& layers = net.layers();
+            for (int index : fp32_layer_indices)
+            {
+                if (index < 0 || static_cast<size_t>(index) >= layers.size())
+                {
+                    LOGW("FP32_LAYER_CONFIG idx=%d status=OUT_OF_RANGE layer_count=%zu",
+                         index, layers.size());
+                    continue;
+                }
+
+                ncnn::Layer* layer = layers[static_cast<size_t>(index)];
+                if (!layer)
+                {
+                    LOGW("FP32_LAYER_CONFIG idx=%d status=NULL_LAYER", index);
+                    continue;
+                }
+
+                layer->featmask |= (1 << 0);
+                const bool fp16_arithmetic_effective =
+                    net.opt.use_fp16_arithmetic && !(layer->featmask & (1 << 0));
+                LOGI("FP32_LAYER_CONFIG idx=%d type=%s name=%s featmask=0x%x arithmetic=%s",
+                     index, layer->type.c_str(), layer->name.c_str(), layer->featmask,
+                     fp16_arithmetic_effective ? "FP16" : "FP32");
+            }
+        }
     }
 
     int ret_bin = net.load_model(mgr, binpath);
