@@ -31,6 +31,7 @@
 
 namespace {
 static int tensor_tap_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.tensor_tap",v)>0?std::atoi(v):0;}
+static int fp32_arithmetic_property(){char v[PROP_VALUE_MAX]={};return __system_property_get("debug.yolo11.fp32_arithmetic",v)>0?std::atoi(v):0;}
 static float half_to_float(uint16_t h){
  const uint32_t sign=(uint32_t)(h&0x8000u)<<16;uint32_t exp=(h>>10)&31u,m=h&1023u,bits=0;
  if(exp==0){if(!m)bits=sign;else{int sh=0;while((m&1024u)==0){m<<=1;++sh;}m&=1023u;bits=sign|((uint32_t)(127-15-sh+1)<<23)|(m<<13);}}
@@ -407,7 +408,8 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size
     net.opt.use_vulkan_compute  = use_vulkan_compute;
     net.opt.use_fp16_packed     = use_vulkan_compute;
     net.opt.use_fp16_storage    = use_vulkan_compute;
-    net.opt.use_fp16_arithmetic = use_vulkan_compute;
+    const bool force_fp32_arithmetic = use_vulkan_compute && fp32_arithmetic_property() != 0;
+    net.opt.use_fp16_arithmetic = use_vulkan_compute && !force_fp32_arithmetic;
     net.opt.lightmode           = true;
     net.opt.num_threads         = 4;
     const bool runtime_benchmark =
@@ -746,6 +748,11 @@ int Yolo11::load(AAssetManager* mgr, const char* modeltype, int model_input_size
          compute_mode, net.opt.use_vulkan_compute ? 1 : 0,
          net.opt.use_fp16_packed ? 1 : 0, net.opt.use_fp16_storage ? 1 : 0,
          net.opt.use_fp16_arithmetic ? 1 : 0, net.opt.use_fp16_uniform ? 1 : 0);
+    LOGI("FP32_ARITHMETIC_DIAG enabled=%d packed=%d storage=%d arithmetic_fp16=%d matmul_already_fp32=1",
+         force_fp32_arithmetic ? 1 : 0,
+         net.opt.use_fp16_packed ? 1 : 0,
+         net.opt.use_fp16_storage ? 1 : 0,
+         net.opt.use_fp16_arithmetic ? 1 : 0);
 
     // Inventory follows MatMul backend selection, so mode 7 reports final placement.
     const auto& model_blobs = net.blobs();
