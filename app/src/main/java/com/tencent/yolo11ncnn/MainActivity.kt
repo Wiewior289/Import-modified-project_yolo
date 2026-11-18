@@ -550,8 +550,10 @@ class MainActivity : AppCompatActivity() {
         val slot = reserveAsyncSlot()
         if (slot < 0) {
             val dropped = droppedBusyFrames.incrementAndGet()
+            val releaseNs = SystemClock.elapsedRealtimeNanos()
+            Log.w(TAG, "AIMAGE_RELEASE frame=$frameId imageTs=$imageTimestampNs reason=async_slots_busy release_ns=$releaseNs slot=-1")
             if (dropped % 30L == 0L) {
-                Log.w(TAG, "FRAME_DROP reason=async_slots_busy total=$dropped")
+                Log.w(TAG, "FRAME_DROP frame=$frameId reason=async_slots_busy total=$dropped")
             }
             image.close()
             return
@@ -640,19 +642,33 @@ class MainActivity : AppCompatActivity() {
                 var gpuStageRet = -1
                 var hwBuffer: HardwareBuffer? = null
                 var deferImageRelease = false
+                var imageReleaseReason = "submit_not_deferred"
                 val imageReleased = AtomicBoolean(false)
                 val releaseCameraImage: () -> Unit = {
                     if (imageReleased.compareAndSet(false, true)) {
+                        val releaseStartNs = SystemClock.elapsedRealtimeNanos()
+                        Log.i(TAG, "AIMAGE_RELEASE_BEGIN frame=$frameId imageTs=$imageTimestampNs slot=$slot reason=$imageReleaseReason release_ns=$releaseStartNs")
+                        val hwCloseStartNs = SystemClock.elapsedRealtimeNanos()
                         try {
                             hwBuffer?.close()
                         } catch (e: Exception) {
-                            Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId", e)
+                            Log.e(TAG, "HardwareBuffer wrapper close failed frame=$frameId slot=$slot", e)
                         }
+                        val hwCloseEndNs = SystemClock.elapsedRealtimeNanos()
+                        val imageCloseStartNs = hwCloseEndNs
                         try {
                             image.close()
                         } catch (e: Exception) {
-                            Log.e(TAG, "Camera Image close failed frame=$frameId", e)
+                            Log.e(TAG, "Camera Image close failed frame=$frameId slot=$slot", e)
                         }
+                        val releaseEndNs = SystemClock.elapsedRealtimeNanos()
+                        Log.i(TAG, "AIMAGE_RELEASE_DONE frame=$frameId imageTs=$imageTimestampNs slot=$slot reason=$imageReleaseReason " +
+                            "start_ns=$releaseStartNs end_ns=$releaseEndNs " +
+                            "hw_wrapper_close_ms=${(hwCloseEndNs - hwCloseStartNs) / 1_000_000.0} " +
+                            "image_close_ms=${(releaseEndNs - imageCloseStartNs) / 1_000_000.0} " +
+                            "total_ms=${(releaseEndNs - releaseStartNs) / 1_000_000.0} tid=${android.os.Process.myTid()}")
+                    } else {
+                        Log.w(TAG, "AIMAGE_RELEASE_DUPLICATE frame=$frameId imageTs=$imageTimestampNs slot=$slot")
                     }
                 }
 
@@ -725,10 +741,12 @@ class MainActivity : AppCompatActivity() {
                             // proves Mali no longer owns this AHB. On other failures,
                             // keep the Image acquired until native teardown drains VkCompute.
                             if (waitRet == 0 || waitRet == -58) {
+                                imageReleaseReason = if (waitRet == 0) "gpu_fence_complete" else "fence_complete_empty_output"
                                 releaseCameraImage()
                             } else {
+                                imageReleaseReason = "deferred_native_teardown"
                                 deferredCameraImageReleases.add(releaseCameraImage)
-                                Log.w(TAG, "Deferring Camera2 Image release until native teardown frame=$frameId slot=$slot ret=$waitRet")
+                                Log.w(TAG, "AIMAGE_RELEASE_DEFERRED frame=$frameId imageTs=$imageTimestampNs slot=$slot reason=native_teardown ret=$waitRet")
                             }
                         }
                         val gpuInFlightAfterWait = if (waitRet == 0 || waitRet == -58) {
@@ -769,6 +787,8 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Nie udało się zakolejkować GPU frame=$frameId", e)
+            val releaseNs = SystemClock.elapsedRealtimeNanos()
+            Log.w(TAG, "AIMAGE_RELEASE frame=$frameId imageTs=$imageTimestampNs reason=gpu_executor_rejected release_ns=$releaseNs slot=$slot")
             try { image.close() } catch (_: Exception) {}
             asyncSlotBusy.set(slot, 0)
         }
@@ -860,6 +880,10 @@ class MainActivity : AppCompatActivity() {
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 val frameId = ++frameSequence
                 val imageTimestampNs = image.timestamp
+                val acquiredNs = SystemClock.elapsedRealtimeNanos()
+                Log.i(TAG, "AIMAGE_ACQUIRE frame=$frameId imageTs=$imageTimestampNs acquire_ns=$acquiredNs " +
+                    "size=${image.width}x${image.height} max_images=${reader.maxImages} generation=$modeGeneration " +
+                    "tid=${android.os.Process.myTid()}")
                 if (frameId % 30L == 0L) Log.i(TAG, "CAMERA_IMAGE frame=$frameId imageTs=$imageTimestampNs size=${image.width}x${image.height} crop=${image.cropRect}")
                 val rotateType = when (sensorOrientation) {
                     90 -> 6
@@ -874,6 +898,8 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (!isProcessingFrame.compareAndSet(false, true)) {
+                    val releaseNs = SystemClock.elapsedRealtimeNanos()
+                    Log.w(TAG, "AIMAGE_RELEASE frame=$frameId imageTs=$imageTimestampNs reason=processing_busy release_ns=$releaseNs slot=-1")
                     image.close()
                     return@setOnImageAvailableListener
                 }
@@ -950,7 +976,12 @@ class MainActivity : AppCompatActivity() {
                             (SystemClock.elapsedRealtimeNanos() - stm32StartNs) / 1_000_000.0
                     } finally {
                         try {
+                            val imageCloseStartNs = SystemClock.elapsedRealtimeNanos()
+                            Log.i(TAG, "AIMAGE_RELEASE_BEGIN frame=$frameId imageTs=$imageTimestampNs slot=-1 reason=sync_detect image_close_start_ns=$imageCloseStartNs")
                             image.close()
+                            val imageCloseEndNs = SystemClock.elapsedRealtimeNanos()
+                            Log.i(TAG, "AIMAGE_RELEASE_DONE frame=$frameId imageTs=$imageTimestampNs slot=-1 reason=sync_detect " +
+                                "image_close_end_ns=$imageCloseEndNs image_close_ms=${(imageCloseEndNs - imageCloseStartNs) / 1_000_000.0}")
                         } catch (e: Exception) {
                             Log.e(TAG, "Camera Image close failed frame=" + frameId, e)
                         } finally {
