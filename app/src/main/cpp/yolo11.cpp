@@ -39,10 +39,9 @@ static std::vector<int> fp32_layers_property()
         return {};
 
     std::vector<int> indices;
-    char* saveptr = nullptr;
-    for (char* token = std::strtok_r(value, ",", &saveptr);
+    for (char* token = std::strtok(value, ",");
          token != nullptr;
-         token = std::strtok_r(nullptr, ",", &saveptr))
+         token = std::strtok(nullptr, ","))
     {
         char* end = nullptr;
         const long parsed = std::strtol(token, &end, 10);
