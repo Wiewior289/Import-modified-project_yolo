@@ -195,6 +195,7 @@ private:
         ncnn::VkAllocator* blob_allocator = nullptr;
         ncnn::VkAllocator* staging_allocator = nullptr;
         AHBImportCacheEntry* cache_entry = nullptr;
+        bool layer_benchmark_enabled = false;
     };
 
     struct AsyncFrameSlot {
