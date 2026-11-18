@@ -1418,7 +1418,7 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
 #if NCNN_BENCHMARK
                     if (opt.use_benchmark) {
                         const size_t layer_query_count = net.layers().size() * 2;
-                        const int query_pool_ret = layer_query_count <= UINT32_MAX
+                        const int query_pool_ret = layer_query_count <= static_cast<size_t>(std::numeric_limits<uint32_t>::max())
                             ? inference_cmd.create_query_pool(static_cast<uint32_t>(layer_query_count))
                             : -1;
                         layer_gpu_query_pool_ready = query_pool_ret == 0;
