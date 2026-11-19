@@ -1,7 +1,7 @@
 diff --git a/src/command.h b/src/command.h
 --- a/src/command.h
 +++ b/src/command.h
-@@ -28,6 +28,7 @@ public:
+@@ -29,5 +29,6 @@
      void record_upload(const Mat& src, VkMat& dst, const Option& opt);
  
      void record_download(const VkMat& src, Mat& dst, const Option& opt);
@@ -9,7 +9,7 @@ diff --git a/src/command.h b/src/command.h
  
      void record_clone(const Mat& src, VkMat& dst, const Option& opt);
  
-@@ -83,6 +84,7 @@ protected:
+@@ -85,4 +85,5 @@
  
  private:
 +    void record_download_impl(const VkMat& src, Mat& dst, const Option& opt, bool preserve_native_type);
@@ -19,14 +19,6 @@ diff --git a/src/command.h b/src/command.h
 diff --git a/src/command.cpp b/src/command.cpp
 --- a/src/command.cpp
 +++ b/src/command.cpp
-@@ -2,6 +2,7 @@
- // SPDX-License-Identifier: BSD-3-Clause
- 
- #include "command.h"
-+#include <atomic>
- 
- #if NCNN_VULKAN
- 
 @@ -439,3 +439,13 @@
  void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
  {
