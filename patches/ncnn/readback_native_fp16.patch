@@ -1,7 +1,7 @@
 diff --git a/src/command.h b/src/command.h
 --- a/src/command.h
 +++ b/src/command.h
-@@ -29,5 +29,6 @@
+@@ -29,6 +29,7 @@
      void record_upload(const Mat& src, VkMat& dst, const Option& opt);
  
      void record_download(const VkMat& src, Mat& dst, const Option& opt);
@@ -9,7 +9,7 @@ diff --git a/src/command.h b/src/command.h
  
      void record_clone(const Mat& src, VkMat& dst, const Option& opt);
  
-@@ -85,4 +85,5 @@
+@@ -85,5 +85,6 @@
  
  private:
 +    void record_download_impl(const VkMat& src, Mat& dst, const Option& opt, bool preserve_native_type);
@@ -19,7 +19,7 @@ diff --git a/src/command.h b/src/command.h
 diff --git a/src/command.cpp b/src/command.cpp
 --- a/src/command.cpp
 +++ b/src/command.cpp
-@@ -439,3 +439,13 @@
+@@ -439,4 +439,14 @@
  void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
  {
 +    record_download_impl(src, dst, opt, false);
@@ -56,3 +56,4 @@ diff --git a/src/command.cpp b/src/command.cpp
 +    if (!preserve_native_type && vkdev->info.type() != 0)
      {
          cast_type_to = 1;
+     }
