@@ -1,0 +1,30 @@
+--- a/src/net.cpp
++++ b/src/net.cpp
+@@ -115,6 +115,22 @@ static Option get_masked_option(const Option& opt, int featmask)
+     opt1.use_tensor_storage = opt1.use_tensor_storage && !(featmask & (1 << 4));
+     opt1.use_sgemm_convolution = opt1.use_sgemm_convolution && !(featmask & (1 << 5));
+     opt1.use_winograd_convolution = opt1.use_winograd_convolution && !(featmask & (1 << 6));
++
++    // Keep layer-specific options consistent with the global option
++    // sanitization performed in Net::load_model().
++#if NCNN_VULKAN
++    if (opt1.use_vulkan_compute)
++    {
++        // FP16 arithmetic requires at least one FP16 storage/packing path.
++        if (!opt1.use_fp16_packed && !opt1.use_fp16_storage)
++            opt1.use_fp16_arithmetic = false;
++
++        // FP16 uniform data is only valid when FP16 arithmetic is enabled.
++        if (!opt1.use_fp16_arithmetic)
++            opt1.use_fp16_uniform = false;
++    }
++    else
++#endif // NCNN_VULKAN
++    {
++        // CPU path: FP16 arithmetic requires FP16 storage.
++        if (!opt1.use_fp16_storage)
++            opt1.use_fp16_arithmetic = false;
++    }
+ 
+     if (featmask & (1 << 7))
+         opt1.num_threads = 1;
