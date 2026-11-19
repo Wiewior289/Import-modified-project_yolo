@@ -16,12 +16,13 @@
 - [ ] Record baseline build/test status on the target device.
 
 ### S2.1 - Correct per-layer feature-mask normalization
-- [ ] Keep `get_masked_option()` consistent with NCNN's global option sanitization.
-- [ ] When FP16 arithmetic is disabled, also disable FP16 uniform.
-- [ ] When Vulkan FP16 packed and storage are both disabled, disable FP16 arithmetic.
-- [ ] Preserve CPU-side rule: FP16 arithmetic is disabled when FP16 storage is disabled.
-- [ ] Include the new patch in the pinned build script, patchset SHA, and CMake verification.
-- Acceptance: pristine pinned NCNN accepts the complete patch stack; option diagnostics show normalized values.
+- [x] Implement `get_masked_option()` normalization consistent with NCNN's global option sanitization.
+- [x] When FP16 arithmetic is disabled, also disable FP16 uniform.
+- [x] When Vulkan FP16 packed and storage are both disabled, disable FP16 arithmetic.
+- [x] Preserve CPU-side rule: FP16 arithmetic is disabled when FP16 storage is disabled.
+- [x] Include the new patch in the pinned build script, patchset SHA, and CMake verification.
+- [ ] Acceptance pending: pristine pinned NCNN must accept the complete patch stack; option diagnostics must show normalized values.
+- Implementation commit: `featmask_option_normalization.patch` plus builder/CMake patchset verification. Android build and on-device validation have not been run.
 
 ### S2.2 - Convolution route and pipeline diagnostics
 - [ ] Log per-layer convolution parameters at pipeline creation: kernel, stride, dilation, input/output channels, input/output shape, FP16 flags, SGEMM/Winograd flags, cooperative-matrix decision.
