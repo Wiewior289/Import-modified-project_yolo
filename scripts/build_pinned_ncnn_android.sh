@@ -70,8 +70,9 @@ PATCH_BENCHMARK="${PATCH_DIR}/benchmark_timestamp_safety.patch"
 PATCH_BENCHMARK_RUNTIME="${PATCH_DIR}/benchmark_runtime_gating.patch"
 PATCH_SYNC="${PATCH_DIR}/runtime_sync_timing.patch"
 PATCH_ASYNC="${PATCH_DIR}/async_vk_submit.patch"
+PATCH_READBACK="${PATCH_DIR}/readback_native_fp16.patch"
 
-for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" "${PATCH_ASYNC}"; do
+for patch_file in "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" "${PATCH_ASYNC}" "${PATCH_READBACK}"; do
     if [[ ! -s "${patch_file}" ]]; then
         echo "ERROR: required MatMul Vulkan patch file is missing or empty: ${patch_file}" >&2
         exit 4
@@ -93,8 +94,10 @@ git -C "${SOURCE_DIR}" apply --check "${PATCH_SYNC}"
 git -C "${SOURCE_DIR}" apply "${PATCH_SYNC}"
 git -C "${SOURCE_DIR}" apply --unidiff-zero --check "${PATCH_ASYNC}"
 git -C "${SOURCE_DIR}" apply --unidiff-zero "${PATCH_ASYNC}"
+git -C "${SOURCE_DIR}" apply --check "${PATCH_READBACK}"
+git -C "${SOURCE_DIR}" apply "${PATCH_READBACK}"
 
-PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" "${PATCH_ASYNC}" | sha256sum | awk '{print $1}')"
+PATCHSET_SHA="$(cat "${PATCH_HEADER}" "${PATCH_SOURCE}" "${PATCH_SHADER}" "${PATCH_BENCHMARK}" "${PATCH_BENCHMARK_RUNTIME}" "${PATCH_SYNC}" "${PATCH_ASYNC}" "${PATCH_READBACK}" | sha256sum | awk '{print $1}')"
 if [[ ! "${PATCHSET_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
     echo "ERROR: failed to calculate NCNN patchset SHA." >&2
     exit 4
