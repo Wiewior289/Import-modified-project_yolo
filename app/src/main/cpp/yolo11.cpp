@@ -1523,29 +1523,44 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                 execute_ret=-13;
                             }
                             if (execute_ret == 0) {
-                                if (frame_id > 0 && frame_id % 30 == 0) {
+                                const size_t scalar_bytes = out_gpu.elempack > 0
+                                    ? out_gpu.elemsize / static_cast<size_t>(out_gpu.elempack) : 0;
+                                const bool native_fp16_readback = async_submit && scalar_bytes == 2;
+
+                                if (frame_id > 0 && (frame_id == 1 || frame_id % 30 == 0)) {
                                     log_vkmat("out0_gpu_before_readback", out_gpu, frame_id, image_timestamp_ns);
-                                    const size_t scalar_bytes = out_gpu.elempack > 0
-                                        ? out_gpu.elemsize / static_cast<size_t>(out_gpu.elempack) : 0;
+                                    const VkPhysicalDeviceMemoryProperties& vk_memory_properties =
+                                        vkdev->info.physicalDeviceMemoryProperties();
+                                    const uint32_t src_mem_type = out_gpu.data
+                                        ? out_gpu.data->memory_type_index : static_cast<uint32_t>(-1);
+                                    const uint32_t blob_mem_type = blob_allocator
+                                        ? blob_allocator->buffer_memory_type_index : static_cast<uint32_t>(-1);
+                                    const VkFlags src_mem_flags = src_mem_type < vk_memory_properties.memoryTypeCount
+                                        ? vk_memory_properties.memoryTypes[src_mem_type].propertyFlags : 0;
+                                    const VkFlags blob_mem_flags = blob_mem_type < vk_memory_properties.memoryTypeCount
+                                        ? vk_memory_properties.memoryTypes[blob_mem_type].propertyFlags : 0;
                                     LOGI("OUT0_READBACK_SOURCE frame=%lld scalar_bytes=%zu payload_bytes=%zu "
-                                         "pack=%d vk_device_type=%d fp16_storage=%d fp16_packed=%d",
+                                         "pack=%d vk_device_type=%d fp16_storage=%d fp16_packed=%d "
+                                         "native_fp16_readback=%d src_mem_type=%u src_mem_flags=0x%x "
+                                         "blob_mem_type=%u blob_mem_flags=0x%x",
                                          (long long)frame_id, scalar_bytes,
                                          out_gpu.total() * out_gpu.elemsize, out_gpu.elempack,
                                          vkdev->info.type(), opt.use_fp16_storage ? 1 : 0,
-                                         opt.use_fp16_packed ? 1 : 0);
+                                         opt.use_fp16_packed ? 1 : 0, native_fp16_readback ? 1 : 0,
+                                         src_mem_type, static_cast<unsigned int>(src_mem_flags),
+                                         blob_mem_type, static_cast<unsigned int>(blob_mem_flags));
                                 }
 
-                                // Preserve the model's native output scalar type on the CPU.
-                                // On Mali, record_download() otherwise expands FP16 to FP32,
-                                // doubling readback traffic and allocating a second full tensor.
-                                // Packing is retained; the DFL parser reads NCNN's 2D packed
-                                // anchor layout directly without a CPU unpack copy.
+                                // The standard integrated-GPU download path casts to FP32.
+                                // For this async YOLO output only, preserve the VkMat scalar type.
+                                // decode_dfl_and_filter() already reads FP16 lazily, so no CPU
+                                // expansion or pack-unpack copy is required.
                                 ncnn::Option download_opt = opt;
-                                if (async_submit) {
-                                    download_opt.use_fp16_storage = false;
-                                    download_opt.use_fp16_packed = false;
+                                if (native_fp16_readback) {
+                                    inference_cmd.record_download_native(out_gpu, out, download_opt);
+                                } else {
+                                    inference_cmd.record_download(out_gpu, out, download_opt);
                                 }
-                                inference_cmd.record_download(out_gpu, out, download_opt);
                                 t=std::chrono::steady_clock::now();
                                 execute_ret = async_submit ? inference_cmd.submit() : inference_cmd.submit_and_wait();
                                 final_submit_wait_ms=std::chrono::duration<double,std::milli>(
