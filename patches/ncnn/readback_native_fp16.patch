@@ -1,0 +1,102 @@
+diff --git a/src/command.h b/src/command.h
+--- a/src/command.h
++++ b/src/command.h
+@@ -28,6 +28,7 @@ public:
+     void record_upload(const Mat& src, VkMat& dst, const Option& opt);
+ 
+     void record_download(const VkMat& src, Mat& dst, const Option& opt);
++    void record_download_native(const VkMat& src, Mat& dst, const Option& opt);
+ 
+     void record_clone(const Mat& src, VkMat& dst, const Option& opt);
+ 
+@@ -83,6 +84,7 @@ protected:
+ 
+ private:
++    void record_download_impl(const VkMat& src, Mat& dst, const Option& opt, bool preserve_native_type);
+     VkComputePrivate* const d;
+ };
+ 
+diff --git a/src/command.cpp b/src/command.cpp
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+ #include "command.h"
++#include <atomic>
+ 
+ #if NCNN_VULKAN
+ 
+@@ -436,7 +437,18 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
++{
++    record_download_impl(src, dst, opt, false);
++}
++
++void VkCompute::record_download_native(const VkMat& src, Mat& dst, const Option& opt)
++{
++    record_download_impl(src, dst, opt, true);
++}
++
++void VkCompute::record_download_impl(const VkMat& src, Mat& dst, const Option& opt, bool preserve_native_type)
+ {
+     // NCNN_LOGE("record_download buffer");
+ 
+@@ -449,10 +461,19 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+ 
+-    // gpu cast to fp32 on the fly (integrated gpu)
++    // A mapped blob buffer is not necessarily efficient for CPU reads.
++    // Inspect the memory type selected for VkBuffer allocations specifically;
++    // VkBlobAllocator also allocates images and its generic mappable flag can
++    // describe the last image allocation rather than this buffer.
+     Option opt_staging = opt;
+-    if (!opt_staging.blob_vkallocator->mappable)
++    const VkPhysicalDeviceMemoryProperties& memory_properties = vkdev->info.physicalDeviceMemoryProperties();
++    const uint32_t blob_memory_type_index = opt_staging.blob_vkallocator
++        ? opt_staging.blob_vkallocator->buffer_memory_type_index : static_cast<uint32_t>(-1);
++    const bool blob_memory_type_valid = blob_memory_type_index < memory_properties.memoryTypeCount;
++    const VkFlags blob_memory_flags = blob_memory_type_valid
++        ? memory_properties.memoryTypes[blob_memory_type_index].propertyFlags : 0;
++    const bool blob_buffer_mappable = (blob_memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
++    const bool blob_buffer_cached = (blob_memory_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
++    if (!blob_buffer_mappable || !blob_buffer_cached)
+     {
+         opt_staging.blob_vkallocator = opt.staging_vkallocator;
+     }
+     int cast_type_to = 0;
+-    if (vkdev->info.type() != 0)
++    if (!preserve_native_type && vkdev->info.type() != 0)
+     {
+         cast_type_to = 1;
+@@ -466,6 +487,27 @@ void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
+     VkMat dst_staging;
+     vkdev->convert_packing(src, dst_staging, dst_elempack, cast_type_to, *this, opt_staging);
+ 
++    // Keep a short diagnostic sample so device-specific memory-type decisions
++    // can be verified from logcat without flooding steady-state inference logs.
++    static std::atomic<unsigned int> readback_log_count(0);
++    if (readback_log_count.fetch_add(1, std::memory_order_relaxed) < 12)
++    {
++        const uint32_t src_memory_type = src.data ? src.data->memory_type_index : static_cast<uint32_t>(-1);
++        const uint32_t dst_memory_type = dst_staging.data ? dst_staging.data->memory_type_index : static_cast<uint32_t>(-1);
++        const VkFlags src_memory_flags = src_memory_type < memory_properties.memoryTypeCount
++            ? memory_properties.memoryTypes[src_memory_type].propertyFlags : 0;
++        const VkFlags dst_memory_flags = dst_memory_type < memory_properties.memoryTypeCount
++            ? memory_properties.memoryTypes[dst_memory_type].propertyFlags : 0;
++        const size_t src_scalar_bytes = src.elempack > 0 ? src.elemsize / static_cast<size_t>(src.elempack) : 0;
++        const size_t dst_scalar_bytes = dst_staging.elempack > 0
++            ? dst_staging.elemsize / static_cast<size_t>(dst_staging.elempack) : 0;
++        NCNN_LOGE("[NCNN_READBACK_PLAN] native=%d src_scalar=%zu src_pack=%d src_bytes=%zu src_mem_type=%u src_mem_flags=0x%x "
++                  "blob_mem_type=%u blob_mem_flags=0x%x blob_host_visible=%d blob_host_cached=%d allocator=%s "
++                  "dst_scalar=%zu dst_pack=%d dst_bytes=%zu dst_mem_type=%u dst_mem_flags=0x%x",
++                  preserve_native_type ? 1 : 0, src_scalar_bytes, src.elempack,
++                  src.total() * src.elemsize, src_memory_type, static_cast<unsigned int>(src_memory_flags),
++                  blob_memory_type_index, static_cast<unsigned int>(blob_memory_flags),
++                  blob_buffer_mappable ? 1 : 0, blob_buffer_cached ? 1 : 0,
++                  opt_staging.blob_vkallocator == opt.staging_vkallocator ? "staging" : "blob",
++                  dst_scalar_bytes, dst_staging.elempack, dst_staging.total() * dst_staging.elemsize,
++                  dst_memory_type, static_cast<unsigned int>(dst_memory_flags));
++    }
++
+     // barrier device any @ compute to host-read @ compute
+     if (dst_staging.data->access_flags & VK_ACCESS_HOST_WRITE_BIT || dst_staging.data->stage_flags != VK_PIPELINE_STAGE_HOST_BIT)
+     {
