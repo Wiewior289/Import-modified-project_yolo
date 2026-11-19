@@ -1525,7 +1525,10 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                             if (execute_ret == 0) {
                                 const size_t scalar_bytes = out_gpu.elempack > 0
                                     ? out_gpu.elemsize / static_cast<size_t>(out_gpu.elempack) : 0;
-                                const bool native_fp16_readback = async_submit && scalar_bytes == 2;
+                                const bool source_is_fp16 = scalar_bytes == 2 &&
+                                    (opt.use_fp16_storage || opt.use_fp16_packed) &&
+                                    !(opt.use_bf16_storage || opt.use_bf16_packed);
+                                const bool native_fp16_readback = async_submit && source_is_fp16;
 
                                 if (frame_id > 0 && (frame_id == 1 || frame_id % 30 == 0)) {
                                     log_vkmat("out0_gpu_before_readback", out_gpu, frame_id, image_timestamp_ns);
