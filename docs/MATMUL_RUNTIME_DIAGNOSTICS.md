@@ -16,7 +16,7 @@ export ANDROID_NDK_HOME="$HOME/Android/Sdk/ndk/<your-ndk-version>"
 ./gradlew clean assembleDebug --no-configuration-cache
 ```
 
-The pinned builder applies the three MatMul backend files and `patches/ncnn/benchmark_timestamp_safety.patch` to a pristine checkout, then regenerates NCNN. The patchset SHA includes all four files, and app CMake verifies that hash before linking.
+The pinned builder applies the MatMul backend files and the NCNN runtime patches to a pristine checkout, then regenerates NCNN. The patchset SHA includes every applied patch and backend file, and app CMake verifies that hash before linking. Stage 2 adds `patches/ncnn/featmask_option_normalization.patch`, which keeps per-layer FP16 option masking consistent with NCNN's global option sanitization.
 
 Build flags:
 - `NCNN_VULKAN=ON`
@@ -84,3 +84,18 @@ A residual Mali driver fault at the final `vkGetQueryPoolResults()` call is stil
 - Mode 6 performs multiple full inference passes per diagnostic sample. Its throughput is not normal live FPS.
 
 Keep the first validation short. Compare mode 7 and mode 8 at the same model resolution, collect the MatMul route and timestamp lines, then check for native crashes and output agreement before drawing performance conclusions.
+
+
+## Stage 2: per-layer option normalization
+
+The new `featmask_option_normalization.patch` changes only `get_masked_option()` in the pinned NCNN `src/net.cpp`.
+
+- Vulkan path: if both FP16 packed and FP16 storage are disabled, FP16 arithmetic is disabled too.
+- Any path: if FP16 arithmetic is disabled, FP16 uniform is disabled.
+- CPU path: if FP16 storage is disabled, FP16 arithmetic is disabled.
+
+The change does not alter the global FP16 defaults, MatMul kernels, queue submission policy, or the model's layer masks. It only makes per-layer options obey the same dependencies as the global configuration.
+
+The builder applies this patch after the existing async/runtime patches and includes it in `NCNN_PATCHSET_SHA`. App CMake includes the same file in its patchset hash calculation, so an APK cannot silently link an NCNN library built without the new patch.
+
+This patch is implemented but is not yet validated by an Android NDK build or a device run. See [Stage 2 implementation plan](STAGE2_IMPLEMENTATION_PLAN.md).
