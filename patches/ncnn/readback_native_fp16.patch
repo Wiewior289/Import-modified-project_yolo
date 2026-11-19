@@ -19,6 +19,12 @@ diff --git a/src/command.h b/src/command.h
 diff --git a/src/command.cpp b/src/command.cpp
 --- a/src/command.cpp
 +++ b/src/command.cpp
+@@ -4,4 +4,5 @@
+ #include "command.h"
+ #include <time.h>
++#include <atomic>
+ 
+ #if NCNN_VULKAN
 @@ -439,4 +439,14 @@
  void VkCompute::record_download(const VkMat& src, Mat& dst, const Option& opt)
  {
@@ -57,3 +63,35 @@ diff --git a/src/command.cpp b/src/command.cpp
      {
          cast_type_to = 1;
      }
+
+@@ -473,4 +491,30 @@
+     VkMat dst_staging;
+     vkdev->convert_packing(src, dst_staging, dst_elempack, cast_type_to, *this, opt_staging);
+ 
++    // Log only the first few readbacks: verify native tensor type and the actual
++    // Vulkan memory type selected for the GPU-to-CPU staging buffer.
++    static std::atomic<unsigned int> readback_log_count(0);
++    if (readback_log_count.fetch_add(1, std::memory_order_relaxed) < 12)
++    {
++        const uint32_t src_memory_type = src.data ? src.data->memory_type_index : static_cast<uint32_t>(-1);
++        const uint32_t dst_memory_type = dst_staging.data ? dst_staging.data->memory_type_index : static_cast<uint32_t>(-1);
++        const VkFlags src_memory_flags = src_memory_type < memory_properties.memoryTypeCount
++            ? memory_properties.memoryTypes[src_memory_type].propertyFlags : 0;
++        const VkFlags dst_memory_flags = dst_memory_type < memory_properties.memoryTypeCount
++            ? memory_properties.memoryTypes[dst_memory_type].propertyFlags : 0;
++        const size_t src_scalar_bytes = src.elempack > 0 ? src.elemsize / static_cast<size_t>(src.elempack) : 0;
++        const size_t dst_scalar_bytes = dst_staging.elempack > 0
++            ? dst_staging.elemsize / static_cast<size_t>(dst_staging.elempack) : 0;
++        NCNN_LOGE("[NCNN_READBACK_PLAN] native=%d src_scalar=%zu src_pack=%d src_bytes=%zu src_mem_type=%u src_flags=0x%x "
++                  "blob_mem_type=%u blob_flags=0x%x blob_host_visible=%d blob_host_cached=%d allocator=%s "
++                  "dst_scalar=%zu dst_pack=%d dst_bytes=%zu dst_mem_type=%u dst_flags=0x%x",
++                  preserve_native_type ? 1 : 0, src_scalar_bytes, src.elempack,
++                  src.total() * src.elemsize, src_memory_type, static_cast<unsigned int>(src_memory_flags),
++                  blob_memory_type_index, static_cast<unsigned int>(blob_memory_flags),
++                  blob_buffer_mappable ? 1 : 0, blob_buffer_cached ? 1 : 0,
++                  opt_staging.blob_vkallocator == opt.staging_vkallocator ? "staging" : "blob",
++                  dst_scalar_bytes, dst_staging.elempack, dst_staging.total() * dst_staging.elemsize,
++                  dst_memory_type, static_cast<unsigned int>(dst_memory_flags));
++    }
++
+     // barrier device any @ compute to host-read @ compute
