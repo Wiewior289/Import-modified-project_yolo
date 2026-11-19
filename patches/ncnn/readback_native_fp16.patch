@@ -42,7 +42,7 @@ diff --git a/src/command.cpp b/src/command.cpp
 +{
      // NCNN_LOGE("record_download buffer");
  
-@@ -456,11 +466,18 @@
+@@ -456,11 +466,17 @@
 -    // gpu cast to fp32 on the fly (integrated gpu)
 +    // A mapped blob buffer is not necessarily efficient for CPU reads.
      Option opt_staging = opt;
