@@ -1594,29 +1594,94 @@ int Yolo11::detect_ahb(AHardwareBuffer* ahb,float conf_thresh,float nms_thresh,s
                                 execute_ret=-13;
                             }
                             if (execute_ret == 0) {
-                                if (frame_id > 0 && frame_id % 30 == 0) {
+                                const bool log_readback_probe = frame_id > 0 && frame_id % 30 == 0;
+                                if (log_readback_probe) {
                                     log_vkmat("out0_gpu_before_readback", out_gpu, frame_id, image_timestamp_ns);
                                     const size_t scalar_bytes = out_gpu.elempack > 0
                                         ? out_gpu.elemsize / static_cast<size_t>(out_gpu.elempack) : 0;
-                                    LOGI("OUT0_READBACK_SOURCE frame=%lld scalar_bytes=%zu payload_bytes=%zu "
-                                         "pack=%d vk_device_type=%d fp16_storage=%d fp16_packed=%d",
-                                         (long long)frame_id, scalar_bytes,
-                                         out_gpu.total() * out_gpu.elemsize, out_gpu.elempack,
+                                    LOGI("OUT0_READBACK_SOURCE frame=%lld dims=%d shape=%d,%d,%d,%d "
+                                         "elemsize=%zu scalar_bytes=%zu pack=%d total=%zu payload_bytes=%zu "
+                                         "vk_device_type=%d fp16_storage=%d fp16_packed=%d",
+                                         (long long)frame_id, out_gpu.dims,
+                                         out_gpu.w, out_gpu.h, out_gpu.d, out_gpu.c,
+                                         out_gpu.elemsize, scalar_bytes, out_gpu.elempack,
+                                         out_gpu.total(), out_gpu.total() * out_gpu.elemsize,
                                          vkdev->info.type(), opt.use_fp16_storage ? 1 : 0,
                                          opt.use_fp16_packed ? 1 : 0);
+
+                                    // HOST_VISIBLE is not equivalent to HOST_CACHED. Record the
+                                    // actual VkBuffer memory type used by out_gpu, then compare
+                                    // it with the allocator route selected by record_download().
+                                    const VkPhysicalDeviceMemoryProperties& memory_properties =
+                                        vkdev->info.physicalDeviceMemoryProperties();
+                                    const uint32_t output_memory_type = out_gpu.data
+                                        ? out_gpu.data->memory_type_index : UINT32_MAX;
+                                    VkMemoryPropertyFlags output_flags = 0;
+                                    const bool output_memory_type_valid =
+                                        output_memory_type < memory_properties.memoryTypeCount;
+                                    if (output_memory_type_valid) {
+                                        output_flags = memory_properties.memoryTypes[output_memory_type].propertyFlags;
+                                    }
+
+                                    const uint32_t blob_memory_type = out_gpu.allocator
+                                        ? out_gpu.allocator->buffer_memory_type_index : UINT32_MAX;
+                                    VkMemoryPropertyFlags blob_flags = 0;
+                                    const bool blob_memory_type_valid =
+                                        blob_memory_type < memory_properties.memoryTypeCount;
+                                    if (blob_memory_type_valid) {
+                                        blob_flags = memory_properties.memoryTypes[blob_memory_type].propertyFlags;
+                                    }
+
+                                    const bool blob_mappable = out_gpu.allocator && out_gpu.allocator->mappable;
+                                    const char* predicted_route = blob_mappable
+                                        ? "blob_direct_candidate" : "staging_candidate";
+                                    LOGI("OUT0_MEMORY_PROBE frame=%lld data_memory_type=%u data_flags=0x%x "
+                                         "data_host_visible=%d data_host_coherent=%d data_host_cached=%d "
+                                         "data_device_local=%d allocator_memory_type=%u allocator_flags=0x%x "
+                                         "allocator_mappable=%d allocator_coherent=%d predicted_download_route=%s",
+                                         (long long)frame_id, output_memory_type, output_flags,
+                                         (output_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? 1 : 0,
+                                         (output_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? 1 : 0,
+                                         (output_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? 1 : 0,
+                                         (output_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? 1 : 0,
+                                         blob_memory_type, blob_flags,
+                                         blob_mappable ? 1 : 0,
+                                         out_gpu.allocator && out_gpu.allocator->coherent ? 1 : 0,
+                                         predicted_route);
                                 }
 
-                                // Preserve the model's native output scalar type on the CPU.
-                                // On Mali, record_download() otherwise expands FP16 to FP32,
-                                // doubling readback traffic and allocating a second full tensor.
-                                // Packing is retained; the DFL parser reads NCNN's 2D packed
-                                // anchor layout directly without a CPU unpack copy.
+                                // Preserve the existing readback behavior for this diagnostic
+                                // commit. First establish the native GPU format and memory route;
+                                // only then change FP16 conversion or allocator selection.
                                 ncnn::Option download_opt = opt;
                                 if (async_submit) {
                                     download_opt.use_fp16_storage = false;
                                     download_opt.use_fp16_packed = false;
                                 }
                                 inference_cmd.record_download(out_gpu, out, download_opt);
+                                if (log_readback_probe) {
+                                    const size_t target_scalar_bytes = out.elempack > 0
+                                        ? out.elemsize / static_cast<size_t>(out.elempack) : 0;
+                                    const ncnn::VkAllocator* staging = download_opt.staging_vkallocator;
+                                    const uint32_t staging_memory_type = staging
+                                        ? staging->buffer_memory_type_index : UINT32_MAX;
+                                    const VkPhysicalDeviceMemoryProperties& memory_properties =
+                                        vkdev->info.physicalDeviceMemoryProperties();
+                                    VkMemoryPropertyFlags staging_flags = 0;
+                                    const bool staging_memory_type_valid =
+                                        staging_memory_type < memory_properties.memoryTypeCount;
+                                    if (staging_memory_type_valid) {
+                                        staging_flags = memory_properties.memoryTypes[staging_memory_type].propertyFlags;
+                                    }
+                                    LOGI("OUT0_READBACK_TARGET frame=%lld dims=%d shape=%d,%d,%d,%d "
+                                         "elemsize=%zu scalar_bytes=%zu pack=%d total=%zu payload_bytes=%zu "
+                                         "staging_memory_type=%u staging_flags=0x%x staging_host_cached=%d",
+                                         (long long)frame_id, out.dims, out.w, out.h, out.d, out.c,
+                                         out.elemsize, target_scalar_bytes, out.elempack,
+                                         out.total(), out.total() * out.elemsize,
+                                         staging_memory_type, staging_flags,
+                                         (staging_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? 1 : 0);
+                                }
                                 t=std::chrono::steady_clock::now();
                                 execute_ret = async_submit ? inference_cmd.submit() : inference_cmd.submit_and_wait();
                                 final_submit_wait_ms=std::chrono::duration<double,std::milli>(
